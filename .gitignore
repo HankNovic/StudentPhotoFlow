@@ -1,0 +1,31 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Build and portable-package artifacts
+build/
+dist/
+_internal/
+*.spec
+*.exe
+*.zip
+
+# Runtime logs and local configuration
+*.log
+.env
+.env.*
+
+# Exported spreadsheets and sensitive student data
+*.xls
+*.xlsx
+导出结果/
+**/导出结果/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
