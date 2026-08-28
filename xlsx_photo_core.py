@@ -26,6 +26,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from xml.etree import ElementTree as ET
 
+from photo_pipeline import (
+    PIPELINE_VERSION,
+    PipelineError,
+    PipelineOptions,
+    run_pipeline,
+    save_pipeline_stages,
+)
+
 
 MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 DOC_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -41,8 +49,8 @@ NS = {
     "a": ART_NS,
 }
 
-APP_VERSION = "1.1.0"
-STATE_SCHEMA = 2
+APP_VERSION = "1.2.0"
+STATE_SCHEMA = 3
 MAX_IMAGE_BYTES = 30 * 1024 * 1024
 VOLATILE_QUERY_RE = re.compile(
     r"(?:sign|signature|token|expires?|timestamp|q-ak|q-key-time|q-sign-time|"
@@ -108,9 +116,28 @@ class ExportOptions:
     header_row: int
     id_col: int
     image_col: int
-    face_detection: bool = False
-    background_mode: str = "none"  # none | quick | ai
+    face_detection: bool = False  # legacy CLI alias for the built-in face check
+    quality_enabled: bool = False
+    auto_orient: bool = True
+    check_grayscale: bool = True
+    check_face: bool = True
+    check_glare: bool = True
+    check_recapture: bool = True
+    grayscale_ratio_threshold: float = 0.85
+    grayscale_delta_limit: int = 10
+    face_confidence_threshold: float = 0.75
+    glare_ratio_threshold: float = 0.08
+    glare_luma_threshold: int = 245
+    recapture_score_threshold: float = 0.72
+    stop_on_reject: bool = True
+    save_intermediate_steps: bool = True
+    background_mode: str = "ai"  # none | quick | ai | hivision
     background_color: str = "#438EDB"
+    hivision_url: str = "http://127.0.0.1:8080"
+    hivision_timeout: int = 120
+    hivision_height: int = 413
+    hivision_width: int = 295
+    hivision_dpi: int = 300
     workers: int = 6
     force_refresh: bool = False
     timeout_seconds: int = 25
@@ -129,6 +156,13 @@ class JobResult:
     original_sha256: str | None = None
     processed_file: str | None = None
     face_count: int | None = None
+    quality_status: str = "not_requested"
+    quality_reasons: list[dict[str, str]] = field(default_factory=list)
+    quality_metrics: dict[str, Any] = field(default_factory=dict)
+    rotation_ccw: int = 0
+    detector: str = "not_used"
+    background_engine: str = "none"
+    step_files: list[dict[str, Any]] = field(default_factory=list)
     processing_status: str = "not_requested"
     processing_message: str = ""
     executed: bool = True
@@ -693,11 +727,54 @@ def _load_state(path: Path) -> dict[str, Any]:
 def _processing_fingerprint(options: ExportOptions) -> str:
     payload = json.dumps({
         "face_detection": options.face_detection,
+        "quality_enabled": options.quality_enabled,
+        "auto_orient": options.auto_orient,
+        "check_grayscale": options.check_grayscale,
+        "check_face": options.check_face,
+        "check_glare": options.check_glare,
+        "check_recapture": options.check_recapture,
+        "grayscale_ratio_threshold": options.grayscale_ratio_threshold,
+        "grayscale_delta_limit": options.grayscale_delta_limit,
+        "face_confidence_threshold": options.face_confidence_threshold,
+        "glare_ratio_threshold": options.glare_ratio_threshold,
+        "glare_luma_threshold": options.glare_luma_threshold,
+        "recapture_score_threshold": options.recapture_score_threshold,
+        "stop_on_reject": options.stop_on_reject,
         "background_mode": options.background_mode,
         "background_color": options.background_color.upper(),
-        "pipeline_version": 1,
+        "hivision_url": options.hivision_url.rstrip("/"),
+        "hivision_height": options.hivision_height,
+        "hivision_width": options.hivision_width,
+        "hivision_dpi": options.hivision_dpi,
+        "pipeline_version": PIPELINE_VERSION,
     }, sort_keys=True).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _pipeline_options(options: ExportOptions) -> PipelineOptions:
+    legacy_face_only = options.face_detection and not options.quality_enabled
+    return PipelineOptions(
+        quality_enabled=options.quality_enabled or options.face_detection,
+        auto_orient=options.auto_orient,
+        check_grayscale=options.check_grayscale if options.quality_enabled else False,
+        check_face=options.check_face if options.quality_enabled else legacy_face_only,
+        check_glare=options.check_glare if options.quality_enabled else False,
+        check_recapture=options.check_recapture if options.quality_enabled else False,
+        grayscale_ratio_threshold=options.grayscale_ratio_threshold,
+        grayscale_delta_limit=options.grayscale_delta_limit,
+        face_confidence_threshold=options.face_confidence_threshold,
+        glare_ratio_threshold=options.glare_ratio_threshold,
+        glare_luma_threshold=options.glare_luma_threshold,
+        recapture_score_threshold=options.recapture_score_threshold,
+        stop_on_reject=options.stop_on_reject,
+        background_mode=options.background_mode,
+        background_color=options.background_color,
+        hivision_url=options.hivision_url,
+        hivision_timeout=options.hivision_timeout,
+        hivision_height=options.hivision_height,
+        hivision_width=options.hivision_width,
+        hivision_dpi=options.hivision_dpi,
+    )
 
 
 def _fetch_source(source: SourceRef, timeout: int) -> bytes:
@@ -958,46 +1035,55 @@ def _execute_job(
         result.original_sha256 = digest
         result.status = "success"
 
-        processing_requested = options.face_detection or options.background_mode != "none"
+        processing_requested = (
+            options.quality_enabled
+            or options.face_detection
+            or options.background_mode != "none"
+        )
         if not processing_requested:
             result.processing_status = "not_requested"
             return result
 
-        processing_errors: list[str] = []
-        if options.face_detection:
-            try:
-                result.face_count = _detect_faces(data)
-                if result.face_count == 0:
-                    processing_errors.append("未检测到正面人脸")
-                elif result.face_count > 1:
-                    processing_errors.append(f"检测到 {result.face_count} 张人脸")
-            except ExportError as exc:
-                processing_errors.append(str(exc))
+        try:
+            pipeline = run_pipeline(data, _pipeline_options(options))
+            result.face_count = pipeline.face_count
+            result.quality_status = pipeline.status if (options.quality_enabled or options.face_detection) else "not_requested"
+            result.quality_reasons = pipeline.reasons
+            result.quality_metrics = pipeline.metrics
+            result.rotation_ccw = pipeline.rotation_ccw
+            result.detector = pipeline.detector
+            result.background_engine = pipeline.background_engine
+            if options.save_intermediate_steps:
+                stage_dir = root / "批次记录" / batch_id / "处理步骤" / row.student_id
+                saved_steps = save_pipeline_stages(pipeline, stage_dir)
+                for saved in saved_steps:
+                    saved["file"] = _relative(root, Path(saved["file"]))
+                result.step_files = saved_steps
 
-        if options.background_mode != "none":
-            try:
-                if options.background_mode == "quick":
-                    processed = _quick_replace_background(data, options.background_color)
-                elif options.background_mode == "ai":
-                    processed = _ai_replace_background(data, options.background_color)
-                else:
-                    raise ExportError(f"未知背景处理模式：{options.background_mode}")
+            if pipeline.status == "rejected":
+                result.processing_status = "rejected"
+                result.processing_message = "；".join(reason["message"] for reason in pipeline.reasons)
+                return result
+
+            should_write_output = (
+                pipeline.output_bytes is not None
+                and (options.background_mode != "none" or pipeline.rotation_ccw != 0)
+            )
+            if should_write_output:
                 processed_path = root / "处理后图片" / f"{row.student_id}.jpg"
                 previous_processed = _safe_state_file(
                     root,
                     existing.get("processing", {}).get("processed_file") if existing else None,
                 )
                 history = root / "历史版本" / batch_id / "处理后图片"
-                _archive_then_install(processed, processed_path, previous_processed, history)
+                _archive_then_install(pipeline.output_bytes, processed_path, previous_processed, history)
                 result.processed_file = _relative(root, processed_path)
-            except ExportError as exc:
-                processing_errors.append(str(exc))
-
-        if processing_errors:
+            result.processing_status = "warning" if pipeline.status == "warning" else "success"
+            if pipeline.reasons:
+                result.processing_message = "；".join(reason["message"] for reason in pipeline.reasons)
+        except PipelineError as exc:
             result.processing_status = "warning"
-            result.processing_message = "；".join(dict.fromkeys(processing_errors))
-        else:
-            result.processing_status = "success"
+            result.processing_message = str(exc)
         return result
     except (ExportError, OSError, ValueError) as exc:
         result.status = "failed"
@@ -1009,7 +1095,7 @@ def _execute_job(
         return result
 
 
-def _copy_batch_images(root: Path, batch_dir: Path, result: JobResult) -> dict[str, str]:
+def _copy_batch_images(root: Path, batch_dir: Path, result: JobResult) -> dict[str, Any]:
     group_names = {
         "new": "本次新增",
         "updated": "本次更新",
@@ -1017,7 +1103,7 @@ def _copy_batch_images(root: Path, batch_dir: Path, result: JobResult) -> dict[s
         "reprocessed": "本次重新处理",
     }
     group = group_names.get(result.change)
-    copied: dict[str, str] = {}
+    copied: dict[str, Any] = {}
     if not group or result.status != "success":
         return copied
     if result.original_file:
@@ -1034,6 +1120,20 @@ def _copy_batch_images(root: Path, batch_dir: Path, result: JobResult) -> dict[s
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
             copied["processed"] = destination.relative_to(batch_dir).as_posix()
+    step_paths: list[dict[str, Any]] = []
+    for step in result.step_files:
+        source = _safe_state_file(root, step.get("file"))
+        if source and source.is_file():
+            try:
+                relative = source.relative_to(batch_dir).as_posix()
+            except ValueError:
+                destination = batch_dir / group / "处理步骤" / source.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+                relative = destination.relative_to(batch_dir).as_posix()
+            step_paths.append({**step, "file": relative})
+    if step_paths:
+        copied["steps"] = step_paths
     return copied
 
 
@@ -1042,7 +1142,8 @@ def _write_manifest(batch_dir: Path, results: list[JobResult]) -> None:
     with path.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow([
-            "学号", "Excel行号", "变更类型", "导出状态", "人脸数", "图片来源",
+            "学号", "Excel行号", "变更类型", "导出状态", "预检状态", "退回原因",
+            "人脸数", "旋转角度", "检测器", "处理引擎", "图片来源",
             "原图文件", "处理后文件", "处理状态", "说明",
         ])
         for item in results:
@@ -1051,7 +1152,12 @@ def _write_manifest(batch_dir: Path, results: list[JobResult]) -> None:
                 item.row_number,
                 item.change,
                 item.status,
+                item.quality_status,
+                "；".join(reason.get("message", "") for reason in item.quality_reasons),
                 "" if item.face_count is None else item.face_count,
+                item.rotation_ccw,
+                item.detector,
+                item.background_engine,
                 item.source_display,
                 item.original_file or "",
                 item.processed_file or "",
@@ -1060,11 +1166,29 @@ def _write_manifest(batch_dir: Path, results: list[JobResult]) -> None:
             ])
 
 
+def _write_reupload_manifest(batch_dir: Path, results: list[JobResult]) -> Path | None:
+    rejected = [item for item in results if item.quality_status == "rejected"]
+    if not rejected:
+        return None
+    path = batch_dir / "需重传名单.csv"
+    with path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["学号", "Excel行号", "退回原因代码", "给学生的说明"])
+        for item in rejected:
+            writer.writerow([
+                item.student_id,
+                item.row_number,
+                ",".join(reason.get("code", "") for reason in item.quality_reasons),
+                "；".join(reason.get("message", "") for reason in item.quality_reasons),
+            ])
+    return path
+
+
 def _write_gallery(
     batch_dir: Path,
     batch_id: str,
     results: list[JobResult],
-    copied: dict[tuple[str, int], dict[str, str]],
+    copied: dict[tuple[str, int], dict[str, Any]],
     summary: dict[str, Any],
 ) -> Path:
     cards: list[str] = []
@@ -1075,23 +1199,41 @@ def _write_gallery(
     visible = [item for item in results if item.change != "unchanged" or item.status == "failed"]
     for item in visible:
         paths = copied.get((item.student_id, item.row_number), {})
+        step_figures: list[str] = []
+        for step in paths.get("steps", []):
+            step_path = step.get("file", "")
+            if not step_path:
+                continue
+            encoded = "/".join(urllib.parse.quote(part) for part in step_path.split("/"))
+            label = html.escape(str(step.get("label", step.get("code", "处理步骤"))))
+            detail = html.escape(str(step.get("detail", "")))
+            step_status = html.escape(str(step.get("status", "")))
+            step_figures.append(
+                f'<figure><img loading="lazy" src="{encoded}" alt="{label}">'
+                f'<figcaption><strong>{label}</strong><span class="stage-status {step_status}">{step_status}</span>'
+                f'<small>{detail}</small></figcaption></figure>'
+            )
         image_path = paths.get("processed") or paths.get("original")
-        if image_path:
+        if step_figures:
+            visual = f'<div class="steps">{"".join(step_figures)}</div>'
+        elif image_path:
             encoded = "/".join(urllib.parse.quote(part) for part in image_path.split("/"))
-            visual = f'<img loading="lazy" src="{encoded}" alt="{html.escape(item.student_id)}">'
+            visual = f'<div class="steps"><figure><img loading="lazy" src="{encoded}" alt="{html.escape(item.student_id)}"><figcaption><strong>结果</strong></figcaption></figure></div>'
         else:
             visual = '<div class="no-image">无可用图片</div>'
-        status_class = "ok" if item.status == "success" and item.processing_status != "warning" else "warn"
+        status_class = "reject" if item.quality_status == "rejected" else (
+            "ok" if item.status == "success" and item.processing_status != "warning" else "warn"
+        )
         note = item.message or item.processing_message or "处理完成"
         face = "" if item.face_count is None else f" · 人脸 {item.face_count}"
         cards.append(f"""
         <article class="card {status_class}">
-          {visual}
           <div class="meta">
             <h2>{html.escape(item.student_id or '(空学号)')}</h2>
             <p>{html.escape(change_labels.get(item.change, item.change))} · Excel 第 {item.row_number} 行{face}</p>
             <p class="note">{html.escape(note)}</p>
           </div>
+          {visual}
         </article>""")
     if not cards:
         cards.append('<div class="empty">本批次没有新增、更新或失败记录。</div>')
@@ -1100,6 +1242,7 @@ def _write_gallery(
         f"更新 {summary.get('updated', 0)}",
         f"重新处理 {summary.get('reprocessed', 0)}",
         f"未变化 {summary.get('unchanged', 0)}",
+        f"需重传 {summary.get('quality_rejected', 0)}",
         f"失败 {summary.get('failed', 0)}",
     ])
     document = f"""<!doctype html>
@@ -1113,10 +1256,18 @@ def _write_gallery(
     body {{ margin: 0; background: #f4f7fb; color: #172033; }}
     header {{ position: sticky; top: 0; z-index: 2; padding: 22px 28px; background: #17365d; color: white; box-shadow: 0 2px 12px #0002; }}
     h1 {{ margin: 0 0 8px; font-size: 24px; }} header p {{ margin: 0; opacity: .9; }}
-    main {{ padding: 24px; display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 18px; }}
+    main {{ padding: 24px; display: grid; gap: 18px; }}
     .card {{ overflow: hidden; border-radius: 12px; background: white; box-shadow: 0 5px 20px #1c355714; border: 1px solid #dce5ef; }}
     .card.warn {{ border-color: #e4a11b; }}
+    .card.reject {{ border-color: #d92d20; }}
+    .steps {{ display: flex; gap: 14px; padding: 0 14px 16px; overflow-x: auto; scroll-snap-type: x proximity; }}
+    figure {{ flex: 0 0 220px; margin: 0; scroll-snap-align: start; border: 1px solid #dce5ef; border-radius: 10px; overflow: hidden; }}
     img, .no-image {{ width: 100%; aspect-ratio: 3/4; object-fit: contain; background: #e8edf4; display: block; }}
+    figcaption {{ padding: 9px; display: grid; grid-template-columns: 1fr auto; gap: 5px; font-size: 12px; }}
+    figcaption small {{ grid-column: 1 / -1; color: #667085; line-height: 1.45; }}
+    .stage-status {{ border-radius: 999px; padding: 1px 7px; background: #eef2f6; }}
+    .stage-status.passed, .stage-status.adjusted {{ color: #067647; background: #ecfdf3; }}
+    .stage-status.rejected {{ color: #b42318; background: #fef3f2; }}
     .no-image {{ display: grid; place-items: center; color: #758195; }}
     .meta {{ padding: 14px; }} h2 {{ margin: 0 0 7px; font-size: 18px; }}
     .meta p {{ margin: 4px 0; color: #5d6879; font-size: 13px; }} .note {{ color: #9a5c00 !important; }}
@@ -1145,7 +1296,7 @@ def run_export(
         raise ExportError("列索引无效")
     if options.id_col == options.image_col:
         raise ExportError("学号列和图片列不能是同一列")
-    if options.background_mode not in {"none", "quick", "ai"}:
+    if options.background_mode not in {"none", "quick", "ai", "hivision"}:
         raise ExportError("背景处理模式无效")
     _parse_color(options.background_color)
     options.workers = max(1, min(16, int(options.workers)))
@@ -1216,7 +1367,7 @@ def run_export(
         else:
             previous_processing = existing.get("processing", {})
             needs_processing = (
-                (options.face_detection or options.background_mode != "none")
+                (options.quality_enabled or options.face_detection or options.background_mode != "none")
                 and (
                     previous_processing.get("config_fingerprint") != processing_fp
                     or previous_processing.get("status") not in {"success", "warning"}
@@ -1239,6 +1390,13 @@ def run_export(
                 original_sha256=existing.get("original_sha256") if existing else None,
                 processed_file=(existing or {}).get("processing", {}).get("processed_file"),
                 face_count=(existing or {}).get("processing", {}).get("face_count"),
+                quality_status=(existing or {}).get("processing", {}).get("quality_status", "not_requested"),
+                quality_reasons=(existing or {}).get("processing", {}).get("quality_reasons", []),
+                quality_metrics=(existing or {}).get("processing", {}).get("quality_metrics", {}),
+                rotation_ccw=(existing or {}).get("processing", {}).get("rotation_ccw", 0),
+                detector=(existing or {}).get("processing", {}).get("detector", "not_used"),
+                background_engine=(existing or {}).get("processing", {}).get("background_engine", "none"),
+                step_files=(existing or {}).get("processing", {}).get("step_files", []),
                 processing_status=(existing or {}).get("processing", {}).get("status", "not_requested"),
                 processing_message=(existing or {}).get("processing", {}).get("message", ""),
                 executed=False,
@@ -1290,6 +1448,13 @@ def run_export(
                 "status": item.processing_status,
                 "processed_file": item.processed_file,
                 "face_count": item.face_count,
+                "quality_status": item.quality_status,
+                "quality_reasons": item.quality_reasons,
+                "quality_metrics": item.quality_metrics,
+                "rotation_ccw": item.rotation_ccw,
+                "detector": item.detector,
+                "background_engine": item.background_engine,
+                "step_files": item.step_files,
                 "message": item.processing_message,
                 "last_processed_at": current_time if item.executed else (existing or {}).get("processing", {}).get("last_processed_at"),
             }
@@ -1313,6 +1478,7 @@ def run_export(
     counts = Counter(item.change for item in all_results if item.status == "success")
     failed = sum(1 for item in all_results if item.status == "failed")
     processing_warnings = sum(1 for item in all_results if item.processing_status == "warning")
+    quality_rejected = sum(1 for item in all_results if item.quality_status == "rejected")
     current_ids = {row.student_id for row in report.rows if row.student_id}
     missing_current = sum(1 for student_id in records if student_id not in current_ids)
     summary = {
@@ -1324,10 +1490,11 @@ def run_export(
         "unchanged": counts.get("unchanged", 0),
         "failed": failed,
         "processing_warnings": processing_warnings,
+        "quality_rejected": quality_rejected,
         "missing_from_current_workbook": missing_current,
     }
 
-    copied: dict[tuple[str, int], dict[str, str]] = {}
+    copied: dict[tuple[str, int], dict[str, Any]] = {}
     for item in all_results:
         try:
             copied[(item.student_id, item.row_number)] = _copy_batch_images(options.output_dir, batch_dir, item)
@@ -1336,6 +1503,7 @@ def run_export(
             item.processing_message = (item.processing_message + "；" if item.processing_message else "") + f"复制批次合集失败：{exc}"
 
     _write_manifest(batch_dir, all_results)
+    _write_reupload_manifest(batch_dir, all_results)
     batch_payload = {
         "batch_id": batch_id,
         "created_at": current_time,
@@ -1346,8 +1514,26 @@ def run_export(
         "image_column": column_label(options.image_col),
         "options": {
             "face_detection": options.face_detection,
+            "quality_enabled": options.quality_enabled,
+            "auto_orient": options.auto_orient,
+            "check_grayscale": options.check_grayscale,
+            "check_face": options.check_face,
+            "check_glare": options.check_glare,
+            "check_recapture": options.check_recapture,
+            "grayscale_ratio_threshold": options.grayscale_ratio_threshold,
+            "grayscale_delta_limit": options.grayscale_delta_limit,
+            "face_confidence_threshold": options.face_confidence_threshold,
+            "glare_ratio_threshold": options.glare_ratio_threshold,
+            "glare_luma_threshold": options.glare_luma_threshold,
+            "recapture_score_threshold": options.recapture_score_threshold,
+            "stop_on_reject": options.stop_on_reject,
             "background_mode": options.background_mode,
             "background_color": options.background_color,
+            "hivision_url": options.hivision_url,
+            "hivision_timeout": options.hivision_timeout,
+            "hivision_height": options.hivision_height,
+            "hivision_width": options.hivision_width,
+            "hivision_dpi": options.hivision_dpi,
             "force_refresh": options.force_refresh,
         },
         "summary": summary,

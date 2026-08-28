@@ -3,14 +3,17 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.portable-build/
 
 # Build and portable-package artifacts
 build/
 dist/
 _internal/
 *.spec
+!StudentPhotoFlow.spec
 *.exe
 *.zip
+release/
 
 # Runtime logs and local configuration
 *.log

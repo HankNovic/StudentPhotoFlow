@@ -28,6 +28,7 @@ BACKGROUND_MODES = {
     "不处理": "none",
     "快速纯色背景替换": "quick",
     "AI 智能抠图换背景": "ai",
+    "Hivision API（可选）": "hivision",
 }
 
 COLOR_PRESETS = {
@@ -53,14 +54,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--header-row", type=int, default=1, help="表头行号，默认 1")
     parser.add_argument("--id-column", help="学号列：列字母、列序号或表头名称")
     parser.add_argument("--image-column", help="图片列：列字母、列序号或表头名称")
-    parser.add_argument("--face-detection", action="store_true", help="检测人脸数量")
+    parser.add_argument("--face-detection", action="store_true", help="兼容参数：启用内置人脸检查")
+    parser.add_argument("--quality-check", action="store_true", help="启用 Pillow/OpenCV/YuNet 内置预检")
+    parser.add_argument("--no-auto-orient", action="store_true", help="预检时不自动修正图片方向")
     parser.add_argument(
         "--background-mode",
-        choices=["none", "quick", "ai"],
-        default="none",
-        help="背景处理：none/quick/ai",
+        choices=["none", "quick", "ai", "hivision"],
+        default="ai",
+        help="背景处理：none/quick/ai/hivision，默认 ai",
     )
     parser.add_argument("--background-color", default="#438EDB", help="背景色，例如 #438EDB")
+    parser.add_argument("--hivision-url", default="http://127.0.0.1:8080", help="可选 Hivision API 地址")
     parser.add_argument("--workers", type=int, default=6, help="并发数 1-16，默认 6")
     parser.add_argument("--force-refresh", action="store_true", help="重新下载已存在照片")
     return parser
@@ -97,8 +101,11 @@ def _cli_main(args: argparse.Namespace) -> int:
         id_col=id_col,
         image_col=image_col,
         face_detection=args.face_detection,
+        quality_enabled=args.quality_check,
+        auto_orient=not args.no_auto_orient,
         background_mode=args.background_mode,
         background_color=args.background_color,
+        hivision_url=args.hivision_url,
         workers=args.workers,
         force_refresh=args.force_refresh,
     )
@@ -130,9 +137,9 @@ class PhotoExporterApp:
         self.messagebox = messagebox
         self.colorchooser = colorchooser
         self.root = tk.Tk()
-        self.root.title(f"学生照片增量导出工具 {APP_VERSION}")
-        self.root.geometry("1120x780")
-        self.root.minsize(900, 650)
+        self.root.title(f"StudentPhotoFlow｜学生照片导出与处理工具 {APP_VERSION}")
+        self.root.geometry("1220x820")
+        self.root.minsize(980, 690)
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.busy = False
         self.sheet_names: list[str] = []
@@ -146,10 +153,27 @@ class PhotoExporterApp:
         self.header_row_var = tk.IntVar(value=1)
         self.id_col_var = tk.StringVar()
         self.image_col_var = tk.StringVar()
-        self.face_var = tk.BooleanVar(value=False)
-        self.background_mode_var = tk.StringVar(value="不处理")
+        self.quality_var = tk.BooleanVar(value=False)
+        self.auto_orient_var = tk.BooleanVar(value=True)
+        self.grayscale_var = tk.BooleanVar(value=True)
+        self.face_var = tk.BooleanVar(value=True)
+        self.glare_var = tk.BooleanVar(value=True)
+        self.recapture_var = tk.BooleanVar(value=True)
+        self.stop_on_reject_var = tk.BooleanVar(value=True)
+        self.grayscale_threshold_var = tk.DoubleVar(value=0.85)
+        self.grayscale_delta_var = tk.IntVar(value=10)
+        self.face_confidence_var = tk.DoubleVar(value=0.75)
+        self.glare_threshold_var = tk.DoubleVar(value=0.08)
+        self.glare_luma_var = tk.IntVar(value=245)
+        self.recapture_threshold_var = tk.DoubleVar(value=0.72)
+        self.background_mode_var = tk.StringVar(value="AI 智能抠图换背景")
         self.color_preset_var = tk.StringVar(value="标准蓝 #438EDB")
         self.custom_color_var = tk.StringVar(value="#438EDB")
+        self.hivision_url_var = tk.StringVar(value="http://127.0.0.1:8080")
+        self.hivision_timeout_var = tk.IntVar(value=120)
+        self.hivision_height_var = tk.IntVar(value=413)
+        self.hivision_width_var = tk.IntVar(value=295)
+        self.hivision_dpi_var = tk.IntVar(value=300)
         self.workers_var = tk.IntVar(value=6)
         self.force_var = tk.BooleanVar(value=False)
         self.open_gallery_var = tk.BooleanVar(value=True)
@@ -198,25 +222,32 @@ class PhotoExporterApp:
 
         options = ttk.LabelFrame(settings, text="可选图片处理", padding=(10, 7))
         options.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(10, 2))
-        ttk.Checkbutton(options, text="检测人脸数量并标记异常", variable=self.face_var).grid(row=0, column=0, padx=(0, 18), pady=2, sticky="w")
-        ttk.Label(options, text="换背景").grid(row=0, column=1, padx=(0, 6), pady=2)
+        ttk.Checkbutton(
+            options,
+            text="启用内置预检（Pillow + OpenCV + YuNet）",
+            variable=self.quality_var,
+        ).grid(row=0, column=0, columnspan=3, padx=(0, 12), pady=2, sticky="w")
+        ttk.Button(options, text="预检参数…", command=self.open_quality_settings).grid(row=0, column=3, padx=(0, 8), pady=2)
+        ttk.Button(options, text="打开可视化处理工作台…", command=self.open_workbench).grid(row=0, column=4, columnspan=3, pady=2, sticky="w")
+
+        ttk.Label(options, text="换背景").grid(row=1, column=0, padx=(0, 6), pady=(7, 2), sticky="w")
         ttk.Combobox(
             options,
             textvariable=self.background_mode_var,
             values=list(BACKGROUND_MODES),
             state="readonly",
             width=20,
-        ).grid(row=0, column=2, padx=(0, 18), pady=2)
-        ttk.Label(options, text="背景色").grid(row=0, column=3, padx=(0, 6), pady=2)
+        ).grid(row=1, column=1, padx=(0, 18), pady=(7, 2), sticky="w")
+        ttk.Label(options, text="背景色").grid(row=1, column=2, padx=(0, 6), pady=(7, 2))
         ttk.Combobox(
             options,
             textvariable=self.color_preset_var,
             values=list(COLOR_PRESETS),
             state="readonly",
             width=18,
-        ).grid(row=0, column=4, padx=(0, 6), pady=2)
-        ttk.Button(options, text="自定义…", command=self.choose_color).grid(row=0, column=5, padx=(0, 18), pady=2)
-        ttk.Label(options, textvariable=self.custom_color_var, width=9).grid(row=0, column=6, pady=2)
+        ).grid(row=1, column=3, padx=(0, 6), pady=(7, 2))
+        ttk.Button(options, text="自定义…", command=self.choose_color).grid(row=1, column=4, padx=(0, 8), pady=(7, 2))
+        ttk.Label(options, textvariable=self.custom_color_var, width=9).grid(row=1, column=5, pady=(7, 2), sticky="w")
 
         advanced = ttk.Frame(settings)
         advanced.grid(row=5, column=0, columnspan=6, sticky="ew", pady=(6, 0))
@@ -297,6 +328,118 @@ class PhotoExporterApp:
 
     def _selected_color(self) -> str:
         return COLOR_PRESETS.get(self.color_preset_var.get(), self.custom_color_var.get())
+
+    def _pipeline_options_from_ui(self):
+        from photo_pipeline import PipelineOptions
+
+        return PipelineOptions(
+            quality_enabled=bool(self.quality_var.get()),
+            auto_orient=bool(self.auto_orient_var.get()),
+            check_grayscale=bool(self.grayscale_var.get()),
+            check_face=bool(self.face_var.get()),
+            check_glare=bool(self.glare_var.get()),
+            check_recapture=bool(self.recapture_var.get()),
+            grayscale_ratio_threshold=float(self.grayscale_threshold_var.get()),
+            grayscale_delta_limit=int(self.grayscale_delta_var.get()),
+            face_confidence_threshold=float(self.face_confidence_var.get()),
+            glare_ratio_threshold=float(self.glare_threshold_var.get()),
+            glare_luma_threshold=int(self.glare_luma_var.get()),
+            recapture_score_threshold=float(self.recapture_threshold_var.get()),
+            stop_on_reject=bool(self.stop_on_reject_var.get()),
+            background_mode=BACKGROUND_MODES[self.background_mode_var.get()],
+            background_color=self._selected_color(),
+            hivision_url=self.hivision_url_var.get().strip(),
+            hivision_timeout=int(self.hivision_timeout_var.get()),
+            hivision_height=int(self.hivision_height_var.get()),
+            hivision_width=int(self.hivision_width_var.get()),
+            hivision_dpi=int(self.hivision_dpi_var.get()),
+        )
+
+    def open_quality_settings(self) -> None:
+        ttk = self.ttk
+        window = self.tk.Toplevel(self.root)
+        window.title("内置预检与 Hivision 参数")
+        window.transient(self.root)
+        window.resizable(False, False)
+        body = ttk.Frame(window, padding=14)
+        body.grid(sticky="nsew")
+
+        steps = ttk.LabelFrame(body, text="参与处理的步骤", padding=10)
+        steps.grid(row=0, column=0, sticky="ew")
+        ttk.Checkbutton(steps, text="自动判断并修正 90°/180°/270°方向", variable=self.auto_orient_var).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(steps, text="彩色/黑白检查", variable=self.grayscale_var).grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(steps, text="人脸数量检查", variable=self.face_var).grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(steps, text="反光与过曝检查", variable=self.glare_var).grid(row=3, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(steps, text="二次拍摄检查", variable=self.recapture_var).grid(row=4, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(steps, text="预检不合格时停止后续换背景并列入重传名单", variable=self.stop_on_reject_var).grid(row=5, column=0, sticky="w", pady=(6, 2))
+
+        thresholds = ttk.LabelFrame(body, text="判定阈值（可调参后重新输出）", padding=10)
+        thresholds.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        rows = [
+            ("灰度得分阈值", self.grayscale_threshold_var, 0.0, 1.0, 0.01),
+            ("灰度通道差上限", self.grayscale_delta_var, 0, 60, 1),
+            ("人脸置信度阈值", self.face_confidence_var, 0.05, 0.99, 0.01),
+            ("反光面积阈值", self.glare_threshold_var, 0.0, 1.0, 0.01),
+            ("反光亮度阈值", self.glare_luma_var, 1, 255, 1),
+            ("二次拍摄得分阈值", self.recapture_threshold_var, 0.0, 1.0, 0.01),
+        ]
+        for row_index, (label, variable, start, end, increment) in enumerate(rows):
+            ttk.Label(thresholds, text=label, width=20).grid(row=row_index, column=0, sticky="w", pady=3)
+            ttk.Spinbox(
+                thresholds,
+                from_=start,
+                to=end,
+                increment=increment,
+                textvariable=variable,
+                width=10,
+            ).grid(row=row_index, column=1, sticky="w", pady=3)
+
+        hivision = ttk.LabelFrame(body, text="Hivision API（仅选择该模式时使用，不打包服务）", padding=10)
+        hivision.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(hivision, text="API 地址").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Entry(hivision, textvariable=self.hivision_url_var, width=42).grid(row=0, column=1, columnspan=5, sticky="ew", pady=3)
+        ttk.Label(hivision, text="超时秒数").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Spinbox(hivision, from_=5, to=600, textvariable=self.hivision_timeout_var, width=8).grid(row=1, column=1, sticky="w")
+        ttk.Label(hivision, text="宽").grid(row=1, column=2, padx=(12, 4))
+        ttk.Spinbox(hivision, from_=100, to=3000, textvariable=self.hivision_width_var, width=7).grid(row=1, column=3)
+        ttk.Label(hivision, text="高").grid(row=1, column=4, padx=(12, 4))
+        ttk.Spinbox(hivision, from_=100, to=4000, textvariable=self.hivision_height_var, width=7).grid(row=1, column=5)
+        ttk.Label(hivision, text="DPI").grid(row=1, column=6, padx=(12, 4))
+        ttk.Spinbox(hivision, from_=72, to=1200, textvariable=self.hivision_dpi_var, width=7).grid(row=1, column=7)
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=3, column=0, sticky="e", pady=(12, 0))
+
+        def restore_defaults() -> None:
+            self.auto_orient_var.set(True)
+            self.grayscale_var.set(True)
+            self.face_var.set(True)
+            self.glare_var.set(True)
+            self.recapture_var.set(True)
+            self.stop_on_reject_var.set(True)
+            self.grayscale_threshold_var.set(0.85)
+            self.grayscale_delta_var.set(10)
+            self.face_confidence_var.set(0.75)
+            self.glare_threshold_var.set(0.08)
+            self.glare_luma_var.set(245)
+            self.recapture_threshold_var.set(0.72)
+
+        ttk.Button(buttons, text="恢复建议值", command=restore_defaults).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="关闭", command=window.destroy).pack(side="left")
+
+    def open_workbench(self) -> None:
+        try:
+            from photo_workbench import PhotoProcessingWorkbench
+
+            PhotoProcessingWorkbench(
+                self.root,
+                self._pipeline_options_from_ui(),
+                Path(self.output_var.get().strip() or application_directory() / "导出结果"),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            self.messagebox.showerror("参数错误", str(exc))
+        except Exception as exc:
+            self.messagebox.showerror("无法打开处理工作台", str(exc))
 
     def _column_choice_to_index(self, choice: str) -> int:
         if " - " in choice:
@@ -432,9 +575,27 @@ class PhotoExporterApp:
                 header_row=int(self.header_row_var.get()),
                 id_col=id_col,
                 image_col=image_col,
-                face_detection=bool(self.face_var.get()),
+                face_detection=False,
+                quality_enabled=bool(self.quality_var.get()),
+                auto_orient=bool(self.auto_orient_var.get()),
+                check_grayscale=bool(self.grayscale_var.get()),
+                check_face=bool(self.face_var.get()),
+                check_glare=bool(self.glare_var.get()),
+                check_recapture=bool(self.recapture_var.get()),
+                grayscale_ratio_threshold=float(self.grayscale_threshold_var.get()),
+                grayscale_delta_limit=int(self.grayscale_delta_var.get()),
+                face_confidence_threshold=float(self.face_confidence_var.get()),
+                glare_ratio_threshold=float(self.glare_threshold_var.get()),
+                glare_luma_threshold=int(self.glare_luma_var.get()),
+                recapture_score_threshold=float(self.recapture_threshold_var.get()),
+                stop_on_reject=bool(self.stop_on_reject_var.get()),
                 background_mode=BACKGROUND_MODES[self.background_mode_var.get()],
                 background_color=self._selected_color(),
+                hivision_url=self.hivision_url_var.get().strip(),
+                hivision_timeout=int(self.hivision_timeout_var.get()),
+                hivision_height=int(self.hivision_height_var.get()),
+                hivision_width=int(self.hivision_width_var.get()),
+                hivision_dpi=int(self.hivision_dpi_var.get()),
                 workers=int(self.workers_var.get()),
                 force_refresh=bool(self.force_var.get()),
             )
@@ -462,7 +623,8 @@ class PhotoExporterApp:
         summary = result.summary
         message = (
             f"批次 {result.batch_id} 完成：新增 {summary['new']}，更新 {summary['updated']}，"
-            f"重新处理 {summary['reprocessed']}，未变化 {summary['unchanged']}，失败 {summary['failed']}。"
+            f"重新处理 {summary['reprocessed']}，未变化 {summary['unchanged']}，"
+            f"需重传 {summary.get('quality_rejected', 0)}，失败 {summary['failed']}。"
         )
         self.progress.configure(value=100)
         self._set_busy(False, "导出完成")
