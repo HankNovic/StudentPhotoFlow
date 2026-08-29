@@ -11,16 +11,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from photo_pipeline import HIVISION_FACE_MODELS, HIVISION_MATTING_MODELS
+from photo_pipeline import HIVISION_FACE_MODELS, HIVISION_MATTING_MODELS, PipelineOptions, test_hivision_api
 from xlsx_photo_core import (
     APP_VERSION,
     ExportOptions,
+    ProcessingOptions,
     WorkbookError,
     WorkbookReader,
     column_label,
     inspect_selection,
     resolve_column_spec,
     run_export,
+    run_processing,
     suggest_columns,
 )
 
@@ -50,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("xlsx", nargs="?", help="Excel 文件路径；不加其他参数时会打开图形界面")
     parser.add_argument("--cli", action="store_true", help="使用命令行模式")
     parser.add_argument("--inspect", action="store_true", help="仅检查工作簿，不导出")
+    parser.add_argument("--operation", choices=["export", "process"], default="export", help="export 只导出原图；process 只处理已导出的原图")
+    parser.add_argument("--test-hivision-api", action="store_true", help="只测试 Hivision OpenAPI 和 /idphoto 参数兼容性")
     parser.add_argument("--output", help="输出目录")
     parser.add_argument("--sheet", help="工作表名称，默认第一张表")
     parser.add_argument("--header-row", type=int, default=1, help="表头行号，默认 1")
@@ -87,10 +91,64 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hivision-saturation", type=float, default=0.0, help="Hivision 饱和度强度")
     parser.add_argument("--workers", type=int, default=6, help="并发数 1-16，默认 6")
     parser.add_argument("--force-refresh", action="store_true", help="重新下载已存在照片")
+    parser.add_argument("--force-process", action="store_true", help="忽略处理指纹，重新处理全部已导出原图")
     return parser
 
 
+def _pipeline_options_from_args(args: argparse.Namespace) -> PipelineOptions:
+    return PipelineOptions(
+        quality_enabled=args.quality_check or args.face_detection,
+        auto_orient=not args.no_auto_orient,
+        check_grayscale=args.quality_check,
+        check_face=args.quality_check or args.face_detection,
+        check_glare=args.quality_check,
+        check_recapture=args.quality_check,
+        background_mode=args.background_mode,
+        background_color=args.background_color,
+        crop_enabled=args.crop,
+        crop_width=args.crop_width,
+        crop_height=args.crop_height,
+        hivision_url=args.hivision_url,
+        hivision_timeout=args.hivision_timeout,
+        hivision_width=args.hivision_width,
+        hivision_height=args.hivision_height,
+        hivision_dpi=args.hivision_dpi,
+        hivision_matting_model=args.hivision_matting_model,
+        hivision_face_model=args.hivision_face_model,
+        hivision_hd=args.hivision_hd,
+        hivision_face_align=args.hivision_face_align,
+        hivision_head_measure_ratio=args.hivision_head_measure_ratio,
+        hivision_head_height_ratio=args.hivision_head_height_ratio,
+        hivision_top_distance_max=args.hivision_top_distance_max,
+        hivision_top_distance_min=args.hivision_top_distance_min,
+        hivision_brightness_strength=args.hivision_brightness,
+        hivision_contrast_strength=args.hivision_contrast,
+        hivision_sharpen_strength=args.hivision_sharpen,
+        hivision_saturation_strength=args.hivision_saturation,
+    )
+
+
 def _cli_main(args: argparse.Namespace) -> int:
+    if args.test_hivision_api:
+        print(json.dumps(test_hivision_api(args.hivision_url, args.hivision_timeout), ensure_ascii=False, indent=2))
+        return 0
+    if args.operation == "process":
+        if not args.output:
+            raise SystemExit("处理已导出原图时必须提供 --output 输出目录")
+        result = run_processing(ProcessingOptions(
+            output_dir=Path(args.output),
+            pipeline=_pipeline_options_from_args(args),
+            workers=args.workers,
+            force_process=args.force_process,
+        ), lambda done, total, message: print(f"[{done}/{total}] {message}", flush=True))
+        print(json.dumps({
+            "batch_id": result.batch_id,
+            "operation": result.operation,
+            "gallery": str(result.gallery_path),
+            "state": str(result.state_path),
+            "summary": result.summary,
+        }, ensure_ascii=False, indent=2))
+        return 2 if result.summary.get("failed") else 0
     if not args.xlsx:
         raise SystemExit("命令行模式必须提供 Excel 文件路径")
     xlsx = Path(args.xlsx)
@@ -120,31 +178,6 @@ def _cli_main(args: argparse.Namespace) -> int:
         header_row=args.header_row,
         id_col=id_col,
         image_col=image_col,
-        face_detection=args.face_detection,
-        quality_enabled=args.quality_check,
-        auto_orient=not args.no_auto_orient,
-        background_mode=args.background_mode,
-        background_color=args.background_color,
-        crop_enabled=args.crop,
-        crop_width=args.crop_width,
-        crop_height=args.crop_height,
-        hivision_url=args.hivision_url,
-        hivision_timeout=args.hivision_timeout,
-        hivision_width=args.hivision_width,
-        hivision_height=args.hivision_height,
-        hivision_dpi=args.hivision_dpi,
-        hivision_matting_model=args.hivision_matting_model,
-        hivision_face_model=args.hivision_face_model,
-        hivision_hd=args.hivision_hd,
-        hivision_face_align=args.hivision_face_align,
-        hivision_head_measure_ratio=args.hivision_head_measure_ratio,
-        hivision_head_height_ratio=args.hivision_head_height_ratio,
-        hivision_top_distance_max=args.hivision_top_distance_max,
-        hivision_top_distance_min=args.hivision_top_distance_min,
-        hivision_brightness_strength=args.hivision_brightness,
-        hivision_contrast_strength=args.hivision_contrast,
-        hivision_sharpen_strength=args.hivision_sharpen,
-        hivision_saturation_strength=args.hivision_saturation,
         workers=args.workers,
         force_refresh=args.force_refresh,
     )
@@ -232,12 +265,15 @@ class PhotoExporterApp:
         self.crop_height_var = tk.IntVar(value=413)
         self.workers_var = tk.IntVar(value=6)
         self.force_var = tk.BooleanVar(value=False)
+        self.force_process_var = tk.BooleanVar(value=False)
         self.open_gallery_var = tk.BooleanVar(value=True)
+        self.hivision_test_status_var = tk.StringVar(value="尚未测试；测试时不会上传学生照片。")
         self.summary_var = tk.StringVar(value="请选择 Excel 文件后点击“检查表格”。")
         self.progress_text_var = tk.StringVar(value="就绪")
         self.export_run_event = threading.Event()
         self.export_run_event.set()
         self.export_paused = False
+        self.current_operation = ""
 
         self._build_ui()
         self.root.after(120, self._poll_events)
@@ -279,8 +315,14 @@ class PhotoExporterApp:
         self.image_box = ttk.Combobox(settings, textvariable=self.image_col_var, state="readonly", width=22)
         self.image_box.grid(row=3, column=3, columnspan=2, sticky="ew", pady=4)
 
-        options = ttk.LabelFrame(settings, text="可选图片处理", padding=(10, 7))
-        options.grid(row=4, column=0, columnspan=6, sticky="ew", pady=(10, 2))
+        ttk.Label(
+            settings,
+            text="流程已分离：第一步从 Excel 增量导出原图；第二步只读取输出目录中的原图进行处理。",
+            foreground="#475467",
+        ).grid(row=4, column=0, columnspan=6, sticky="w", pady=(8, 2))
+
+        options = ttk.LabelFrame(settings, text="第二步：图片处理参数", padding=(10, 7))
+        options.grid(row=5, column=0, columnspan=6, sticky="ew", pady=(6, 2))
         ttk.Checkbutton(
             options,
             text="启用内置预检（Pillow + OpenCV + YuNet）",
@@ -324,10 +366,11 @@ class PhotoExporterApp:
         ttk.Label(options, text="像素（默认 295×413）").grid(row=2, column=5, pady=(7, 2), sticky="w")
 
         advanced = ttk.Frame(settings)
-        advanced.grid(row=5, column=0, columnspan=6, sticky="ew", pady=(6, 0))
+        advanced.grid(row=6, column=0, columnspan=6, sticky="ew", pady=(6, 0))
         ttk.Label(advanced, text="并发数").pack(side="left")
         ttk.Spinbox(advanced, from_=1, to=16, textvariable=self.workers_var, width=5).pack(side="left", padx=(6, 18))
         ttk.Checkbutton(advanced, text="强制重新下载已有照片", variable=self.force_var).pack(side="left", padx=(0, 18))
+        ttk.Checkbutton(advanced, text="强制重新处理全部原图", variable=self.force_process_var).pack(side="left", padx=(0, 18))
         ttk.Checkbutton(advanced, text="完成后打开本次合集", variable=self.open_gallery_var).pack(side="left")
 
         content = ttk.Panedwindow(self.root, orient="vertical")
@@ -378,8 +421,10 @@ class PhotoExporterApp:
         ttk.Button(footer, text="查看最新批次", command=self.open_latest).grid(row=0, column=3, padx=(8, 0))
         self.pause_button = ttk.Button(footer, text="暂停", command=self.toggle_export_pause, state="disabled")
         self.pause_button.grid(row=0, column=4, padx=(12, 0))
-        self.export_button = ttk.Button(footer, text="开始增量导出", command=self.export_async)
+        self.export_button = ttk.Button(footer, text="1. 导出原图", command=self.export_async)
         self.export_button.grid(row=0, column=5, padx=(8, 0))
+        self.process_button = ttk.Button(footer, text="2. 处理图片", command=self.process_async)
+        self.process_button.grid(row=0, column=6, padx=(8, 0))
 
     def choose_xlsx(self) -> None:
         path = self.filedialog.askopenfilename(
@@ -517,19 +562,24 @@ class PhotoExporterApp:
         ttk.Label(connection, text="可填服务根地址或以 /idphoto 结尾的完整地址", foreground="#667085").grid(
             row=1, column=1, columnspan=7, sticky="w", pady=(0, 5)
         )
-        ttk.Label(connection, text="超时秒数").grid(row=2, column=0, sticky="w", pady=3)
-        ttk.Spinbox(connection, from_=5, to=3600, textvariable=self.hivision_timeout_var, width=8).grid(row=2, column=1, sticky="w")
-        ttk.Label(connection, text="宽").grid(row=2, column=2, padx=(12, 4))
-        ttk.Spinbox(connection, from_=32, to=10000, textvariable=self.hivision_width_var, width=8).grid(row=2, column=3)
-        ttk.Label(connection, text="高").grid(row=2, column=4, padx=(12, 4))
-        ttk.Spinbox(connection, from_=32, to=10000, textvariable=self.hivision_height_var, width=8).grid(row=2, column=5)
-        ttk.Label(connection, text="DPI").grid(row=2, column=6, padx=(12, 4))
-        ttk.Spinbox(connection, from_=36, to=2400, textvariable=self.hivision_dpi_var, width=8).grid(row=2, column=7)
+        self.hivision_test_button = ttk.Button(connection, text="测试 API", command=self.test_hivision_connection)
+        self.hivision_test_button.grid(row=2, column=0, sticky="w", pady=(2, 6))
+        ttk.Label(connection, textvariable=self.hivision_test_status_var, foreground="#475467", wraplength=650).grid(
+            row=2, column=1, columnspan=7, sticky="w", pady=(2, 6)
+        )
+        ttk.Label(connection, text="超时秒数").grid(row=3, column=0, sticky="w", pady=3)
+        ttk.Spinbox(connection, from_=5, to=3600, textvariable=self.hivision_timeout_var, width=8).grid(row=3, column=1, sticky="w")
+        ttk.Label(connection, text="宽").grid(row=3, column=2, padx=(12, 4))
+        ttk.Spinbox(connection, from_=32, to=10000, textvariable=self.hivision_width_var, width=8).grid(row=3, column=3)
+        ttk.Label(connection, text="高").grid(row=3, column=4, padx=(12, 4))
+        ttk.Spinbox(connection, from_=32, to=10000, textvariable=self.hivision_height_var, width=8).grid(row=3, column=5)
+        ttk.Label(connection, text="DPI").grid(row=3, column=6, padx=(12, 4))
+        ttk.Spinbox(connection, from_=36, to=2400, textvariable=self.hivision_dpi_var, width=8).grid(row=3, column=7)
         ttk.Checkbutton(connection, text="请求并使用高清结果", variable=self.hivision_hd_var).grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(7, 2)
+            row=4, column=0, columnspan=3, sticky="w", pady=(7, 2)
         )
         ttk.Checkbutton(connection, text="启用 Hivision 人脸对齐", variable=self.hivision_face_align_var).grid(
-            row=3, column=3, columnspan=4, sticky="w", pady=(7, 2)
+            row=4, column=3, columnspan=4, sticky="w", pady=(7, 2)
         )
 
         models = ttk.LabelFrame(hivision_tab, text="服务端模型", padding=10)
@@ -636,6 +686,28 @@ class PhotoExporterApp:
         ttk.Button(buttons, text="恢复 Hivision 默认值", command=restore_hivision_defaults).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="关闭", command=window.destroy).pack(side="left")
 
+    def test_hivision_connection(self) -> None:
+        try:
+            url = self.hivision_url_var.get().strip()
+            timeout = int(self.hivision_timeout_var.get())
+        except (TypeError, ValueError) as exc:
+            self.messagebox.showerror("API 设置错误", str(exc))
+            return
+        self.hivision_test_status_var.set("正在读取 OpenAPI 并检查 /idphoto 参数…")
+        try:
+            self.hivision_test_button.configure(state="disabled")
+        except Exception:
+            pass
+
+        def worker() -> None:
+            try:
+                result = test_hivision_api(url, timeout)
+                self.events.put(("api_test_done", result))
+            except Exception as exc:
+                self.events.put(("api_test_error", str(exc)))
+
+        threading.Thread(target=worker, name="test-hivision-api", daemon=True).start()
+
     def open_workbench(self) -> None:
         try:
             from photo_workbench import PhotoProcessingWorkbench
@@ -660,6 +732,7 @@ class PhotoExporterApp:
         state = "disabled" if busy else "normal"
         self.inspect_button.configure(state=state)
         self.export_button.configure(state=state)
+        self.process_button.configure(state=state)
         if not busy:
             self.export_paused = False
             self.export_run_event.set()
@@ -675,13 +748,13 @@ class PhotoExporterApp:
             self.export_run_event.set()
             self.pause_button.configure(text="暂停")
             self.progress_text_var.set("正在继续处理…")
-            self._append_log("已继续：等待中的学生任务开始处理。")
+            self._append_log("已继续：等待中的学生任务开始执行。")
         else:
             self.export_paused = True
             self.export_run_event.clear()
             self.pause_button.configure(text="继续")
             self.progress_text_var.set("已暂停；正在处理的任务会安全收尾")
-            self._append_log("已暂停：不再启动新任务；正在处理的任务会安全完成。")
+            self._append_log("已暂停：不再启动新任务；正在执行的任务会安全完成。")
 
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -804,44 +877,6 @@ class PhotoExporterApp:
                 header_row=int(self.header_row_var.get()),
                 id_col=id_col,
                 image_col=image_col,
-                face_detection=False,
-                quality_enabled=bool(self.quality_var.get()),
-                auto_orient=bool(self.auto_orient_var.get()),
-                check_grayscale=bool(self.grayscale_var.get()),
-                check_face=bool(self.face_var.get()),
-                check_glare=bool(self.glare_var.get()),
-                check_recapture=bool(self.recapture_var.get()),
-                grayscale_ratio_threshold=float(self.grayscale_threshold_var.get()),
-                grayscale_delta_limit=int(self.grayscale_delta_var.get()),
-                face_confidence_threshold=float(self.face_confidence_var.get()),
-                orientation_min_confidence=float(self.orientation_min_confidence_var.get()),
-                orientation_confidence_margin=float(self.orientation_confidence_margin_var.get()),
-                glare_ratio_threshold=float(self.glare_threshold_var.get()),
-                glare_luma_threshold=int(self.glare_luma_var.get()),
-                recapture_score_threshold=float(self.recapture_threshold_var.get()),
-                stop_on_reject=bool(self.stop_on_reject_var.get()),
-                background_mode=BACKGROUND_MODES[self.background_mode_var.get()],
-                background_color=self._selected_color(),
-                hivision_url=self.hivision_url_var.get().strip(),
-                hivision_timeout=int(self.hivision_timeout_var.get()),
-                hivision_height=int(self.hivision_height_var.get()),
-                hivision_width=int(self.hivision_width_var.get()),
-                hivision_dpi=int(self.hivision_dpi_var.get()),
-                hivision_matting_model=self.hivision_matting_model_var.get().strip(),
-                hivision_face_model=self.hivision_face_model_var.get().strip(),
-                hivision_hd=bool(self.hivision_hd_var.get()),
-                hivision_face_align=bool(self.hivision_face_align_var.get()),
-                hivision_head_measure_ratio=float(self.hivision_head_measure_ratio_var.get()),
-                hivision_head_height_ratio=float(self.hivision_head_height_ratio_var.get()),
-                hivision_top_distance_max=float(self.hivision_top_distance_max_var.get()),
-                hivision_top_distance_min=float(self.hivision_top_distance_min_var.get()),
-                hivision_brightness_strength=float(self.hivision_brightness_var.get()),
-                hivision_contrast_strength=float(self.hivision_contrast_var.get()),
-                hivision_sharpen_strength=float(self.hivision_sharpen_var.get()),
-                hivision_saturation_strength=float(self.hivision_saturation_var.get()),
-                crop_enabled=bool(self.crop_enabled_var.get()),
-                crop_width=int(self.crop_width_var.get()),
-                crop_height=int(self.crop_height_var.get()),
                 workers=int(self.workers_var.get()),
                 force_refresh=bool(self.force_var.get()),
             )
@@ -849,12 +884,13 @@ class PhotoExporterApp:
             self.messagebox.showerror("设置错误", str(exc))
             return
 
-        self._set_busy(True, "准备导出…")
+        self.current_operation = "export"
+        self._set_busy(True, "准备导出原图…")
         self.export_paused = False
         self.export_run_event.set()
         self.pause_button.configure(text="暂停", state="normal")
         self.progress.configure(value=0)
-        self._append_log(f"开始增量导出到：{options.output_dir}")
+        self._append_log(f"第一步：只增量导出原图到 {options.output_dir}")
 
         def progress(done: int, total: int, message: str) -> None:
             self.events.put(("progress", (done, total, message)))
@@ -868,15 +904,60 @@ class PhotoExporterApp:
 
         threading.Thread(target=worker, name="run-export", daemon=True).start()
 
+    def process_async(self) -> None:
+        if self.busy:
+            return
+        try:
+            output = Path(self.output_var.get().strip())
+            pipeline = self._pipeline_options_from_ui()
+            options = ProcessingOptions(
+                output_dir=output,
+                pipeline=pipeline,
+                workers=int(self.workers_var.get()),
+                force_process=bool(self.force_process_var.get()),
+                save_intermediate_steps=True,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            self.messagebox.showerror("处理设置错误", str(exc))
+            return
+
+        self.current_operation = "process"
+        self._set_busy(True, "准备处理已导出原图…")
+        self.export_paused = False
+        self.export_run_event.set()
+        self.pause_button.configure(text="暂停", state="normal")
+        self.progress.configure(value=0)
+        self._append_log(f"第二步：从 {options.output_dir / '原始图片'} 读取并处理图片")
+
+        def progress(done: int, total: int, message: str) -> None:
+            self.events.put(("progress", (done, total, message)))
+
+        def worker() -> None:
+            try:
+                result = run_processing(options, progress, self.export_run_event)
+                self.events.put(("export_done", result))
+            except Exception as exc:
+                self.events.put(("error", ("图片处理失败", str(exc))))
+
+        threading.Thread(target=worker, name="run-processing", daemon=True).start()
+
     def _show_export_done(self, result: Any) -> None:
         summary = result.summary
-        message = (
-            f"批次 {result.batch_id} 完成：新增 {summary['new']}，更新 {summary['updated']}，"
-            f"重新处理 {summary['reprocessed']}，未变化 {summary['unchanged']}，"
-            f"需重传 {summary.get('quality_rejected', 0)}，失败 {summary['failed']}。"
-        )
+        if getattr(result, "operation", "export") == "process":
+            title = "图片处理完成"
+            message = (
+                f"处理批次 {result.batch_id} 完成：本次处理 {summary['reprocessed']}，"
+                f"参数未变 {summary['unchanged']}，需重传 {summary.get('quality_rejected', 0)}，"
+                f"警告 {summary.get('processing_warnings', 0)}，失败 {summary['failed']}。"
+            )
+        else:
+            title = "原图导出完成"
+            message = (
+                f"导出批次 {result.batch_id} 完成：新增 {summary['new']}，更新 {summary['updated']}，"
+                f"修复 {summary['repair']}，未变化 {summary['unchanged']}，失败 {summary['failed']}。"
+            )
         self.progress.configure(value=100)
-        self._set_busy(False, "导出完成")
+        self._set_busy(False, title)
         self._append_log(message)
         if summary.get("processing_warnings"):
             self._append_log(f"其中 {summary['processing_warnings']} 条有图片处理警告，请查看本次合集。")
@@ -885,7 +966,7 @@ class PhotoExporterApp:
                 os.startfile(result.gallery_path)  # type: ignore[attr-defined]
             except OSError as exc:
                 self._append_log(f"无法自动打开合集：{exc}")
-        self.messagebox.showinfo("导出完成", message)
+        self.messagebox.showinfo(title, message)
 
     def _poll_events(self) -> None:
         try:
@@ -904,6 +985,32 @@ class PhotoExporterApp:
                     self._append_log(message)
                 elif event == "export_done":
                     self._show_export_done(payload)
+                elif event == "api_test_done":
+                    self.hivision_test_status_var.set(payload["message"])
+                    try:
+                        self.hivision_test_button.configure(state="normal")
+                    except Exception:
+                        pass
+                    self._append_log(f"Hivision API 测试：{payload['message']}")
+                    title = "API 兼容" if payload.get("ok") else "API 参数不兼容"
+                    details = (
+                        f"{payload['message']}\n\n"
+                        f"接口：{payload['endpoint']}\n"
+                        f"服务：{payload['service_title']} {payload['service_version']}\n"
+                        "本次测试只读取 OpenAPI，没有上传学生照片。"
+                    )
+                    if payload.get("ok"):
+                        self.messagebox.showinfo(title, details)
+                    else:
+                        self.messagebox.showwarning(title, details)
+                elif event == "api_test_error":
+                    self.hivision_test_status_var.set(f"测试失败：{payload}")
+                    try:
+                        self.hivision_test_button.configure(state="normal")
+                    except Exception:
+                        pass
+                    self._append_log(f"Hivision API 测试失败：{payload}")
+                    self.messagebox.showerror("API 测试失败", payload)
                 elif event == "error":
                     title, message = payload
                     self._set_busy(False, "发生错误")

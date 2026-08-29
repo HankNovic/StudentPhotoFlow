@@ -8,6 +8,7 @@ import re
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -100,6 +101,110 @@ class PipelineResult:
     metrics: dict[str, Any]
     detector: str = "not_used"
     background_engine: str = "none"
+
+
+HIVISION_API_FIELDS = {
+    "input_image",
+    "height",
+    "width",
+    "human_matting_model",
+    "face_detect_model",
+    "hd",
+    "dpi",
+    "face_align",
+    "head_measure_ratio",
+    "head_height_ratio",
+    "top_distance_max",
+    "top_distance_min",
+    "brightness_strength",
+    "contrast_strength",
+    "sharpen_strength",
+    "saturation_strength",
+}
+HIVISION_CORE_FIELDS = {
+    "input_image",
+    "height",
+    "width",
+    "human_matting_model",
+    "face_detect_model",
+}
+
+
+def _resolve_openapi_schema(document: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
+    reference = schema.get("$ref")
+    if not isinstance(reference, str) or not reference.startswith("#/"):
+        return schema
+    value: Any = document
+    for part in reference[2:].split("/"):
+        if not isinstance(value, dict):
+            return schema
+        value = value.get(part.replace("~1", "/").replace("~0", "~"))
+    return value if isinstance(value, dict) else schema
+
+
+def test_hivision_api(url: str, timeout: int = 15) -> dict[str, Any]:
+    """Check reachability and /idphoto form compatibility without uploading a photo."""
+    text = url.strip()
+    if not text:
+        raise PipelineError("请先填写 Hivision API 地址")
+    parsed = urllib.parse.urlsplit(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise PipelineError("Hivision API 地址必须是有效的 http/https 地址")
+    path = parsed.path.rstrip("/")
+    if path.endswith("/idphoto"):
+        path = path[:-len("/idphoto")]
+    root = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", ""))
+    openapi_url = root + "/openapi.json"
+    endpoint = root + "/idphoto"
+    request = urllib.request.Request(
+        openapi_url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) StudentPhotoFlow/1.5",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=max(3, min(120, int(timeout)))) as response:
+            raw = response.read(4 * 1024 * 1024 + 1)
+            status_code = int(getattr(response, "status", 200))
+    except urllib.error.HTTPError as exc:
+        raise PipelineError(f"API 文档检测失败（HTTP {exc.code}）：{openapi_url}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise PipelineError(f"无法连接 Hivision API：{exc}") from exc
+    if len(raw) > 4 * 1024 * 1024:
+        raise PipelineError("Hivision OpenAPI 文档异常：超过 4 MB")
+    try:
+        document = json.loads(raw.decode("utf-8"))
+        post = document["paths"]["/idphoto"]["post"]
+        schema = post["requestBody"]["content"]["multipart/form-data"]["schema"]
+        schema = _resolve_openapi_schema(document, schema)
+        supported = set(schema.get("properties", {}))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise PipelineError("服务可访问，但 OpenAPI 中没有兼容的 POST /idphoto 接口") from exc
+    missing_core = sorted(HIVISION_CORE_FIELDS - supported)
+    missing_optional = sorted((HIVISION_API_FIELDS - HIVISION_CORE_FIELDS) - supported)
+    compatible = not missing_core
+    if compatible and not missing_optional:
+        message = f"连接成功，/idphoto 支持当前全部 {len(HIVISION_API_FIELDS)} 个参数"
+    elif compatible:
+        message = (
+            f"连接成功，核心接口兼容；{len(missing_optional)} 个可调参数未在服务文档中声明："
+            + "、".join(missing_optional)
+        )
+    else:
+        message = "服务可访问，但缺少核心参数：" + "、".join(missing_core)
+    return {
+        "ok": compatible,
+        "http_status": status_code,
+        "openapi_url": openapi_url,
+        "endpoint": endpoint,
+        "service_title": str(document.get("info", {}).get("title", "Hivision API")),
+        "service_version": str(document.get("info", {}).get("version", "")),
+        "supported_fields": sorted(supported & HIVISION_API_FIELDS),
+        "missing_core_fields": missing_core,
+        "missing_optional_fields": missing_optional,
+        "message": message,
+    }
 
 
 def _resource_root() -> Path:

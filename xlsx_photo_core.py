@@ -32,6 +32,7 @@ from photo_pipeline import (
     PipelineOptions,
     run_pipeline,
     save_pipeline_stages,
+    validate_pipeline_options,
 )
 
 
@@ -49,7 +50,7 @@ NS = {
     "a": ART_NS,
 }
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 STATE_SCHEMA = 3
 MAX_IMAGE_BYTES = 30 * 1024 * 1024
 VOLATILE_QUERY_RE = re.compile(
@@ -161,6 +162,15 @@ class ExportOptions:
 
 
 @dataclass
+class ProcessingOptions:
+    output_dir: Path
+    pipeline: PipelineOptions
+    workers: int = 6
+    force_process: bool = False
+    save_intermediate_steps: bool = True
+
+
+@dataclass
 class JobResult:
     student_id: str
     row_number: int
@@ -193,6 +203,7 @@ class BatchResult:
     state_path: Path
     summary: dict[str, Any]
     results: list[JobResult] = field(default_factory=list)
+    operation: str = "export"
 
 
 def now_local() -> datetime:
@@ -741,47 +752,12 @@ def _load_state(path: Path) -> dict[str, Any]:
     return state
 
 
-def _processing_fingerprint(options: ExportOptions) -> str:
-    payload = json.dumps({
-        "face_detection": options.face_detection,
-        "quality_enabled": options.quality_enabled,
-        "auto_orient": options.auto_orient,
-        "check_grayscale": options.check_grayscale,
-        "check_face": options.check_face,
-        "check_glare": options.check_glare,
-        "check_recapture": options.check_recapture,
-        "grayscale_ratio_threshold": options.grayscale_ratio_threshold,
-        "grayscale_delta_limit": options.grayscale_delta_limit,
-        "face_confidence_threshold": options.face_confidence_threshold,
-        "orientation_min_confidence": options.orientation_min_confidence,
-        "orientation_confidence_margin": options.orientation_confidence_margin,
-        "glare_ratio_threshold": options.glare_ratio_threshold,
-        "glare_luma_threshold": options.glare_luma_threshold,
-        "recapture_score_threshold": options.recapture_score_threshold,
-        "stop_on_reject": options.stop_on_reject,
-        "background_mode": options.background_mode,
-        "background_color": options.background_color.upper(),
-        "hivision_url": options.hivision_url.rstrip("/"),
-        "hivision_height": options.hivision_height,
-        "hivision_width": options.hivision_width,
-        "hivision_dpi": options.hivision_dpi,
-        "hivision_matting_model": options.hivision_matting_model,
-        "hivision_face_model": options.hivision_face_model,
-        "hivision_hd": options.hivision_hd,
-        "hivision_face_align": options.hivision_face_align,
-        "hivision_head_measure_ratio": options.hivision_head_measure_ratio,
-        "hivision_head_height_ratio": options.hivision_head_height_ratio,
-        "hivision_top_distance_max": options.hivision_top_distance_max,
-        "hivision_top_distance_min": options.hivision_top_distance_min,
-        "hivision_brightness_strength": options.hivision_brightness_strength,
-        "hivision_contrast_strength": options.hivision_contrast_strength,
-        "hivision_sharpen_strength": options.hivision_sharpen_strength,
-        "hivision_saturation_strength": options.hivision_saturation_strength,
-        "crop_enabled": options.crop_enabled,
-        "crop_width": options.crop_width,
-        "crop_height": options.crop_height,
-        "pipeline_version": PIPELINE_VERSION,
-    }, sort_keys=True).encode("utf-8")
+def _processing_fingerprint(options: PipelineOptions) -> str:
+    settings = asdict(options)
+    settings["hivision_url"] = str(settings.get("hivision_url", "")).rstrip("/")
+    settings["background_color"] = str(settings.get("background_color", "")).upper()
+    settings["pipeline_version"] = PIPELINE_VERSION
+    payload = json.dumps(settings, sort_keys=True).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
@@ -1062,21 +1038,66 @@ def _execute_job(
         result.original_file = _relative(root, original_path)
         result.original_sha256 = digest
         result.status = "success"
+        # Export is intentionally a download-only stage. Image analysis and
+        # transformation are performed later by run_processing().
+        if change in {"new", "updated"}:
+            result.processing_status = "pending"
+        elif existing:
+            result.processing_status = existing.get("processing", {}).get("status", "pending")
+        return result
+    except (ExportError, OSError, ValueError) as exc:
+        result.status = "failed"
+        result.message = str(exc)
+        return result
+    except Exception as exc:  # keep one bad row from stopping the batch
+        result.status = "failed"
+        result.message = f"未预期错误：{type(exc).__name__}: {exc}"
+        return result
 
-        processing_requested = (
-            options.quality_enabled
-            or options.face_detection
-            or options.background_mode != "none"
-            or options.crop_enabled
+
+def _execute_processing_job(
+    row: SelectedRow,
+    existing: dict[str, Any],
+    options: ProcessingOptions,
+    batch_id: str,
+) -> JobResult:
+    root = options.output_dir
+    result = JobResult(
+        student_id=row.student_id,
+        row_number=row.row_number,
+        change="reprocessed",
+        status="failed",
+        source_display=str(existing.get("source_display", "已导出原图")),
+        source_fingerprint=str(existing.get("source_fingerprint", "")),
+    )
+    try:
+        original_path = _safe_state_file(root, existing.get("original_file"))
+        if original_path is None or not original_path.is_file():
+            raise ExportError("已导出的原图不存在；请先执行第一步“导出原图”")
+        data = original_path.read_bytes()
+        result.original_file = _relative(root, original_path)
+        result.original_sha256 = hashlib.sha256(data).hexdigest()
+        result.status = "success"
+
+        previous_processed = _safe_state_file(
+            root,
+            existing.get("processing", {}).get("processed_file"),
         )
-        if not processing_requested:
-            result.processing_status = "not_requested"
-            return result
+        if previous_processed and previous_processed.is_file():
+            history = root / "历史版本" / batch_id / "处理后图片"
+            history.mkdir(parents=True, exist_ok=True)
+            archive_target = history / previous_processed.name
+            if archive_target.exists():
+                archive_target = history / (
+                    f"{previous_processed.stem}_旧_{hashlib.sha1(str(previous_processed).encode()).hexdigest()[:8]}"
+                    f"{previous_processed.suffix}"
+                )
+            shutil.move(str(previous_processed), str(archive_target))
 
         try:
-            pipeline = run_pipeline(data, _pipeline_options(options))
+            pipeline = run_pipeline(data, options.pipeline)
             result.face_count = pipeline.face_count
-            result.quality_status = pipeline.status if (options.quality_enabled or options.face_detection) else "not_requested"
+            result.quality_status = pipeline.status if options.pipeline.quality_enabled else "not_requested"
             result.quality_reasons = pipeline.reasons
             result.quality_metrics = pipeline.metrics
             result.rotation_ccw = pipeline.rotation_ccw
@@ -1097,19 +1118,15 @@ def _execute_job(
             should_write_output = (
                 pipeline.output_bytes is not None
                 and (
-                    options.background_mode != "none"
+                    options.pipeline.background_mode != "none"
                     or pipeline.rotation_ccw != 0
-                    or options.crop_enabled
+                    or options.pipeline.crop_enabled
                 )
             )
             if should_write_output:
                 processed_path = root / "处理后图片" / f"{row.student_id}.jpg"
-                previous_processed = _safe_state_file(
-                    root,
-                    existing.get("processing", {}).get("processed_file") if existing else None,
-                )
                 history = root / "历史版本" / batch_id / "处理后图片"
-                _archive_then_install(pipeline.output_bytes, processed_path, previous_processed, history)
+                _archive_then_install(pipeline.output_bytes, processed_path, None, history)
                 result.processed_file = _relative(root, processed_path)
             result.processing_status = "warning" if pipeline.status == "warning" else "success"
             if pipeline.reasons:
@@ -1122,7 +1139,7 @@ def _execute_job(
         result.status = "failed"
         result.message = str(exc)
         return result
-    except Exception as exc:  # keep one bad row from stopping the batch
+    except Exception as exc:
         result.status = "failed"
         result.message = f"未预期错误：{type(exc).__name__}: {exc}"
         return result
@@ -1330,6 +1347,18 @@ def _execute_job_after_resume(
     return _execute_job(row, change, existing, options, batch_id)
 
 
+def _execute_processing_job_after_resume(
+    run_event: threading.Event | None,
+    row: SelectedRow,
+    existing: dict[str, Any],
+    options: ProcessingOptions,
+    batch_id: str,
+) -> JobResult:
+    if run_event is not None:
+        run_event.wait()
+    return _execute_processing_job(row, existing, options, batch_id)
+
+
 def run_export(
     options: ExportOptions,
     progress: Callable[[int, int, str], None] | None = None,
@@ -1343,14 +1372,6 @@ def run_export(
         raise ExportError("列索引无效")
     if options.id_col == options.image_col:
         raise ExportError("学号列和图片列不能是同一列")
-    if options.background_mode not in {"none", "quick", "ai", "hivision"}:
-        raise ExportError("背景处理模式无效")
-    _parse_color(options.background_color)
-    if options.crop_enabled and not (
-        32 <= int(options.crop_width) <= 10000
-        and 32 <= int(options.crop_height) <= 10000
-    ):
-        raise ExportError("最终裁切宽高必须在 32 到 10000 像素之间")
     options.workers = max(1, min(16, int(options.workers)))
     options.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1367,7 +1388,6 @@ def run_export(
     state_path = options.output_dir / "export_state.json"
     state = _load_state(state_path)
     records: dict[str, dict[str, Any]] = state["records"]
-    processing_fp = _processing_fingerprint(options)
 
     id_counts = Counter(row.student_id for row in report.rows if row.student_id)
     duplicate_ids = {student_id for student_id, count in id_counts.items() if count > 1}
@@ -1417,31 +1437,7 @@ def run_export(
         elif previous_file is None or not previous_file.is_file():
             change = "repair"
         else:
-            previous_processing = existing.get("processing", {})
-            needs_processing = (
-                (
-                    options.quality_enabled
-                    or options.face_detection
-                    or options.background_mode != "none"
-                    or options.crop_enabled
-                )
-                and (
-                    previous_processing.get("config_fingerprint") != processing_fp
-                    or previous_processing.get("status") not in {"success", "warning"}
-                    or (
-                        options.background_mode != "none"
-                        or options.crop_enabled
-                    )
-                    and not (
-                        _safe_state_file(
-                            options.output_dir,
-                            previous_processing.get("processed_file"),
-                        )
-                        or Path()
-                    ).is_file()
-                )
-            )
-            change = "reprocessed" if needs_processing else "unchanged"
+            change = "unchanged"
         if change == "unchanged":
             unchanged_results.append(JobResult(
                 student_id=row.student_id,
@@ -1471,7 +1467,7 @@ def run_export(
     total = len(jobs) + len(immediate)
     completed = len(immediate)
     if progress:
-        progress(completed, total, f"已检查 {len(report.rows)} 行，需处理 {len(jobs)} 条")
+        progress(completed, total, f"已检查 {len(report.rows)} 行，需导出 {len(jobs)} 条原图")
     executed_results: list[JobResult] = list(immediate)
     if jobs:
         with ThreadPoolExecutor(max_workers=options.workers, thread_name_prefix="photo-export") as pool:
@@ -1508,30 +1504,32 @@ def run_export(
                     progress(completed, total, f"{item.student_id}：{label}")
 
     all_results = sorted(executed_results + unchanged_results, key=lambda item: item.row_number)
-    row_by_key = {(row.student_id, row.row_number): row for row in report.rows}
     current_time = iso_now()
     for item in all_results:
         if not item.student_id:
             continue
         existing = records.get(item.student_id)
         if item.status == "success" and item.original_file:
-            processing = {
-                "config_fingerprint": processing_fp,
-                "status": item.processing_status,
-                "processed_file": item.processed_file,
-                "face_count": item.face_count,
-                "quality_status": item.quality_status,
-                "quality_reasons": item.quality_reasons,
-                "quality_metrics": item.quality_metrics,
-                "rotation_ccw": item.rotation_ccw,
-                "detector": item.detector,
-                "background_engine": item.background_engine,
-                "step_files": item.step_files,
-                "message": item.processing_message,
-                "last_processed_at": current_time if item.executed else (existing or {}).get("processing", {}).get("last_processed_at"),
-            }
-            if not item.executed and existing:
-                processing = existing.get("processing", processing)
+            if item.change in {"new", "updated"}:
+                processing = {
+                    "config_fingerprint": None,
+                    "status": "pending",
+                    "processed_file": None,
+                    "face_count": None,
+                    "quality_status": "not_requested",
+                    "quality_reasons": [],
+                    "quality_metrics": {},
+                    "rotation_ccw": 0,
+                    "detector": "not_used",
+                    "background_engine": "none",
+                    "step_files": [],
+                    "message": "等待第二步图片处理",
+                    "last_processed_at": None,
+                }
+            elif existing:
+                processing = existing.get("processing", {})
+            else:
+                processing = {"status": "pending", "message": "等待第二步图片处理"}
             records[item.student_id] = {
                 "student_id": item.student_id,
                 "sheet": options.sheet_name,
@@ -1549,8 +1547,10 @@ def run_export(
 
     counts = Counter(item.change for item in all_results if item.status == "success")
     failed = sum(1 for item in all_results if item.status == "failed")
-    processing_warnings = sum(1 for item in all_results if item.processing_status == "warning")
-    quality_rejected = sum(1 for item in all_results if item.quality_status == "rejected")
+    # Export batches report only download results. Historical processing states
+    # remain on records but belong to separate processing batches.
+    processing_warnings = 0
+    quality_rejected = 0
     current_ids = {row.student_id for row in report.rows if row.student_id}
     missing_current = sum(1 for student_id in records if student_id not in current_ids)
     summary = {
@@ -1584,46 +1584,10 @@ def run_export(
         "header_row": options.header_row,
         "id_column": column_label(options.id_col),
         "image_column": column_label(options.image_col),
+        "operation": "export",
         "options": {
-            "face_detection": options.face_detection,
-            "quality_enabled": options.quality_enabled,
-            "auto_orient": options.auto_orient,
-            "check_grayscale": options.check_grayscale,
-            "check_face": options.check_face,
-            "check_glare": options.check_glare,
-            "check_recapture": options.check_recapture,
-            "grayscale_ratio_threshold": options.grayscale_ratio_threshold,
-            "grayscale_delta_limit": options.grayscale_delta_limit,
-            "face_confidence_threshold": options.face_confidence_threshold,
-            "orientation_min_confidence": options.orientation_min_confidence,
-            "orientation_confidence_margin": options.orientation_confidence_margin,
-            "glare_ratio_threshold": options.glare_ratio_threshold,
-            "glare_luma_threshold": options.glare_luma_threshold,
-            "recapture_score_threshold": options.recapture_score_threshold,
-            "stop_on_reject": options.stop_on_reject,
-            "background_mode": options.background_mode,
-            "background_color": options.background_color,
-            "hivision_url": options.hivision_url,
-            "hivision_timeout": options.hivision_timeout,
-            "hivision_height": options.hivision_height,
-            "hivision_width": options.hivision_width,
-            "hivision_dpi": options.hivision_dpi,
-            "hivision_matting_model": options.hivision_matting_model,
-            "hivision_face_model": options.hivision_face_model,
-            "hivision_hd": options.hivision_hd,
-            "hivision_face_align": options.hivision_face_align,
-            "hivision_head_measure_ratio": options.hivision_head_measure_ratio,
-            "hivision_head_height_ratio": options.hivision_head_height_ratio,
-            "hivision_top_distance_max": options.hivision_top_distance_max,
-            "hivision_top_distance_min": options.hivision_top_distance_min,
-            "hivision_brightness_strength": options.hivision_brightness_strength,
-            "hivision_contrast_strength": options.hivision_contrast_strength,
-            "hivision_sharpen_strength": options.hivision_sharpen_strength,
-            "hivision_saturation_strength": options.hivision_saturation_strength,
-            "crop_enabled": options.crop_enabled,
-            "crop_width": options.crop_width,
-            "crop_height": options.crop_height,
             "force_refresh": options.force_refresh,
+            "workers": options.workers,
         },
         "summary": summary,
         "results": [asdict(item) for item in all_results],
@@ -1642,6 +1606,7 @@ def run_export(
     source_stat = options.xlsx_path.stat()
     batch_history = {
         "batch_id": batch_id,
+        "operation": "export",
         "created_at": current_time,
         "source_workbook": str(options.xlsx_path),
         "source_size": source_stat.st_size,
@@ -1654,7 +1619,7 @@ def run_export(
     }
     state["updated_at"] = current_time
     state["last_batch_id"] = batch_id
-    state["last_configuration"] = batch_payload["options"] | {
+    state["last_export_configuration"] = batch_payload["options"] | {
         "sheet": options.sheet_name,
         "header_row": options.header_row,
         "id_column": column_label(options.id_col),
@@ -1662,7 +1627,244 @@ def run_export(
     }
     state["batches"].append(batch_history)
     _atomic_write_json(state_path, state)
-    return BatchResult(batch_id, batch_dir, gallery, state_path, summary, all_results)
+    return BatchResult(batch_id, batch_dir, gallery, state_path, summary, all_results, "export")
+
+
+def run_processing(
+    options: ProcessingOptions,
+    progress: Callable[[int, int, str], None] | None = None,
+    run_event: threading.Event | None = None,
+) -> BatchResult:
+    options.output_dir = Path(options.output_dir)
+    options.workers = max(1, min(16, int(options.workers)))
+    validate_pipeline_options(options.pipeline)
+    processing_requested = (
+        options.pipeline.quality_enabled
+        or options.pipeline.background_mode != "none"
+        or options.pipeline.crop_enabled
+    )
+    if not processing_requested:
+        raise ExportError("第二步至少要启用预检、换背景或最终裁切中的一项")
+
+    state_path = options.output_dir / "export_state.json"
+    if not state_path.is_file():
+        raise ExportError("没有找到 export_state.json；请先执行第一步“导出原图”")
+    state = _load_state(state_path)
+    records: dict[str, dict[str, Any]] = state["records"]
+    if not records:
+        raise ExportError("当前状态中没有已导出的学生原图")
+
+    batch_id = now_local().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    batch_dir = options.output_dir / "批次记录" / batch_id
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    processing_fp = _processing_fingerprint(options.pipeline)
+    output_expected = options.pipeline.background_mode != "none" or options.pipeline.crop_enabled
+
+    jobs: list[tuple[SelectedRow, dict[str, Any]]] = []
+    immediate: list[JobResult] = []
+    unchanged_results: list[JobResult] = []
+    ordered_records = sorted(
+        records.items(),
+        key=lambda pair: (int(pair[1].get("row", 0) or 0), pair[0]),
+    )
+    for student_id, existing in ordered_records:
+        row_number = int(existing.get("row", 0) or 0)
+        original_path = _safe_state_file(options.output_dir, existing.get("original_file"))
+        if original_path is None or not original_path.is_file():
+            immediate.append(JobResult(
+                student_id=student_id,
+                row_number=row_number,
+                change="reprocessed",
+                status="failed",
+                message="已导出的原图不存在；请先执行第一步“导出原图”修复",
+                source_display=str(existing.get("source_display", "")),
+                source_fingerprint=str(existing.get("source_fingerprint", "")),
+            ))
+            continue
+        previous = existing.get("processing", {})
+        processed_path = _safe_state_file(options.output_dir, previous.get("processed_file"))
+        terminal = previous.get("status") in {"success", "warning", "rejected"}
+        needs_processing = (
+            options.force_process
+            or previous.get("config_fingerprint") != processing_fp
+            or not terminal
+            or (output_expected and (processed_path is None or not processed_path.is_file()))
+        )
+        if needs_processing:
+            jobs.append((
+                SelectedRow(
+                    row_number=row_number,
+                    student_id=student_id,
+                    source=SourceRef(
+                        kind="file",
+                        value=str(original_path),
+                        fingerprint=str(existing.get("source_fingerprint", "")),
+                        display="已导出原图",
+                    ),
+                ),
+                existing,
+            ))
+        else:
+            unchanged_results.append(JobResult(
+                student_id=student_id,
+                row_number=row_number,
+                change="unchanged",
+                status="success",
+                source_display=str(existing.get("source_display", "")),
+                source_fingerprint=str(existing.get("source_fingerprint", "")),
+                original_file=existing.get("original_file"),
+                original_sha256=existing.get("original_sha256"),
+                processed_file=previous.get("processed_file"),
+                face_count=previous.get("face_count"),
+                quality_status=previous.get("quality_status", "not_requested"),
+                quality_reasons=previous.get("quality_reasons", []),
+                quality_metrics=previous.get("quality_metrics", {}),
+                rotation_ccw=previous.get("rotation_ccw", 0),
+                detector=previous.get("detector", "not_used"),
+                background_engine=previous.get("background_engine", "none"),
+                step_files=previous.get("step_files", []),
+                processing_status=previous.get("status", "not_requested"),
+                processing_message=previous.get("message", ""),
+                executed=False,
+            ))
+
+    total = len(jobs) + len(immediate)
+    completed = len(immediate)
+    if progress:
+        progress(completed, total, f"找到 {len(records)} 条已导出原图，需处理 {len(jobs)} 条")
+    executed_results: list[JobResult] = list(immediate)
+    if jobs:
+        with ThreadPoolExecutor(max_workers=options.workers, thread_name_prefix="photo-process") as pool:
+            futures = {
+                pool.submit(
+                    _execute_processing_job_after_resume,
+                    run_event,
+                    row,
+                    existing,
+                    options,
+                    batch_id,
+                ): row
+                for row, existing in jobs
+            }
+            for future in as_completed(futures):
+                row = futures[future]
+                try:
+                    item = future.result()
+                except Exception as exc:
+                    item = JobResult(
+                        student_id=row.student_id,
+                        row_number=row.row_number,
+                        change="reprocessed",
+                        status="failed",
+                        message=f"任务异常：{type(exc).__name__}: {exc}",
+                    )
+                executed_results.append(item)
+                completed += 1
+                if progress:
+                    label = "完成" if item.status == "success" else "失败"
+                    progress(completed, total, f"{item.student_id}：{label}")
+
+    all_results = sorted(
+        executed_results + unchanged_results,
+        key=lambda item: (item.row_number, item.student_id),
+    )
+    current_time = iso_now()
+    for item in all_results:
+        if not item.executed or item.status != "success" or not item.original_file:
+            continue
+        existing = records.get(item.student_id)
+        if not existing:
+            continue
+        existing["processing"] = {
+            "config_fingerprint": processing_fp,
+            "status": item.processing_status,
+            "processed_file": item.processed_file,
+            "face_count": item.face_count,
+            "quality_status": item.quality_status,
+            "quality_reasons": item.quality_reasons,
+            "quality_metrics": item.quality_metrics,
+            "rotation_ccw": item.rotation_ccw,
+            "detector": item.detector,
+            "background_engine": item.background_engine,
+            "step_files": item.step_files,
+            "message": item.processing_message,
+            "last_processed_at": current_time,
+        }
+        existing["last_batch_id"] = batch_id
+
+    counts = Counter(item.change for item in all_results if item.status == "success")
+    summary = {
+        "total_rows": len(records),
+        "new": 0,
+        "updated": 0,
+        "repair": 0,
+        "reprocessed": counts.get("reprocessed", 0),
+        "unchanged": counts.get("unchanged", 0),
+        "failed": sum(1 for item in all_results if item.status == "failed"),
+        "processing_warnings": sum(1 for item in all_results if item.processing_status == "warning"),
+        "quality_rejected": sum(1 for item in all_results if item.quality_status == "rejected"),
+        "missing_from_current_workbook": 0,
+    }
+
+    copied: dict[tuple[str, int], dict[str, Any]] = {}
+    for item in all_results:
+        try:
+            copied[(item.student_id, item.row_number)] = _copy_batch_images(
+                options.output_dir, batch_dir, item,
+            )
+        except OSError as exc:
+            item.processing_status = "warning"
+            item.processing_message = (
+                (item.processing_message + "；") if item.processing_message else ""
+            ) + f"复制批次合集失败：{exc}"
+
+    _write_manifest(batch_dir, all_results)
+    _write_reupload_manifest(batch_dir, all_results)
+    pipeline_settings = asdict(options.pipeline)
+    batch_payload = {
+        "batch_id": batch_id,
+        "created_at": current_time,
+        "operation": "process",
+        "source_workbook": next(
+            (
+                item.get("source_workbook", "")
+                for item in reversed(state.get("batches", []))
+                if item.get("operation", "export") == "export"
+            ),
+            "",
+        ),
+        "options": pipeline_settings | {
+            "workers": options.workers,
+            "force_process": options.force_process,
+            "save_intermediate_steps": options.save_intermediate_steps,
+        },
+        "summary": summary,
+        "results": [asdict(item) for item in all_results],
+    }
+    _atomic_write_json(batch_dir / "batch.json", batch_payload)
+    gallery = _write_gallery(batch_dir, batch_id, all_results, copied, summary)
+    relative_gallery = gallery.relative_to(options.output_dir).as_posix()
+    (options.output_dir / "查看最新批次.html").write_text(
+        '<!doctype html><meta charset="utf-8"><title>最新批次</title>'
+        f'<meta http-equiv="refresh" content="0; url={html.escape(relative_gallery, quote=True)}">'
+        f'<a href="{html.escape(relative_gallery, quote=True)}">打开最新批次</a>',
+        encoding="utf-8",
+    )
+
+    batch_history = {
+        "batch_id": batch_id,
+        "operation": "process",
+        "created_at": current_time,
+        "source_workbook": batch_payload["source_workbook"],
+        "batch_directory": _relative(options.output_dir, batch_dir),
+        "summary": summary,
+    }
+    state["updated_at"] = current_time
+    state["last_batch_id"] = batch_id
+    state["last_processing_configuration"] = batch_payload["options"]
+    state["batches"].append(batch_history)
+    _atomic_write_json(state_path, state)
+    return BatchResult(batch_id, batch_dir, gallery, state_path, summary, all_results, "process")
 
 
 def suggest_columns(headers: Iterable[str]) -> tuple[int, int]:

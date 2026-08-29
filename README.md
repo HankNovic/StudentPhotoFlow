@@ -8,7 +8,7 @@
 
 便携版适用于 64 位 Windows 10、Windows 11，不需要安装 Python，也不需要单独安装图片或 AI 依赖。
 
-1. 完整解压 `StudentPhotoFlow_Windows_x64_v1.4.0.zip`。
+1. 完整解压 `StudentPhotoFlow_Windows_x64_v1.5.0.zip`。
 2. 不要只复制 EXE 或 BAT；`PhotoExporter.exe`、`启动工具.bat` 和 `_internal` 文件夹必须放在一起。
 3. 双击唯一的 `启动工具.bat`。也可以把 `.xlsx` 文件拖到这个 BAT 上。
 
@@ -21,9 +21,10 @@
 1. 从采集系统导出最新 Excel。
 2. 立即打开本工具并选择该文件。样表链接签名只在短时间内有效；过期后无法恢复，只能重新导出 Excel。
 3. 点击“检查表格”，确认工作表、表头行、学号列和图片列。
-4. 默认使用内置 AI 智能抠图换背景；可选择是否启用内置照片预检。
-5. 需要调试阈值时，打开“可视化处理工作台”，逐步查看结果并反复输出。
-6. 点击“开始增量导出”。运行中可点击“暂停”，程序会让已启动任务安全收尾并停止启动新任务；点击“继续”后从当前进度接着处理。
+4. 点击“1. 导出原图”。这一阶段只读取 Excel、下载新增或变化的照片并按学号保存，不会执行预检、换背景或裁切。
+5. 设置预检、换背景、Hivision 和裁切参数；需要调试阈值时可先打开“可视化处理工作台”。
+6. 点击“2. 处理图片”。这一阶段只读取 `原始图片` 和 `export_state.json`，不访问 Excel 中的图片链接；关闭软件或移走 Excel 后仍可重新调参处理。
+7. 两个阶段运行中都可点击“暂停”；已启动任务会安全收尾，点击“继续”后从当前进度接着执行。
 
 原图始终保持服务器返回的原始字节，不会因为开启换背景而被覆盖。处理结果单独保存在“处理后图片”目录。
 
@@ -32,8 +33,9 @@
 - 首次出现的学号：记为“新增”。
 - 同一学号的照片对象发生变化：记为“更新”。
 - 状态中已有照片但磁盘文件丢失：记为“修复”。
-- 原图未变，但换背景颜色、处理模式、人脸检测设置或 Hivision 参数变化：记为“重新处理”。
-- 原图和处理设置都没变：记为“未变化”，不会重复下载。
+- 第一步只比较原图来源：来源未变且本地原图存在时记为“未变化”，不会重复下载。
+- 第二步只比较处理指纹：换背景颜色、处理模式、人脸检测设置、裁切或 Hivision 参数变化时记为“重新处理”。
+- 原图和处理设置都没变：第二步记为“未变化”，不会重复处理。
 - 每次重新导出的签名参数会变化，但工具会忽略这些短时参数，因此不会把全部旧记录误判成更新。
 
 如果勾选“强制重新下载已有照片”，本次所有已存在记录都会重新下载。旧版本在覆盖前会保存在“历史版本”目录。
@@ -72,6 +74,7 @@
 - 默认的“AI 智能抠图换背景”使用便携包内置的 `rembg/u2netp`，无需联网。
 - “Hivision API”仅是可选 HTTP 接入。Hivision 服务和模型不会打进便携包，只有用户主动选择该模式时才会访问填写的地址。
 - Hivision 页签和可视化工作台可调 API 地址、超时、宽高、DPI、抠图模型、人脸模型、标准/高清结果、人脸对齐、面部占比、面部中心高度、头顶留白、亮度、对比度、锐化和饱和度；这些值会写入批次 JSON 和增量处理指纹。
+- Hivision 参数页提供“测试 API”：只读取服务的 `openapi.json`，检查 `POST /idphoto` 和当前 16 个表单参数是否兼容，不会上传任何学生照片。
 - 背景色默认标准蓝 `#438EDB`，也可选择白色、红色或自定义颜色。
 - 可启用“最终图片裁切”，自定义精确像素宽高，例如 295×413；程序按人脸位置进行等比裁切后缩放，并把成片作为独立可视化步骤。
 
@@ -83,31 +86,37 @@
 PhotoExporter.exe "学生信息.xlsx" --inspect
 ```
 
-增量导出：
+第一步，只增量导出原图：
 
 ```powershell
 PhotoExporter.exe "学生信息.xlsx" --cli --output "D:\照片导出" --sheet "Sheet1" --id-column A --image-column B
 ```
 
-启用完整预检与快速蓝底替换：
+第二步，处理已导出的原图（不再需要 Excel 参数）：
 
 ```powershell
-PhotoExporter.exe "学生信息.xlsx" --cli --output "D:\照片导出" --id-column 学号 --image-column 个人免冠照片 --quality-check --background-mode quick --background-color "#438EDB"
+PhotoExporter.exe --cli --operation process --output "D:\照片导出" --quality-check --background-mode quick --background-color "#438EDB"
 ```
 
 同时输出 295×413 像素成片：
 
 ```powershell
-PhotoExporter.exe "学生信息.xlsx" --cli --output "D:\照片导出" --id-column 学号 --image-column 个人免冠照片 --quality-check --crop --crop-width 295 --crop-height 413
+PhotoExporter.exe --cli --operation process --output "D:\照片导出" --quality-check --crop --crop-width 295 --crop-height 413
 ```
 
 不指定 `--background-mode` 时默认使用 `ai`。选择可选 Hivision 服务时可使用：
 
 ```powershell
-PhotoExporter.exe "学生信息.xlsx" --cli --output "D:\照片导出" --id-column 学号 --image-column 个人免冠照片 --background-mode hivision --hivision-url https://photo-api.example.com --hivision-matting-model hivision_modnet --hivision-face-model mtcnn --hivision-face-align --hivision-head-measure-ratio 0.20 --hivision-top-distance-max 0.12 --hivision-top-distance-min 0.10
+PhotoExporter.exe --cli --operation process --output "D:\照片导出" --background-mode hivision --hivision-url https://photo-api.example.com --hivision-matting-model hivision_modnet --hivision-face-model mtcnn --hivision-face-align --hivision-head-measure-ratio 0.20 --hivision-top-distance-max 0.12 --hivision-top-distance-min 0.10
 ```
 
 需要 Hivision 高清返回时再加 `--hivision-hd`。运行 `PhotoExporter.exe --help` 可查看亮度、对比度、锐化、饱和度等完整参数。
+
+只测试 Hivision API 和参数兼容性（不上传照片）：
+
+```powershell
+PhotoExporter.exe --cli --test-hivision-api --hivision-url https://photo-api.example.com
+```
 
 ## 构建便携版
 

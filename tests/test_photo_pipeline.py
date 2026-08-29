@@ -24,8 +24,17 @@ from photo_pipeline import (  # noqa: E402
     _orient_image,
     run_pipeline,
     save_pipeline_stages,
+    test_hivision_api,
 )
-from xlsx_photo_core import _execute_job_after_resume  # noqa: E402
+from xlsx_photo_core import (  # noqa: E402
+    ExportOptions,
+    ProcessingOptions,
+    SelectedRow,
+    SourceRef,
+    _execute_job,
+    _execute_job_after_resume,
+    run_processing,
+)
 
 
 def encoded_image(color: tuple[int, int, int]) -> bytes:
@@ -36,6 +45,137 @@ def encoded_image(color: tuple[int, int, int]) -> bytes:
 
 
 class PhotoPipelineTests(unittest.TestCase):
+    def test_hivision_api_check_reads_openapi_without_uploading_photo(self) -> None:
+        fields = {
+            name: {"type": "string"}
+            for name in [
+                "input_image", "height", "width", "human_matting_model", "face_detect_model",
+                "hd", "dpi", "face_align", "head_measure_ratio", "head_height_ratio",
+                "top_distance_max", "top_distance_min", "brightness_strength",
+                "contrast_strength", "sharpen_strength", "saturation_strength",
+            ]
+        }
+        response_body = json.dumps({
+            "info": {"title": "HivisionIDPhotos API", "version": "1.2.3"},
+            "paths": {
+                "/idphoto": {
+                    "post": {
+                        "requestBody": {
+                            "content": {
+                                "multipart/form-data": {
+                                    "schema": {"$ref": "#/components/schemas/IdPhotoForm"}
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {"schemas": {"IdPhotoForm": {"properties": fields}}},
+        }).encode("utf-8")
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+            def read(self, _limit: int) -> bytes:
+                return response_body
+
+        def fake_urlopen(request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        with patch("photo_pipeline.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = test_hivision_api("https://photo.example/idphoto", 12)
+
+        request = captured["request"]
+        self.assertEqual(request.full_url, "https://photo.example/openapi.json")
+        self.assertIsNone(request.data)
+        self.assertEqual(captured["timeout"], 12)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["endpoint"], "https://photo.example/idphoto")
+        self.assertEqual(result["missing_optional_fields"], [])
+
+    def test_export_job_only_writes_original_even_when_processing_options_are_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.jpg"
+            source.write_bytes(encoded_image((70, 125, 210)))
+            row = SelectedRow(
+                row_number=2,
+                student_id="2600000001",
+                source=SourceRef(kind="file", value=str(source), hint=".jpg", fingerprint="source-1"),
+            )
+            options = ExportOptions(
+                xlsx_path=root / "unused.xlsx",
+                output_dir=root / "output",
+                sheet_name="Sheet1",
+                header_row=1,
+                id_col=0,
+                image_col=1,
+                quality_enabled=True,
+                background_mode="ai",
+                crop_enabled=True,
+            )
+            with patch("xlsx_photo_core.run_pipeline") as pipeline:
+                result = _execute_job(row, "new", None, options, "batch")
+            pipeline.assert_not_called()
+            self.assertEqual(result.status, "success")
+            self.assertEqual(result.processing_status, "pending")
+            self.assertIsNone(result.processed_file)
+            self.assertTrue((options.output_dir / result.original_file).is_file())
+
+    def test_processing_stage_reads_exported_original_without_fetching_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            original_dir = root / "原始图片"
+            original_dir.mkdir(parents=True)
+            original_path = original_dir / "2600000002.jpg"
+            original_path.write_bytes(encoded_image((70, 125, 210)))
+            state = {
+                "schema_version": 3,
+                "app_version": "1.5.0",
+                "records": {
+                    "2600000002": {
+                        "student_id": "2600000002",
+                        "row": 2,
+                        "source_fingerprint": "source-2",
+                        "source_display": "https://example.invalid/photo.jpg",
+                        "original_file": "原始图片/2600000002.jpg",
+                        "original_sha256": "old",
+                        "processing": {"status": "pending"},
+                    }
+                },
+                "batches": [],
+            }
+            (root / "export_state.json").write_text(json.dumps(state), encoding="utf-8")
+            options = ProcessingOptions(
+                output_dir=root,
+                pipeline=PipelineOptions(
+                    quality_enabled=False,
+                    background_mode="none",
+                    crop_enabled=True,
+                    crop_width=295,
+                    crop_height=413,
+                ),
+                workers=1,
+            )
+            with patch("xlsx_photo_core._fetch_source") as fetch:
+                result = run_processing(options)
+            fetch.assert_not_called()
+            self.assertEqual(result.operation, "process")
+            self.assertEqual(result.summary["reprocessed"], 1)
+            with Image.open(root / "处理后图片" / "2600000002.jpg") as output:
+                self.assertEqual(output.size, (295, 413))
+            batch = json.loads((result.batch_dir / "batch.json").read_text(encoding="utf-8"))
+            self.assertEqual(batch["operation"], "process")
+
     def test_hivision_sends_adjustable_parameters_and_uses_hd_response(self) -> None:
         def png_base64(size: tuple[int, int], color: tuple[int, int, int, int]) -> str:
             stream = io.BytesIO()
