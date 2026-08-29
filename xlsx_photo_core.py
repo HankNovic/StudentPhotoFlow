@@ -49,7 +49,7 @@ NS = {
     "a": ART_NS,
 }
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 STATE_SCHEMA = 3
 MAX_IMAGE_BYTES = 30 * 1024 * 1024
 VOLATILE_QUERY_RE = re.compile(
@@ -140,6 +140,18 @@ class ExportOptions:
     hivision_height: int = 413
     hivision_width: int = 295
     hivision_dpi: int = 300
+    hivision_matting_model: str = "modnet_photographic_portrait_matting"
+    hivision_face_model: str = "mtcnn"
+    hivision_hd: bool = False
+    hivision_face_align: bool = False
+    hivision_head_measure_ratio: float = 0.20
+    hivision_head_height_ratio: float = 0.45
+    hivision_top_distance_max: float = 0.12
+    hivision_top_distance_min: float = 0.10
+    hivision_brightness_strength: float = 0.0
+    hivision_contrast_strength: float = 0.0
+    hivision_sharpen_strength: float = 0.0
+    hivision_saturation_strength: float = 0.0
     crop_enabled: bool = False
     crop_width: int = 295
     crop_height: int = 413
@@ -753,6 +765,18 @@ def _processing_fingerprint(options: ExportOptions) -> str:
         "hivision_height": options.hivision_height,
         "hivision_width": options.hivision_width,
         "hivision_dpi": options.hivision_dpi,
+        "hivision_matting_model": options.hivision_matting_model,
+        "hivision_face_model": options.hivision_face_model,
+        "hivision_hd": options.hivision_hd,
+        "hivision_face_align": options.hivision_face_align,
+        "hivision_head_measure_ratio": options.hivision_head_measure_ratio,
+        "hivision_head_height_ratio": options.hivision_head_height_ratio,
+        "hivision_top_distance_max": options.hivision_top_distance_max,
+        "hivision_top_distance_min": options.hivision_top_distance_min,
+        "hivision_brightness_strength": options.hivision_brightness_strength,
+        "hivision_contrast_strength": options.hivision_contrast_strength,
+        "hivision_sharpen_strength": options.hivision_sharpen_strength,
+        "hivision_saturation_strength": options.hivision_saturation_strength,
         "crop_enabled": options.crop_enabled,
         "crop_width": options.crop_width,
         "crop_height": options.crop_height,
@@ -786,6 +810,18 @@ def _pipeline_options(options: ExportOptions) -> PipelineOptions:
         hivision_height=options.hivision_height,
         hivision_width=options.hivision_width,
         hivision_dpi=options.hivision_dpi,
+        hivision_matting_model=options.hivision_matting_model,
+        hivision_face_model=options.hivision_face_model,
+        hivision_hd=options.hivision_hd,
+        hivision_face_align=options.hivision_face_align,
+        hivision_head_measure_ratio=options.hivision_head_measure_ratio,
+        hivision_head_height_ratio=options.hivision_head_height_ratio,
+        hivision_top_distance_max=options.hivision_top_distance_max,
+        hivision_top_distance_min=options.hivision_top_distance_min,
+        hivision_brightness_strength=options.hivision_brightness_strength,
+        hivision_contrast_strength=options.hivision_contrast_strength,
+        hivision_sharpen_strength=options.hivision_sharpen_strength,
+        hivision_saturation_strength=options.hivision_saturation_strength,
         crop_enabled=options.crop_enabled,
         crop_width=options.crop_width,
         crop_height=options.crop_height,
@@ -1281,9 +1317,23 @@ def _write_gallery(
     return path
 
 
+def _execute_job_after_resume(
+    run_event: threading.Event | None,
+    row: SelectedRow,
+    change: str,
+    existing: dict[str, Any] | None,
+    options: ExportOptions,
+    batch_id: str,
+) -> JobResult:
+    if run_event is not None:
+        run_event.wait()
+    return _execute_job(row, change, existing, options, batch_id)
+
+
 def run_export(
     options: ExportOptions,
     progress: Callable[[int, int, str], None] | None = None,
+    run_event: threading.Event | None = None,
 ) -> BatchResult:
     options.xlsx_path = Path(options.xlsx_path)
     options.output_dir = Path(options.output_dir)
@@ -1426,7 +1476,15 @@ def run_export(
     if jobs:
         with ThreadPoolExecutor(max_workers=options.workers, thread_name_prefix="photo-export") as pool:
             futures = {
-                pool.submit(_execute_job, row, change, existing, options, batch_id): (row, change)
+                pool.submit(
+                    _execute_job_after_resume,
+                    run_event,
+                    row,
+                    change,
+                    existing,
+                    options,
+                    batch_id,
+                ): (row, change)
                 for row, change, existing in jobs
             }
             for future in as_completed(futures):
@@ -1550,6 +1608,18 @@ def run_export(
             "hivision_height": options.hivision_height,
             "hivision_width": options.hivision_width,
             "hivision_dpi": options.hivision_dpi,
+            "hivision_matting_model": options.hivision_matting_model,
+            "hivision_face_model": options.hivision_face_model,
+            "hivision_hd": options.hivision_hd,
+            "hivision_face_align": options.hivision_face_align,
+            "hivision_head_measure_ratio": options.hivision_head_measure_ratio,
+            "hivision_head_height_ratio": options.hivision_head_height_ratio,
+            "hivision_top_distance_max": options.hivision_top_distance_max,
+            "hivision_top_distance_min": options.hivision_top_distance_min,
+            "hivision_brightness_strength": options.hivision_brightness_strength,
+            "hivision_contrast_strength": options.hivision_contrast_strength,
+            "hivision_sharpen_strength": options.hivision_sharpen_strength,
+            "hivision_saturation_strength": options.hivision_saturation_strength,
             "crop_enabled": options.crop_enabled,
             "crop_width": options.crop_width,
             "crop_height": options.crop_height,

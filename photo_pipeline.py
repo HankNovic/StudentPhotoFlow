@@ -16,7 +16,20 @@ from pathlib import Path
 from typing import Any
 
 
-PIPELINE_VERSION = 3
+PIPELINE_VERSION = 4
+
+HIVISION_MATTING_MODELS = (
+    "modnet_photographic_portrait_matting",
+    "hivision_modnet",
+    "rmbg-1.4",
+    "birefnet-v1-lite",
+    "mnn_hivision_modnet",
+)
+HIVISION_FACE_MODELS = (
+    "mtcnn",
+    "retinaface-resnet50",
+    "face_plusplus",
+)
 
 
 class PipelineError(RuntimeError):
@@ -49,6 +62,16 @@ class PipelineOptions:
     hivision_dpi: int = 300
     hivision_matting_model: str = "modnet_photographic_portrait_matting"
     hivision_face_model: str = "mtcnn"
+    hivision_hd: bool = False
+    hivision_face_align: bool = False
+    hivision_head_measure_ratio: float = 0.20
+    hivision_head_height_ratio: float = 0.45
+    hivision_top_distance_max: float = 0.12
+    hivision_top_distance_min: float = 0.10
+    hivision_brightness_strength: float = 0.0
+    hivision_contrast_strength: float = 0.0
+    hivision_sharpen_strength: float = 0.0
+    hivision_saturation_strength: float = 0.0
     crop_enabled: bool = False
     crop_width: int = 295
     crop_height: int = 413
@@ -617,13 +640,23 @@ def _hivision_replace_background(image, options: PipelineOptions):
         "width": options.hivision_width,
         "human_matting_model": options.hivision_matting_model,
         "face_detect_model": options.hivision_face_model,
-        "hd": "false",
+        "hd": str(bool(options.hivision_hd)).lower(),
         "dpi": options.hivision_dpi,
-        "face_alignment": "true",
+        "face_align": str(bool(options.hivision_face_align)).lower(),
+        "head_measure_ratio": options.hivision_head_measure_ratio,
+        "head_height_ratio": options.hivision_head_height_ratio,
+        "top_distance_max": options.hivision_top_distance_max,
+        "top_distance_min": options.hivision_top_distance_min,
+        "brightness_strength": options.hivision_brightness_strength,
+        "contrast_strength": options.hivision_contrast_strength,
+        "sharpen_strength": options.hivision_sharpen_strength,
+        "saturation_strength": options.hivision_saturation_strength,
     }
     input_bytes = _encode_image(image, "image/jpeg")
     body, boundary = _multipart_payload(fields, input_bytes)
-    endpoint = options.hivision_url.rstrip("/") + "/idphoto"
+    endpoint = options.hivision_url.rstrip("/")
+    if not endpoint.endswith("/idphoto"):
+        endpoint += "/idphoto"
     request = urllib.request.Request(
         endpoint,
         data=body,
@@ -646,7 +679,8 @@ def _hivision_replace_background(image, options: PipelineOptions):
         payload = json.loads(raw.decode("utf-8"))
         if not payload.get("status"):
             raise ValueError(payload.get("error") or payload.get("message") or "status=false")
-        encoded = payload["image_base64_standard"]
+        response_key = "image_base64_hd" if options.hivision_hd else "image_base64_standard"
+        encoded = payload[response_key]
         if "," in encoded:
             encoded = encoded.split(",", 1)[1]
         foreground = Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGBA")
@@ -674,6 +708,38 @@ def validate_pipeline_options(options: PipelineOptions) -> None:
         raise PipelineError("最终裁切宽高必须在 32 到 10000 像素之间")
     if options.background_mode == "hivision" and not options.hivision_url.strip():
         raise PipelineError("选择 Hivision 时必须填写 API 地址")
+    options.hivision_timeout = int(options.hivision_timeout)
+    options.hivision_height = int(options.hivision_height)
+    options.hivision_width = int(options.hivision_width)
+    options.hivision_dpi = int(options.hivision_dpi)
+    options.hivision_head_measure_ratio = float(options.hivision_head_measure_ratio)
+    options.hivision_head_height_ratio = float(options.hivision_head_height_ratio)
+    options.hivision_top_distance_max = float(options.hivision_top_distance_max)
+    options.hivision_top_distance_min = float(options.hivision_top_distance_min)
+    options.hivision_brightness_strength = float(options.hivision_brightness_strength)
+    options.hivision_contrast_strength = float(options.hivision_contrast_strength)
+    options.hivision_sharpen_strength = float(options.hivision_sharpen_strength)
+    options.hivision_saturation_strength = float(options.hivision_saturation_strength)
+    if options.background_mode == "hivision":
+        if not options.hivision_matting_model.strip() or not options.hivision_face_model.strip():
+            raise PipelineError("Hivision 抠图模型和人脸模型不能为空")
+        if not (5 <= options.hivision_timeout <= 3600):
+            raise PipelineError("Hivision 超时秒数必须在 5 到 3600 之间")
+        if not (
+            32 <= options.hivision_width <= 10000
+            and 32 <= options.hivision_height <= 10000
+        ):
+            raise PipelineError("Hivision 输出宽高必须在 32 到 10000 像素之间")
+        if not (36 <= options.hivision_dpi <= 2400):
+            raise PipelineError("Hivision DPI 必须在 36 到 2400 之间")
+        if not (0.05 <= options.hivision_head_measure_ratio <= 0.80):
+            raise PipelineError("Hivision 面部占比必须在 0.05 到 0.80 之间")
+        if not (0.05 <= options.hivision_head_height_ratio <= 0.95):
+            raise PipelineError("Hivision 面部中心高度必须在 0.05 到 0.95 之间")
+        if not (
+            0.0 <= options.hivision_top_distance_min <= options.hivision_top_distance_max <= 0.80
+        ):
+            raise PipelineError("Hivision 头顶留白需满足 0 ≤ 最小值 ≤ 最大值 ≤ 0.80")
 
 
 def run_pipeline(data: bytes, options: PipelineOptions) -> PipelineResult:
@@ -857,13 +923,41 @@ def run_pipeline(data: bytes, options: PipelineOptions) -> PipelineResult:
         except Exception as exc:
             raise PipelineError(f"图片处理失败：{type(exc).__name__}: {exc}") from exc
         background_output = _encode_image(final_image)
+        background_metrics: dict[str, Any] = {
+            "engine": engine,
+            "background_color": options.background_color.upper(),
+        }
+        detail = f"处理引擎 {engine}；背景色 {options.background_color.upper()}"
+        if options.background_mode == "hivision":
+            background_metrics.update({
+                "matting_model": options.hivision_matting_model,
+                "face_model": options.hivision_face_model,
+                "hd": options.hivision_hd,
+                "face_align": options.hivision_face_align,
+                "width": options.hivision_width,
+                "height": options.hivision_height,
+                "dpi": options.hivision_dpi,
+                "head_measure_ratio": options.hivision_head_measure_ratio,
+                "head_height_ratio": options.hivision_head_height_ratio,
+                "top_distance_max": options.hivision_top_distance_max,
+                "top_distance_min": options.hivision_top_distance_min,
+                "brightness_strength": options.hivision_brightness_strength,
+                "contrast_strength": options.hivision_contrast_strength,
+                "sharpen_strength": options.hivision_sharpen_strength,
+                "saturation_strength": options.hivision_saturation_strength,
+            })
+            output_kind = "高清" if options.hivision_hd else "标准"
+            detail = (
+                f"{output_kind}结果；{options.hivision_matting_model} + "
+                f"{options.hivision_face_model}；背景色 {options.background_color.upper()}"
+            )
         stages.append(PipelineStage(
             code="background",
             label=label,
             status="passed",
-            detail=f"处理引擎 {engine}；背景色 {options.background_color.upper()}",
+            detail=detail,
             image_bytes=background_output,
-            metrics={"engine": engine, "background_color": options.background_color.upper()},
+            metrics=background_metrics,
         ))
 
     if options.crop_enabled:

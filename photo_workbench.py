@@ -8,7 +8,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from photo_pipeline import PipelineOptions, PipelineResult, run_pipeline
+from photo_pipeline import (
+    HIVISION_FACE_MODELS,
+    HIVISION_MATTING_MODELS,
+    PipelineOptions,
+    PipelineResult,
+    run_pipeline,
+)
 
 
 BACKGROUND_LABELS = {
@@ -66,6 +72,18 @@ class PhotoProcessingWorkbench:
         self.hivision_width_var = tk.IntVar(value=initial.hivision_width)
         self.hivision_height_var = tk.IntVar(value=initial.hivision_height)
         self.hivision_dpi_var = tk.IntVar(value=initial.hivision_dpi)
+        self.hivision_matting_model_var = tk.StringVar(value=initial.hivision_matting_model)
+        self.hivision_face_model_var = tk.StringVar(value=initial.hivision_face_model)
+        self.hivision_hd_var = tk.BooleanVar(value=initial.hivision_hd)
+        self.hivision_face_align_var = tk.BooleanVar(value=initial.hivision_face_align)
+        self.hivision_head_measure_ratio_var = tk.DoubleVar(value=initial.hivision_head_measure_ratio)
+        self.hivision_head_height_ratio_var = tk.DoubleVar(value=initial.hivision_head_height_ratio)
+        self.hivision_top_distance_max_var = tk.DoubleVar(value=initial.hivision_top_distance_max)
+        self.hivision_top_distance_min_var = tk.DoubleVar(value=initial.hivision_top_distance_min)
+        self.hivision_brightness_var = tk.DoubleVar(value=initial.hivision_brightness_strength)
+        self.hivision_contrast_var = tk.DoubleVar(value=initial.hivision_contrast_strength)
+        self.hivision_sharpen_var = tk.DoubleVar(value=initial.hivision_sharpen_strength)
+        self.hivision_saturation_var = tk.DoubleVar(value=initial.hivision_saturation_strength)
         self.crop_enabled_var = tk.BooleanVar(value=initial.crop_enabled)
         self.crop_width_var = tk.IntVar(value=initial.crop_width)
         self.crop_height_var = tk.IntVar(value=initial.crop_height)
@@ -169,30 +187,69 @@ class PhotoProcessingWorkbench:
         ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 5))
         ttk.Label(processing, text="背景色").grid(row=2, column=0, sticky="w", pady=2)
         ttk.Entry(processing, textvariable=self.color_var, width=12).grid(row=2, column=1, sticky="e", pady=2)
-        ttk.Label(processing, text="Hivision 地址").grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 2))
-        ttk.Entry(processing, textvariable=self.hivision_url_var).grid(row=4, column=0, columnspan=2, sticky="ew")
-        ttk.Label(processing, text="超时/宽/高/DPI").grid(row=5, column=0, columnspan=2, sticky="w", pady=(6, 2))
-        hivision_values = ttk.Frame(processing)
-        hivision_values.grid(row=6, column=0, columnspan=2, sticky="ew")
-        for variable, width in [
-            (self.hivision_timeout_var, 5),
-            (self.hivision_width_var, 5),
-            (self.hivision_height_var, 5),
-            (self.hivision_dpi_var, 5),
-        ]:
-            ttk.Entry(hivision_values, textvariable=variable, width=width).pack(side="left", padx=(0, 4))
-
         ttk.Checkbutton(
             processing,
             text="最终成片裁切",
             variable=self.crop_enabled_var,
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(7, 2))
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(7, 2))
         crop_values = ttk.Frame(processing)
-        crop_values.grid(row=8, column=0, columnspan=2, sticky="ew")
+        crop_values.grid(row=4, column=0, columnspan=2, sticky="ew")
         ttk.Label(crop_values, text="宽").pack(side="left")
         ttk.Entry(crop_values, textvariable=self.crop_width_var, width=7).pack(side="left", padx=(4, 8))
         ttk.Label(crop_values, text="× 高").pack(side="left")
         ttk.Entry(crop_values, textvariable=self.crop_height_var, width=7).pack(side="left", padx=(4, 0))
+
+        hivision = ttk.LabelFrame(controls, text="Hivision API 参数", padding=9)
+        hivision.pack(fill="x", pady=(9, 0))
+        ttk.Label(hivision, text="地址").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Entry(hivision, textvariable=self.hivision_url_var).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 5))
+        ttk.Label(hivision, text="超时/宽/高/DPI").grid(row=2, column=0, columnspan=2, sticky="w")
+        hivision_values = ttk.Frame(hivision)
+        hivision_values.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 5))
+        for variable in [
+            self.hivision_timeout_var,
+            self.hivision_width_var,
+            self.hivision_height_var,
+            self.hivision_dpi_var,
+        ]:
+            ttk.Entry(hivision_values, textvariable=variable, width=6).pack(side="left", padx=(0, 4))
+        ttk.Label(hivision, text="抠图模型").grid(row=4, column=0, columnspan=2, sticky="w")
+        ttk.Combobox(
+            hivision,
+            textvariable=self.hivision_matting_model_var,
+            values=HIVISION_MATTING_MODELS,
+            state="normal",
+        ).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(2, 5))
+        ttk.Label(hivision, text="人脸模型").grid(row=6, column=0, columnspan=2, sticky="w")
+        ttk.Combobox(
+            hivision,
+            textvariable=self.hivision_face_model_var,
+            values=HIVISION_FACE_MODELS,
+            state="normal",
+        ).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(2, 5))
+        ttk.Checkbutton(hivision, text="使用高清返回", variable=self.hivision_hd_var).grid(row=8, column=0, sticky="w")
+        ttk.Checkbutton(hivision, text="人脸对齐", variable=self.hivision_face_align_var).grid(row=8, column=1, sticky="w")
+
+        hivision_rows = [
+            ("面部占比", self.hivision_head_measure_ratio_var, 0.05, 0.80, 0.01),
+            ("中心高度", self.hivision_head_height_ratio_var, 0.05, 0.95, 0.01),
+            ("留白最大", self.hivision_top_distance_max_var, 0.0, 0.80, 0.01),
+            ("留白最小", self.hivision_top_distance_min_var, 0.0, 0.80, 0.01),
+            ("亮度", self.hivision_brightness_var, -5, 25, 1),
+            ("对比度", self.hivision_contrast_var, -10, 50, 1),
+            ("锐化", self.hivision_sharpen_var, 0, 5, 1),
+            ("饱和度", self.hivision_saturation_var, -10, 50, 1),
+        ]
+        for row, (label, variable, start, end, increment) in enumerate(hivision_rows, start=9):
+            ttk.Label(hivision, text=label).grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Spinbox(
+                hivision,
+                from_=start,
+                to=end,
+                increment=increment,
+                textvariable=variable,
+                width=9,
+            ).grid(row=row, column=1, sticky="e", pady=2)
 
         self.run_button = ttk.Button(controls, text="运行全部步骤／按参数重跑", command=self.run_async)
         self.run_button.pack(fill="x", pady=(12, 0))
@@ -260,6 +317,18 @@ class PhotoProcessingWorkbench:
             hivision_width=int(self.hivision_width_var.get()),
             hivision_height=int(self.hivision_height_var.get()),
             hivision_dpi=int(self.hivision_dpi_var.get()),
+            hivision_matting_model=self.hivision_matting_model_var.get().strip(),
+            hivision_face_model=self.hivision_face_model_var.get().strip(),
+            hivision_hd=bool(self.hivision_hd_var.get()),
+            hivision_face_align=bool(self.hivision_face_align_var.get()),
+            hivision_head_measure_ratio=float(self.hivision_head_measure_ratio_var.get()),
+            hivision_head_height_ratio=float(self.hivision_head_height_ratio_var.get()),
+            hivision_top_distance_max=float(self.hivision_top_distance_max_var.get()),
+            hivision_top_distance_min=float(self.hivision_top_distance_min_var.get()),
+            hivision_brightness_strength=float(self.hivision_brightness_var.get()),
+            hivision_contrast_strength=float(self.hivision_contrast_var.get()),
+            hivision_sharpen_strength=float(self.hivision_sharpen_var.get()),
+            hivision_saturation_strength=float(self.hivision_saturation_var.get()),
             crop_enabled=bool(self.crop_enabled_var.get()),
             crop_width=int(self.crop_width_var.get()),
             crop_height=int(self.crop_height_var.get()),

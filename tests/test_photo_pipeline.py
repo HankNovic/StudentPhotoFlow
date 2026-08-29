@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
 import io
+import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -16,11 +19,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from photo_pipeline import (  # noqa: E402
     PipelineOptions,
     _crop_and_resize,
+    _hivision_replace_background,
     _load_haar_cascade,
     _orient_image,
     run_pipeline,
     save_pipeline_stages,
 )
+from xlsx_photo_core import _execute_job_after_resume  # noqa: E402
 
 
 def encoded_image(color: tuple[int, int, int]) -> bytes:
@@ -31,6 +36,97 @@ def encoded_image(color: tuple[int, int, int]) -> bytes:
 
 
 class PhotoPipelineTests(unittest.TestCase):
+    def test_hivision_sends_adjustable_parameters_and_uses_hd_response(self) -> None:
+        def png_base64(size: tuple[int, int], color: tuple[int, int, int, int]) -> str:
+            stream = io.BytesIO()
+            Image.new("RGBA", size, color).save(stream, format="PNG")
+            return base64.b64encode(stream.getvalue()).decode("ascii")
+
+        response_body = json.dumps({
+            "status": True,
+            "image_base64_standard": png_base64((5, 7), (255, 0, 0, 255)),
+            "image_base64_hd": png_base64((10, 14), (0, 255, 0, 255)),
+        }).encode("utf-8")
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+            def read(self, _limit: int) -> bytes:
+                return response_body
+
+        def fake_urlopen(request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return FakeResponse()
+
+        options = PipelineOptions(
+            background_mode="hivision",
+            background_color="#438EDB",
+            hivision_url="https://example.invalid/idphoto",
+            hivision_timeout=45,
+            hivision_matting_model="hivision_modnet",
+            hivision_face_model="retinaface-resnet50",
+            hivision_hd=True,
+            hivision_face_align=True,
+            hivision_head_measure_ratio=0.23,
+            hivision_head_height_ratio=0.44,
+            hivision_top_distance_max=0.13,
+            hivision_top_distance_min=0.09,
+            hivision_brightness_strength=1,
+            hivision_contrast_strength=2,
+            hivision_sharpen_strength=1,
+            hivision_saturation_strength=3,
+        )
+        with patch("photo_pipeline.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = _hivision_replace_background(Image.new("RGB", (40, 50), "white"), options)
+
+        request = captured["request"]
+        self.assertEqual(request.full_url, "https://example.invalid/idphoto")
+        self.assertEqual(captured["timeout"], 45)
+        body = request.data
+        for expected in [
+            b'name="human_matting_model"', b"hivision_modnet",
+            b'name="face_detect_model"', b"retinaface-resnet50",
+            b'name="hd"', b"true",
+            b'name="face_align"',
+            b'name="head_measure_ratio"', b"0.23",
+            b'name="brightness_strength"', b"1",
+        ]:
+            self.assertIn(expected, body)
+        self.assertEqual(result.size, (10, 14))
+
+    def test_export_job_waits_while_paused_and_continues_after_resume(self) -> None:
+        class Gate:
+            def __init__(self) -> None:
+                self.waiting = threading.Event()
+                self.release = threading.Event()
+
+            def wait(self) -> None:
+                self.waiting.set()
+                self.release.wait()
+
+        gate = Gate()
+        outcome: list[object] = []
+        with patch("xlsx_photo_core._execute_job", return_value="done") as execute:
+            worker = threading.Thread(
+                target=lambda: outcome.append(
+                    _execute_job_after_resume(gate, object(), "new", None, object(), "batch")
+                )
+            )
+            worker.start()
+            self.assertTrue(gate.waiting.wait(1.0))
+            execute.assert_not_called()
+            gate.release.set()
+            worker.join(1.0)
+            self.assertFalse(worker.is_alive())
+            execute.assert_called_once()
+        self.assertEqual(outcome, ["done"])
+
     def test_orientation_keeps_upright_photo_when_180_score_is_only_slightly_higher(self) -> None:
         image = Image.new("RGB", (864, 1166), (60, 130, 210))
         detections = [

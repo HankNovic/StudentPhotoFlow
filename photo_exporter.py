@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from photo_pipeline import HIVISION_FACE_MODELS, HIVISION_MATTING_MODELS
 from xlsx_photo_core import (
     APP_VERSION,
     ExportOptions,
@@ -68,6 +69,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--crop-width", type=int, default=295, help="最终图片宽度，默认 295")
     parser.add_argument("--crop-height", type=int, default=413, help="最终图片高度，默认 413")
     parser.add_argument("--hivision-url", default="http://127.0.0.1:8080", help="可选 Hivision API 地址")
+    parser.add_argument("--hivision-timeout", type=int, default=120, help="Hivision 请求超时秒数")
+    parser.add_argument("--hivision-width", type=int, default=295, help="Hivision 标准照宽度")
+    parser.add_argument("--hivision-height", type=int, default=413, help="Hivision 标准照高度")
+    parser.add_argument("--hivision-dpi", type=int, default=300, help="Hivision 输出 DPI")
+    parser.add_argument("--hivision-matting-model", default=HIVISION_MATTING_MODELS[0], help="Hivision 抠图模型")
+    parser.add_argument("--hivision-face-model", default=HIVISION_FACE_MODELS[0], help="Hivision 人脸检测模型")
+    parser.add_argument("--hivision-hd", action="store_true", help="请求并使用 Hivision 高清结果")
+    parser.add_argument("--hivision-face-align", action="store_true", help="启用 Hivision 人脸对齐")
+    parser.add_argument("--hivision-head-measure-ratio", type=float, default=0.20, help="Hivision 面部占比")
+    parser.add_argument("--hivision-head-height-ratio", type=float, default=0.45, help="Hivision 面部中心高度")
+    parser.add_argument("--hivision-top-distance-max", type=float, default=0.12, help="Hivision 头顶留白最大值")
+    parser.add_argument("--hivision-top-distance-min", type=float, default=0.10, help="Hivision 头顶留白最小值")
+    parser.add_argument("--hivision-brightness", type=float, default=0.0, help="Hivision 亮度强度")
+    parser.add_argument("--hivision-contrast", type=float, default=0.0, help="Hivision 对比度强度")
+    parser.add_argument("--hivision-sharpen", type=float, default=0.0, help="Hivision 锐化强度")
+    parser.add_argument("--hivision-saturation", type=float, default=0.0, help="Hivision 饱和度强度")
     parser.add_argument("--workers", type=int, default=6, help="并发数 1-16，默认 6")
     parser.add_argument("--force-refresh", action="store_true", help="重新下载已存在照片")
     return parser
@@ -112,6 +129,22 @@ def _cli_main(args: argparse.Namespace) -> int:
         crop_width=args.crop_width,
         crop_height=args.crop_height,
         hivision_url=args.hivision_url,
+        hivision_timeout=args.hivision_timeout,
+        hivision_width=args.hivision_width,
+        hivision_height=args.hivision_height,
+        hivision_dpi=args.hivision_dpi,
+        hivision_matting_model=args.hivision_matting_model,
+        hivision_face_model=args.hivision_face_model,
+        hivision_hd=args.hivision_hd,
+        hivision_face_align=args.hivision_face_align,
+        hivision_head_measure_ratio=args.hivision_head_measure_ratio,
+        hivision_head_height_ratio=args.hivision_head_height_ratio,
+        hivision_top_distance_max=args.hivision_top_distance_max,
+        hivision_top_distance_min=args.hivision_top_distance_min,
+        hivision_brightness_strength=args.hivision_brightness,
+        hivision_contrast_strength=args.hivision_contrast,
+        hivision_sharpen_strength=args.hivision_sharpen,
+        hivision_saturation_strength=args.hivision_saturation,
         workers=args.workers,
         force_refresh=args.force_refresh,
     )
@@ -182,6 +215,18 @@ class PhotoExporterApp:
         self.hivision_height_var = tk.IntVar(value=413)
         self.hivision_width_var = tk.IntVar(value=295)
         self.hivision_dpi_var = tk.IntVar(value=300)
+        self.hivision_matting_model_var = tk.StringVar(value=HIVISION_MATTING_MODELS[0])
+        self.hivision_face_model_var = tk.StringVar(value=HIVISION_FACE_MODELS[0])
+        self.hivision_hd_var = tk.BooleanVar(value=False)
+        self.hivision_face_align_var = tk.BooleanVar(value=False)
+        self.hivision_head_measure_ratio_var = tk.DoubleVar(value=0.20)
+        self.hivision_head_height_ratio_var = tk.DoubleVar(value=0.45)
+        self.hivision_top_distance_max_var = tk.DoubleVar(value=0.12)
+        self.hivision_top_distance_min_var = tk.DoubleVar(value=0.10)
+        self.hivision_brightness_var = tk.DoubleVar(value=0.0)
+        self.hivision_contrast_var = tk.DoubleVar(value=0.0)
+        self.hivision_sharpen_var = tk.DoubleVar(value=0.0)
+        self.hivision_saturation_var = tk.DoubleVar(value=0.0)
         self.crop_enabled_var = tk.BooleanVar(value=False)
         self.crop_width_var = tk.IntVar(value=295)
         self.crop_height_var = tk.IntVar(value=413)
@@ -190,6 +235,9 @@ class PhotoExporterApp:
         self.open_gallery_var = tk.BooleanVar(value=True)
         self.summary_var = tk.StringVar(value="请选择 Excel 文件后点击“检查表格”。")
         self.progress_text_var = tk.StringVar(value="就绪")
+        self.export_run_event = threading.Event()
+        self.export_run_event.set()
+        self.export_paused = False
 
         self._build_ui()
         self.root.after(120, self._poll_events)
@@ -328,8 +376,10 @@ class PhotoExporterApp:
         ttk.Label(footer, textvariable=self.progress_text_var, width=28).grid(row=0, column=1, sticky="w")
         ttk.Button(footer, text="打开输出目录", command=self.open_output).grid(row=0, column=2, padx=(8, 0))
         ttk.Button(footer, text="查看最新批次", command=self.open_latest).grid(row=0, column=3, padx=(8, 0))
+        self.pause_button = ttk.Button(footer, text="暂停", command=self.toggle_export_pause, state="disabled")
+        self.pause_button.grid(row=0, column=4, padx=(12, 0))
         self.export_button = ttk.Button(footer, text="开始增量导出", command=self.export_async)
-        self.export_button.grid(row=0, column=4, padx=(12, 0))
+        self.export_button.grid(row=0, column=5, padx=(8, 0))
 
     def choose_xlsx(self) -> None:
         path = self.filedialog.askopenfilename(
@@ -381,6 +431,18 @@ class PhotoExporterApp:
             hivision_height=int(self.hivision_height_var.get()),
             hivision_width=int(self.hivision_width_var.get()),
             hivision_dpi=int(self.hivision_dpi_var.get()),
+            hivision_matting_model=self.hivision_matting_model_var.get().strip(),
+            hivision_face_model=self.hivision_face_model_var.get().strip(),
+            hivision_hd=bool(self.hivision_hd_var.get()),
+            hivision_face_align=bool(self.hivision_face_align_var.get()),
+            hivision_head_measure_ratio=float(self.hivision_head_measure_ratio_var.get()),
+            hivision_head_height_ratio=float(self.hivision_head_height_ratio_var.get()),
+            hivision_top_distance_max=float(self.hivision_top_distance_max_var.get()),
+            hivision_top_distance_min=float(self.hivision_top_distance_min_var.get()),
+            hivision_brightness_strength=float(self.hivision_brightness_var.get()),
+            hivision_contrast_strength=float(self.hivision_contrast_var.get()),
+            hivision_sharpen_strength=float(self.hivision_sharpen_var.get()),
+            hivision_saturation_strength=float(self.hivision_saturation_var.get()),
             crop_enabled=bool(self.crop_enabled_var.get()),
             crop_width=int(self.crop_width_var.get()),
             crop_height=int(self.crop_height_var.get()),
@@ -391,11 +453,29 @@ class PhotoExporterApp:
         window = self.tk.Toplevel(self.root)
         window.title("内置预检与 Hivision 参数")
         window.transient(self.root)
-        window.resizable(False, False)
+        screen_width = window.winfo_screenwidth()
+        screen_height = window.winfo_screenheight()
+        width = min(920, max(720, screen_width - 160))
+        height = min(760, max(580, screen_height - 160))
+        window.geometry(f"{width}x{height}")
+        window.minsize(min(720, width), min(580, height))
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
         body = ttk.Frame(window, padding=14)
         body.grid(sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
 
-        steps = ttk.LabelFrame(body, text="参与处理的步骤", padding=10)
+        notebook = ttk.Notebook(body)
+        notebook.grid(row=0, column=0, sticky="nsew")
+        precheck_tab = ttk.Frame(notebook, padding=12)
+        hivision_tab = ttk.Frame(notebook, padding=12)
+        notebook.add(precheck_tab, text="内置预检")
+        notebook.add(hivision_tab, text="Hivision API")
+        precheck_tab.columnconfigure(0, weight=1)
+        hivision_tab.columnconfigure(0, weight=1)
+
+        steps = ttk.LabelFrame(precheck_tab, text="参与处理的步骤", padding=10)
         steps.grid(row=0, column=0, sticky="ew")
         ttk.Checkbutton(steps, text="自动判断并安全修正 90°/180°/270°方向", variable=self.auto_orient_var).grid(row=0, column=0, sticky="w", pady=2)
         ttk.Checkbutton(steps, text="彩色/黑白检查", variable=self.grayscale_var).grid(row=1, column=0, sticky="w", pady=2)
@@ -404,7 +484,7 @@ class PhotoExporterApp:
         ttk.Checkbutton(steps, text="二次拍摄检查", variable=self.recapture_var).grid(row=4, column=0, sticky="w", pady=2)
         ttk.Checkbutton(steps, text="预检不合格时停止后续换背景并列入重传名单", variable=self.stop_on_reject_var).grid(row=5, column=0, sticky="w", pady=(6, 2))
 
-        thresholds = ttk.LabelFrame(body, text="判定阈值（可调参后重新输出）", padding=10)
+        thresholds = ttk.LabelFrame(precheck_tab, text="判定阈值（可调参后重新输出）", padding=10)
         thresholds.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         rows = [
             ("灰度得分阈值", self.grayscale_threshold_var, 0.0, 1.0, 0.01),
@@ -427,21 +507,96 @@ class PhotoExporterApp:
                 width=10,
             ).grid(row=row_index, column=1, sticky="w", pady=3)
 
-        hivision = ttk.LabelFrame(body, text="Hivision API（仅选择该模式时使用，不打包服务）", padding=10)
-        hivision.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        ttk.Label(hivision, text="API 地址").grid(row=0, column=0, sticky="w", pady=3)
-        ttk.Entry(hivision, textvariable=self.hivision_url_var, width=42).grid(row=0, column=1, columnspan=5, sticky="ew", pady=3)
-        ttk.Label(hivision, text="超时秒数").grid(row=1, column=0, sticky="w", pady=3)
-        ttk.Spinbox(hivision, from_=5, to=600, textvariable=self.hivision_timeout_var, width=8).grid(row=1, column=1, sticky="w")
-        ttk.Label(hivision, text="宽").grid(row=1, column=2, padx=(12, 4))
-        ttk.Spinbox(hivision, from_=100, to=3000, textvariable=self.hivision_width_var, width=7).grid(row=1, column=3)
-        ttk.Label(hivision, text="高").grid(row=1, column=4, padx=(12, 4))
-        ttk.Spinbox(hivision, from_=100, to=4000, textvariable=self.hivision_height_var, width=7).grid(row=1, column=5)
-        ttk.Label(hivision, text="DPI").grid(row=1, column=6, padx=(12, 4))
-        ttk.Spinbox(hivision, from_=72, to=1200, textvariable=self.hivision_dpi_var, width=7).grid(row=1, column=7)
+        connection = ttk.LabelFrame(hivision_tab, text="连接与输出", padding=10)
+        connection.grid(row=0, column=0, sticky="ew")
+        connection.columnconfigure(1, weight=1)
+        ttk.Label(connection, text="API 地址").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Entry(connection, textvariable=self.hivision_url_var).grid(
+            row=0, column=1, columnspan=7, sticky="ew", pady=3
+        )
+        ttk.Label(connection, text="可填服务根地址或以 /idphoto 结尾的完整地址", foreground="#667085").grid(
+            row=1, column=1, columnspan=7, sticky="w", pady=(0, 5)
+        )
+        ttk.Label(connection, text="超时秒数").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Spinbox(connection, from_=5, to=3600, textvariable=self.hivision_timeout_var, width=8).grid(row=2, column=1, sticky="w")
+        ttk.Label(connection, text="宽").grid(row=2, column=2, padx=(12, 4))
+        ttk.Spinbox(connection, from_=32, to=10000, textvariable=self.hivision_width_var, width=8).grid(row=2, column=3)
+        ttk.Label(connection, text="高").grid(row=2, column=4, padx=(12, 4))
+        ttk.Spinbox(connection, from_=32, to=10000, textvariable=self.hivision_height_var, width=8).grid(row=2, column=5)
+        ttk.Label(connection, text="DPI").grid(row=2, column=6, padx=(12, 4))
+        ttk.Spinbox(connection, from_=36, to=2400, textvariable=self.hivision_dpi_var, width=8).grid(row=2, column=7)
+        ttk.Checkbutton(connection, text="请求并使用高清结果", variable=self.hivision_hd_var).grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(7, 2)
+        )
+        ttk.Checkbutton(connection, text="启用 Hivision 人脸对齐", variable=self.hivision_face_align_var).grid(
+            row=3, column=3, columnspan=4, sticky="w", pady=(7, 2)
+        )
+
+        models = ttk.LabelFrame(hivision_tab, text="服务端模型", padding=10)
+        models.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        models.columnconfigure(1, weight=1)
+        ttk.Label(models, text="抠图模型").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Combobox(
+            models,
+            textvariable=self.hivision_matting_model_var,
+            values=HIVISION_MATTING_MODELS,
+            state="normal",
+        ).grid(row=0, column=1, sticky="ew", pady=3)
+        ttk.Label(models, text="人脸模型").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+        ttk.Combobox(
+            models,
+            textvariable=self.hivision_face_model_var,
+            values=HIVISION_FACE_MODELS,
+            state="normal",
+        ).grid(row=1, column=1, sticky="ew", pady=3)
+        ttk.Label(models, text="列表可直接选择，也允许输入服务器支持的自定义模型名。", foreground="#667085").grid(
+            row=2, column=1, sticky="w", pady=(2, 0)
+        )
+
+        composition = ttk.LabelFrame(hivision_tab, text="构图参数", padding=10)
+        composition.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        composition_rows = [
+            ("面部占比", self.hivision_head_measure_ratio_var, 0.05, 0.80, 0.01),
+            ("面部中心高度", self.hivision_head_height_ratio_var, 0.05, 0.95, 0.01),
+            ("头顶留白最大值", self.hivision_top_distance_max_var, 0.0, 0.80, 0.01),
+            ("头顶留白最小值", self.hivision_top_distance_min_var, 0.0, 0.80, 0.01),
+        ]
+        for index, (label, variable, start, end, increment) in enumerate(composition_rows):
+            column = (index % 2) * 2
+            row = index // 2
+            ttk.Label(composition, text=label).grid(row=row, column=column, sticky="w", padx=(0, 6), pady=3)
+            ttk.Spinbox(
+                composition,
+                from_=start,
+                to=end,
+                increment=increment,
+                textvariable=variable,
+                width=10,
+            ).grid(row=row, column=column + 1, sticky="w", padx=(0, 20), pady=3)
+
+        enhancement = ttk.LabelFrame(hivision_tab, text="图像增强强度", padding=10)
+        enhancement.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        enhancement_rows = [
+            ("亮度", self.hivision_brightness_var, -5, 25, 1),
+            ("对比度", self.hivision_contrast_var, -10, 50, 1),
+            ("锐化", self.hivision_sharpen_var, 0, 5, 1),
+            ("饱和度", self.hivision_saturation_var, -10, 50, 1),
+        ]
+        for index, (label, variable, start, end, increment) in enumerate(enhancement_rows):
+            column = (index % 3) * 2
+            row = index // 3
+            ttk.Label(enhancement, text=label).grid(row=row, column=column, sticky="w", padx=(0, 6), pady=3)
+            ttk.Spinbox(
+                enhancement,
+                from_=start,
+                to=end,
+                increment=increment,
+                textvariable=variable,
+                width=8,
+            ).grid(row=row, column=column + 1, sticky="w", padx=(0, 20), pady=3)
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=3, column=0, sticky="e", pady=(12, 0))
+        buttons.grid(row=1, column=0, sticky="e", pady=(12, 0))
 
         def restore_defaults() -> None:
             self.auto_orient_var.set(True)
@@ -459,7 +614,26 @@ class PhotoExporterApp:
             self.glare_luma_var.set(245)
             self.recapture_threshold_var.set(0.72)
 
-        ttk.Button(buttons, text="恢复建议值", command=restore_defaults).pack(side="left", padx=(0, 8))
+        def restore_hivision_defaults() -> None:
+            self.hivision_timeout_var.set(120)
+            self.hivision_width_var.set(295)
+            self.hivision_height_var.set(413)
+            self.hivision_dpi_var.set(300)
+            self.hivision_matting_model_var.set(HIVISION_MATTING_MODELS[0])
+            self.hivision_face_model_var.set(HIVISION_FACE_MODELS[0])
+            self.hivision_hd_var.set(False)
+            self.hivision_face_align_var.set(False)
+            self.hivision_head_measure_ratio_var.set(0.20)
+            self.hivision_head_height_ratio_var.set(0.45)
+            self.hivision_top_distance_max_var.set(0.12)
+            self.hivision_top_distance_min_var.set(0.10)
+            self.hivision_brightness_var.set(0.0)
+            self.hivision_contrast_var.set(0.0)
+            self.hivision_sharpen_var.set(0.0)
+            self.hivision_saturation_var.set(0.0)
+
+        ttk.Button(buttons, text="恢复预检建议值", command=restore_defaults).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="恢复 Hivision 默认值", command=restore_hivision_defaults).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="关闭", command=window.destroy).pack(side="left")
 
     def open_workbench(self) -> None:
@@ -486,8 +660,28 @@ class PhotoExporterApp:
         state = "disabled" if busy else "normal"
         self.inspect_button.configure(state=state)
         self.export_button.configure(state=state)
+        if not busy:
+            self.export_paused = False
+            self.export_run_event.set()
+            self.pause_button.configure(text="暂停", state="disabled")
         if text:
             self.progress_text_var.set(text)
+
+    def toggle_export_pause(self) -> None:
+        if not self.busy:
+            return
+        if self.export_paused:
+            self.export_paused = False
+            self.export_run_event.set()
+            self.pause_button.configure(text="暂停")
+            self.progress_text_var.set("正在继续处理…")
+            self._append_log("已继续：等待中的学生任务开始处理。")
+        else:
+            self.export_paused = True
+            self.export_run_event.clear()
+            self.pause_button.configure(text="继续")
+            self.progress_text_var.set("已暂停；正在处理的任务会安全收尾")
+            self._append_log("已暂停：不再启动新任务；正在处理的任务会安全完成。")
 
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -633,6 +827,18 @@ class PhotoExporterApp:
                 hivision_height=int(self.hivision_height_var.get()),
                 hivision_width=int(self.hivision_width_var.get()),
                 hivision_dpi=int(self.hivision_dpi_var.get()),
+                hivision_matting_model=self.hivision_matting_model_var.get().strip(),
+                hivision_face_model=self.hivision_face_model_var.get().strip(),
+                hivision_hd=bool(self.hivision_hd_var.get()),
+                hivision_face_align=bool(self.hivision_face_align_var.get()),
+                hivision_head_measure_ratio=float(self.hivision_head_measure_ratio_var.get()),
+                hivision_head_height_ratio=float(self.hivision_head_height_ratio_var.get()),
+                hivision_top_distance_max=float(self.hivision_top_distance_max_var.get()),
+                hivision_top_distance_min=float(self.hivision_top_distance_min_var.get()),
+                hivision_brightness_strength=float(self.hivision_brightness_var.get()),
+                hivision_contrast_strength=float(self.hivision_contrast_var.get()),
+                hivision_sharpen_strength=float(self.hivision_sharpen_var.get()),
+                hivision_saturation_strength=float(self.hivision_saturation_var.get()),
                 crop_enabled=bool(self.crop_enabled_var.get()),
                 crop_width=int(self.crop_width_var.get()),
                 crop_height=int(self.crop_height_var.get()),
@@ -644,6 +850,9 @@ class PhotoExporterApp:
             return
 
         self._set_busy(True, "准备导出…")
+        self.export_paused = False
+        self.export_run_event.set()
+        self.pause_button.configure(text="暂停", state="normal")
         self.progress.configure(value=0)
         self._append_log(f"开始增量导出到：{options.output_dir}")
 
@@ -652,7 +861,7 @@ class PhotoExporterApp:
 
         def worker() -> None:
             try:
-                result = run_export(options, progress)
+                result = run_export(options, progress, self.export_run_event)
                 self.events.put(("export_done", result))
             except Exception as exc:
                 self.events.put(("error", ("导出失败", str(exc))))
@@ -688,7 +897,10 @@ class PhotoExporterApp:
                     done, total, message = payload
                     percent = 100 if total == 0 else min(100, done * 100 / total)
                     self.progress.configure(value=percent)
-                    self.progress_text_var.set(f"{done}/{total} {message}")
+                    if self.export_paused:
+                        self.progress_text_var.set(f"已暂停｜{done}/{total} 已启动任务收尾中")
+                    else:
+                        self.progress_text_var.set(f"{done}/{total} {message}")
                     self._append_log(message)
                 elif event == "export_done":
                     self._show_export_done(payload)
