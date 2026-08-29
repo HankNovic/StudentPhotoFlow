@@ -49,7 +49,7 @@ NS = {
     "a": ART_NS,
 }
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 STATE_SCHEMA = 3
 MAX_IMAGE_BYTES = 30 * 1024 * 1024
 VOLATILE_QUERY_RE = re.compile(
@@ -126,6 +126,8 @@ class ExportOptions:
     grayscale_ratio_threshold: float = 0.85
     grayscale_delta_limit: int = 10
     face_confidence_threshold: float = 0.75
+    orientation_min_confidence: float = 0.85
+    orientation_confidence_margin: float = 0.08
     glare_ratio_threshold: float = 0.08
     glare_luma_threshold: int = 245
     recapture_score_threshold: float = 0.72
@@ -138,6 +140,9 @@ class ExportOptions:
     hivision_height: int = 413
     hivision_width: int = 295
     hivision_dpi: int = 300
+    crop_enabled: bool = False
+    crop_width: int = 295
+    crop_height: int = 413
     workers: int = 6
     force_refresh: bool = False
     timeout_seconds: int = 25
@@ -736,6 +741,8 @@ def _processing_fingerprint(options: ExportOptions) -> str:
         "grayscale_ratio_threshold": options.grayscale_ratio_threshold,
         "grayscale_delta_limit": options.grayscale_delta_limit,
         "face_confidence_threshold": options.face_confidence_threshold,
+        "orientation_min_confidence": options.orientation_min_confidence,
+        "orientation_confidence_margin": options.orientation_confidence_margin,
         "glare_ratio_threshold": options.glare_ratio_threshold,
         "glare_luma_threshold": options.glare_luma_threshold,
         "recapture_score_threshold": options.recapture_score_threshold,
@@ -746,6 +753,9 @@ def _processing_fingerprint(options: ExportOptions) -> str:
         "hivision_height": options.hivision_height,
         "hivision_width": options.hivision_width,
         "hivision_dpi": options.hivision_dpi,
+        "crop_enabled": options.crop_enabled,
+        "crop_width": options.crop_width,
+        "crop_height": options.crop_height,
         "pipeline_version": PIPELINE_VERSION,
     }, sort_keys=True).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
@@ -763,6 +773,8 @@ def _pipeline_options(options: ExportOptions) -> PipelineOptions:
         grayscale_ratio_threshold=options.grayscale_ratio_threshold,
         grayscale_delta_limit=options.grayscale_delta_limit,
         face_confidence_threshold=options.face_confidence_threshold,
+        orientation_min_confidence=options.orientation_min_confidence,
+        orientation_confidence_margin=options.orientation_confidence_margin,
         glare_ratio_threshold=options.glare_ratio_threshold,
         glare_luma_threshold=options.glare_luma_threshold,
         recapture_score_threshold=options.recapture_score_threshold,
@@ -774,6 +786,9 @@ def _pipeline_options(options: ExportOptions) -> PipelineOptions:
         hivision_height=options.hivision_height,
         hivision_width=options.hivision_width,
         hivision_dpi=options.hivision_dpi,
+        crop_enabled=options.crop_enabled,
+        crop_width=options.crop_width,
+        crop_height=options.crop_height,
     )
 
 
@@ -1016,6 +1031,7 @@ def _execute_job(
             options.quality_enabled
             or options.face_detection
             or options.background_mode != "none"
+            or options.crop_enabled
         )
         if not processing_requested:
             result.processing_status = "not_requested"
@@ -1044,7 +1060,11 @@ def _execute_job(
 
             should_write_output = (
                 pipeline.output_bytes is not None
-                and (options.background_mode != "none" or pipeline.rotation_ccw != 0)
+                and (
+                    options.background_mode != "none"
+                    or pipeline.rotation_ccw != 0
+                    or options.crop_enabled
+                )
             )
             if should_write_output:
                 processed_path = root / "处理后图片" / f"{row.student_id}.jpg"
@@ -1276,6 +1296,11 @@ def run_export(
     if options.background_mode not in {"none", "quick", "ai", "hivision"}:
         raise ExportError("背景处理模式无效")
     _parse_color(options.background_color)
+    if options.crop_enabled and not (
+        32 <= int(options.crop_width) <= 10000
+        and 32 <= int(options.crop_height) <= 10000
+    ):
+        raise ExportError("最终裁切宽高必须在 32 到 10000 像素之间")
     options.workers = max(1, min(16, int(options.workers)))
     options.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1344,14 +1369,26 @@ def run_export(
         else:
             previous_processing = existing.get("processing", {})
             needs_processing = (
-                (options.quality_enabled or options.face_detection or options.background_mode != "none")
+                (
+                    options.quality_enabled
+                    or options.face_detection
+                    or options.background_mode != "none"
+                    or options.crop_enabled
+                )
                 and (
                     previous_processing.get("config_fingerprint") != processing_fp
                     or previous_processing.get("status") not in {"success", "warning"}
                     or (
                         options.background_mode != "none"
-                        and not (_safe_state_file(options.output_dir, previous_processing.get("processed_file")) or Path()).is_file()
+                        or options.crop_enabled
                     )
+                    and not (
+                        _safe_state_file(
+                            options.output_dir,
+                            previous_processing.get("processed_file"),
+                        )
+                        or Path()
+                    ).is_file()
                 )
             )
             change = "reprocessed" if needs_processing else "unchanged"
@@ -1500,6 +1537,8 @@ def run_export(
             "grayscale_ratio_threshold": options.grayscale_ratio_threshold,
             "grayscale_delta_limit": options.grayscale_delta_limit,
             "face_confidence_threshold": options.face_confidence_threshold,
+            "orientation_min_confidence": options.orientation_min_confidence,
+            "orientation_confidence_margin": options.orientation_confidence_margin,
             "glare_ratio_threshold": options.glare_ratio_threshold,
             "glare_luma_threshold": options.glare_luma_threshold,
             "recapture_score_threshold": options.recapture_score_threshold,
@@ -1511,6 +1550,9 @@ def run_export(
             "hivision_height": options.hivision_height,
             "hivision_width": options.hivision_width,
             "hivision_dpi": options.hivision_dpi,
+            "crop_enabled": options.crop_enabled,
+            "crop_width": options.crop_width,
+            "crop_height": options.crop_height,
             "force_refresh": options.force_refresh,
         },
         "summary": summary,

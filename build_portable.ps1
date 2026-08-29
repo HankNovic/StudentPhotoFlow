@@ -9,7 +9,7 @@ $BuildRoot = Join-Path $ProjectRoot ".portable-build"
 $VenvRoot = Join-Path $BuildRoot "venv"
 $DistRoot = Join-Path $BuildRoot "dist"
 $ReleaseRoot = Join-Path $ProjectRoot "release"
-$Version = "1.2.1"
+$Version = "1.3.0"
 
 if (-not $Python) {
     $PyLauncher = Get-Command py -ErrorAction SilentlyContinue

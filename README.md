@@ -8,7 +8,7 @@
 
 便携版适用于 64 位 Windows 10、Windows 11，不需要安装 Python，也不需要单独安装图片或 AI 依赖。
 
-1. 完整解压 `StudentPhotoFlow_Windows_x64_v1.2.1.zip`。
+1. 完整解压 `StudentPhotoFlow_Windows_x64_v1.3.0.zip`。
 2. 不要只复制 EXE 或 BAT；`PhotoExporter.exe`、`启动工具.bat` 和 `_internal` 文件夹必须放在一起。
 3. 双击唯一的 `启动工具.bat`。也可以把 `.xlsx` 文件拖到这个 BAT 上。
 
@@ -64,13 +64,15 @@
 ## 分步骤预检与图片处理
 
 - 内置预检使用 Pillow、OpenCV 和 YuNet ONNX，可整体关闭，也可分别启停方向、黑白、人脸、反光和翻拍检查。
-- 方向错误会自动生成修正版；黑白、无人脸、多人脸、严重反光和明显翻拍默认列入重传名单，并停止后续换背景。
+- 方向修正采用正向优先的安全阈值；只有旋转候选明显优于原方向时才自动旋转，避免正常证件照被误转 180°。
+- 黑白、无人脸、多人脸、严重反光和明显翻拍默认列入重传名单，并停止后续换背景。
 - YuNet 仅做离线人脸检测和五官定位，不做人脸身份识别，也不建立人脸库。
 - “可视化处理工作台”按顺序显示原图解码、方向、人脸、黑白、反光、翻拍和换背景结果；调整阈值后可立即整条重跑并另存图片与 JSON 参数记录。
 - “快速纯色背景替换”适合原背景较均匀的证件照，速度快且无需额外模型。头发边缘复杂或背景杂乱时，建议改用 AI 模式。
 - 默认的“AI 智能抠图换背景”使用便携包内置的 `rembg/u2netp`，无需联网。
 - “Hivision API”仅是可选 HTTP 接入。Hivision 服务和模型不会打进便携包，只有用户主动选择该模式时才会访问填写的地址。
 - 背景色默认标准蓝 `#438EDB`，也可选择白色、红色或自定义颜色。
+- 可启用“最终图片裁切”，自定义精确像素宽高，例如 295×413；程序按人脸位置进行等比裁切后缩放，并把成片作为独立可视化步骤。
 
 ## 命令行用法
 
@@ -90,6 +92,12 @@ PhotoExporter.exe "学生信息.xlsx" --cli --output "D:\照片导出" --sheet "
 
 ```powershell
 PhotoExporter.exe "学生信息.xlsx" --cli --output "D:\照片导出" --id-column 学号 --image-column 个人免冠照片 --quality-check --background-mode quick --background-color "#438EDB"
+```
+
+同时输出 295×413 像素成片：
+
+```powershell
+PhotoExporter.exe "学生信息.xlsx" --cli --output "D:\照片导出" --id-column 学号 --image-column 个人免冠照片 --quality-check --crop --crop-width 295 --crop-height 413
 ```
 
 不指定 `--background-mode` 时默认使用 `ai`。选择可选 Hivision 服务时使用 `--background-mode hivision --hivision-url http://127.0.0.1:8080`。

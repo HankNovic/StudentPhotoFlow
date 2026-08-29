@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 
-PIPELINE_VERSION = 2
+PIPELINE_VERSION = 3
 
 
 class PipelineError(RuntimeError):
@@ -37,6 +37,8 @@ class PipelineOptions:
     glare_ratio_threshold: float = 0.08
     glare_luma_threshold: int = 245
     recapture_score_threshold: float = 0.72
+    orientation_min_confidence: float = 0.85
+    orientation_confidence_margin: float = 0.08
     stop_on_reject: bool = True
     background_mode: str = "ai"  # none | quick | ai | hivision
     background_color: str = "#438EDB"
@@ -47,6 +49,9 @@ class PipelineOptions:
     hivision_dpi: int = 300
     hivision_matting_model: str = "modnet_photographic_portrait_matting"
     hivision_face_model: str = "mtcnn"
+    crop_enabled: bool = False
+    crop_width: int = 295
+    crop_height: int = 413
 
 
 @dataclass
@@ -239,8 +244,101 @@ def _orient_image(image, options: PipelineOptions):
         rotated = image if angle == 0 else image.rotate(angle, expand=True)
         faces, detector = _detect_faces(rotated, options.face_confidence_threshold)
         candidates.append((_face_rank(rotated, faces), angle, rotated, faces, detector))
-    _rank, angle, oriented, faces, detector = max(candidates, key=lambda item: item[0])
-    return oriented, angle, faces, detector
+    original = candidates[0]
+    best = max(candidates, key=lambda item: item[0])
+    _rank, angle, oriented, faces, detector = best
+
+    def candidate_metrics(candidate) -> dict[str, Any]:
+        rank, candidate_angle, _image, candidate_faces, candidate_detector = candidate
+        return {
+            "angle": candidate_angle,
+            "face_count": len(candidate_faces),
+            "confidence": round(float(rank[2]), 4),
+            "face_area_ratio": round(float(rank[3]), 4),
+            "detector": candidate_detector,
+        }
+
+    decision = "original_is_best"
+    if angle != 0:
+        original_rank = original[0]
+        best_confidence = float(_rank[2])
+        original_confidence = float(original_rank[2])
+        confidence_margin = best_confidence - original_confidence
+        minimum_confidence = options.orientation_min_confidence
+        required_margin = options.orientation_confidence_margin
+        if angle == 180:
+            # An upside-down portrait can still produce a weak false-positive
+            # YuNet box.  A 180-degree correction therefore needs stronger
+            # evidence than a sideways 90/270-degree correction.
+            minimum_confidence = max(minimum_confidence, 0.90)
+            required_margin = max(required_margin, 0.12)
+        area_is_plausible = (
+            original_rank[3] <= 0.0
+            or _rank[3] >= original_rank[3] * 0.65
+        )
+        should_rotate = (
+            len(faces) == 1
+            and best_confidence >= minimum_confidence
+            and confidence_margin >= required_margin
+            and area_is_plausible
+        )
+        if should_rotate:
+            decision = "rotated_with_clear_advantage"
+        else:
+            best = original
+            _rank, angle, oriented, faces, detector = best
+            decision = "kept_original_due_to_rotation_safety"
+
+    orientation_metrics = {
+        "decision": decision,
+        "minimum_confidence": round(float(options.orientation_min_confidence), 4),
+        "required_confidence_margin": round(float(options.orientation_confidence_margin), 4),
+        "candidates": [candidate_metrics(candidate) for candidate in candidates],
+    }
+    return oriented, angle, faces, detector, orientation_metrics
+
+
+def _crop_and_resize(image, faces: list[dict[str, Any]], width: int, height: int):
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise PipelineError("最终裁切需要 Pillow") from exc
+
+    target_ratio = width / height
+    source_ratio = image.width / image.height
+    if source_ratio > target_ratio:
+        crop_height = image.height
+        crop_width = max(1, min(image.width, round(crop_height * target_ratio)))
+    else:
+        crop_width = image.width
+        crop_height = max(1, min(image.height, round(crop_width / target_ratio)))
+
+    anchor = "image_center"
+    center_x = image.width / 2
+    center_y = image.height / 2
+    if faces:
+        face = max(faces, key=lambda item: item["box"][2] * item["box"][3])
+        x, y, face_width, face_height = face["box"]
+        center_x = x + face_width / 2
+        # Certificate portraits generally look balanced with the eye/face area
+        # slightly above the vertical centre of the final frame.
+        center_y = y + face_height / 2
+        anchor = "largest_face"
+
+    left = round(center_x - crop_width / 2)
+    top = round(center_y - crop_height * (0.42 if faces else 0.5))
+    left = max(0, min(image.width - crop_width, left))
+    top = max(0, min(image.height - crop_height, top))
+    box = (left, top, left + crop_width, top + crop_height)
+    cropped = image.crop(box).resize((width, height), Image.Resampling.LANCZOS)
+    return cropped, {
+        "source_width": image.width,
+        "source_height": image.height,
+        "crop_box": list(box),
+        "crop_anchor": anchor,
+        "target_width": width,
+        "target_height": height,
+    }
 
 
 def _face_region(image, faces: list[dict[str, Any]]):
@@ -565,9 +663,15 @@ def validate_pipeline_options(options: PipelineOptions) -> None:
     options.grayscale_ratio_threshold = min(1.0, max(0.0, float(options.grayscale_ratio_threshold)))
     options.grayscale_delta_limit = min(60, max(0, int(options.grayscale_delta_limit)))
     options.face_confidence_threshold = min(0.99, max(0.05, float(options.face_confidence_threshold)))
+    options.orientation_min_confidence = min(0.99, max(0.05, float(options.orientation_min_confidence)))
+    options.orientation_confidence_margin = min(0.5, max(0.0, float(options.orientation_confidence_margin)))
     options.glare_ratio_threshold = min(1.0, max(0.0, float(options.glare_ratio_threshold)))
     options.glare_luma_threshold = min(255, max(1, int(options.glare_luma_threshold)))
     options.recapture_score_threshold = min(1.0, max(0.0, float(options.recapture_score_threshold)))
+    options.crop_width = int(options.crop_width)
+    options.crop_height = int(options.crop_height)
+    if options.crop_enabled and not (32 <= options.crop_width <= 10000 and 32 <= options.crop_height <= 10000):
+        raise PipelineError("最终裁切宽高必须在 32 到 10000 像素之间")
     if options.background_mode == "hivision" and not options.hivision_url.strip():
         raise PipelineError("选择 Hivision 时必须填写 API 地址")
 
@@ -588,25 +692,37 @@ def run_pipeline(data: bytes, options: PipelineOptions) -> PipelineResult:
     face_count: int | None = None
     rotation = 0
     detector = "not_used"
+    faces: list[dict[str, Any]] = []
     working = image
 
     if options.quality_enabled:
-        working, rotation, faces, detector = _orient_image(image, options)
+        working, rotation, faces, detector, orientation_metrics = _orient_image(image, options)
         face_count = len(faces)
         metrics.update({
             "rotation_ccw": rotation,
             "face_count": face_count,
             "face_detector": detector,
             "face_scores": [round(float(face.get("score", 0.0)), 4) for face in faces],
+            "orientation": orientation_metrics,
         })
-        orientation_detail = "方向无需调整" if rotation == 0 else f"自动逆时针旋转 {rotation}°"
+        if rotation:
+            orientation_detail = f"检测证据明确，自动逆时针旋转 {rotation}°"
+        elif orientation_metrics["decision"] == "kept_original_due_to_rotation_safety":
+            orientation_detail = "旋转候选优势不足，按安全策略保留原方向"
+        else:
+            orientation_detail = "方向无需调整"
         stages.append(PipelineStage(
             code="orientation",
             label="方向与人脸定位",
             status="adjusted" if rotation else "passed",
             detail=f"{orientation_detail}；检测器 {detector}",
             image_bytes=_encode_image(_annotate(working, faces=faces)),
-            metrics={"rotation_ccw": rotation, "face_count": face_count, "detector": detector},
+            metrics={
+                "rotation_ccw": rotation,
+                "face_count": face_count,
+                "detector": detector,
+                **orientation_metrics,
+            },
         ))
 
         if options.check_grayscale:
@@ -716,6 +832,7 @@ def run_pipeline(data: bytes, options: PipelineOptions) -> PipelineResult:
         )
 
     if options.background_mode == "none":
+        final_image = working
         stages.append(PipelineStage(
             code="background",
             label="换背景",
@@ -723,7 +840,6 @@ def run_pipeline(data: bytes, options: PipelineOptions) -> PipelineResult:
             detail="未选择换背景处理",
             image_bytes=_encode_image(working),
         ))
-        output = _encode_image(working)
         engine = "none"
     else:
         try:
@@ -740,15 +856,59 @@ def run_pipeline(data: bytes, options: PipelineOptions) -> PipelineResult:
             raise
         except Exception as exc:
             raise PipelineError(f"图片处理失败：{type(exc).__name__}: {exc}") from exc
-        output = _encode_image(final_image)
+        background_output = _encode_image(final_image)
         stages.append(PipelineStage(
             code="background",
             label=label,
             status="passed",
             detail=f"处理引擎 {engine}；背景色 {options.background_color.upper()}",
-            image_bytes=output,
+            image_bytes=background_output,
             metrics={"engine": engine, "background_color": options.background_color.upper()},
         ))
+
+    if options.crop_enabled:
+        crop_faces = faces
+        crop_detector = detector
+        if not crop_faces or final_image.size != working.size:
+            try:
+                crop_faces, crop_detector = _detect_faces(
+                    final_image,
+                    options.face_confidence_threshold,
+                )
+            except PipelineError:
+                crop_faces, crop_detector = [], "center_fallback"
+        final_image, crop_metrics = _crop_and_resize(
+            final_image,
+            crop_faces,
+            options.crop_width,
+            options.crop_height,
+        )
+        crop_metrics.update({"face_count": len(crop_faces), "detector": crop_detector})
+        metrics.update({
+            "crop_enabled": True,
+            "crop_width": options.crop_width,
+            "crop_height": options.crop_height,
+            "crop_box": crop_metrics["crop_box"],
+        })
+        stages.append(PipelineStage(
+            code="crop",
+            label="最终成片裁切",
+            status="adjusted",
+            detail=f"按证件照比例裁切并精确输出 {options.crop_width}×{options.crop_height} 像素",
+            image_bytes=_encode_image(final_image),
+            metrics=crop_metrics,
+        ))
+    else:
+        metrics["crop_enabled"] = False
+        stages.append(PipelineStage(
+            code="crop",
+            label="最终成片裁切",
+            status="disabled",
+            detail="用户未启用最终尺寸裁切",
+            image_bytes=_encode_image(final_image),
+        ))
+
+    output = _encode_image(final_image)
 
     return PipelineResult(
         status="warning" if reasons else "success",

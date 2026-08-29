@@ -54,6 +54,8 @@ class PhotoProcessingWorkbench:
         self.gray_threshold_var = tk.DoubleVar(value=initial.grayscale_ratio_threshold)
         self.gray_delta_var = tk.IntVar(value=initial.grayscale_delta_limit)
         self.face_confidence_var = tk.DoubleVar(value=initial.face_confidence_threshold)
+        self.orientation_min_confidence_var = tk.DoubleVar(value=initial.orientation_min_confidence)
+        self.orientation_confidence_margin_var = tk.DoubleVar(value=initial.orientation_confidence_margin)
         self.glare_threshold_var = tk.DoubleVar(value=initial.glare_ratio_threshold)
         self.glare_luma_var = tk.IntVar(value=initial.glare_luma_threshold)
         self.recapture_threshold_var = tk.DoubleVar(value=initial.recapture_score_threshold)
@@ -64,6 +66,9 @@ class PhotoProcessingWorkbench:
         self.hivision_width_var = tk.IntVar(value=initial.hivision_width)
         self.hivision_height_var = tk.IntVar(value=initial.hivision_height)
         self.hivision_dpi_var = tk.IntVar(value=initial.hivision_dpi)
+        self.crop_enabled_var = tk.BooleanVar(value=initial.crop_enabled)
+        self.crop_width_var = tk.IntVar(value=initial.crop_width)
+        self.crop_height_var = tk.IntVar(value=initial.crop_height)
         self.status_var = tk.StringVar(value="选择一张照片后，点击“运行全部步骤”。")
         self._busy = False
         self._photos: list[Any] = []
@@ -81,17 +86,46 @@ class PhotoProcessingWorkbench:
         ttk.Entry(source, textvariable=self.input_var).grid(row=0, column=1, sticky="ew")
         ttk.Button(source, text="选择…", command=self.choose_image).grid(row=0, column=2, padx=(8, 0))
 
-        panes = ttk.Panedwindow(self.window, orient="horizontal")
-        panes.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
-        self.panes = panes
+        workspace = ttk.Frame(self.window)
+        workspace.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+        workspace.columnconfigure(1, weight=1)
+        workspace.rowconfigure(0, weight=1)
 
-        controls = ttk.Frame(panes, padding=(0, 0, 10, 0), width=310)
-        panes.add(controls, weight=0)
+        controls_host = ttk.Frame(workspace, width=330)
+        controls_host.columnconfigure(0, weight=1)
+        controls_host.rowconfigure(0, weight=1)
+        controls_host.grid(row=0, column=0, sticky="ns", padx=(0, 10))
+        controls_host.grid_propagate(False)
+        controls_canvas = self.tk.Canvas(
+            controls_host,
+            highlightthickness=0,
+            borderwidth=0,
+            width=310,
+        )
+        controls_scroll = ttk.Scrollbar(
+            controls_host,
+            orient="vertical",
+            command=controls_canvas.yview,
+        )
+        controls_canvas.configure(yscrollcommand=controls_scroll.set)
+        controls_canvas.grid(row=0, column=0, sticky="nsew")
+        controls_scroll.grid(row=0, column=1, sticky="ns")
+        controls = ttk.Frame(controls_canvas, padding=(0, 0, 10, 0))
+        controls_window = controls_canvas.create_window((0, 0), window=controls, anchor="nw")
+
+        def update_scroll_region(_event=None) -> None:
+            controls_canvas.configure(scrollregion=controls_canvas.bbox("all"))
+
+        def fit_controls_width(event) -> None:
+            controls_canvas.itemconfigure(controls_window, width=max(1, event.width))
+
+        controls.bind("<Configure>", update_scroll_region)
+        controls_canvas.bind("<Configure>", fit_controls_width)
         quality = ttk.LabelFrame(controls, text="内置预检步骤", padding=9)
         quality.pack(fill="x")
         ttk.Checkbutton(quality, text="启用 Pillow + OpenCV + YuNet", variable=self.quality_var).pack(anchor="w")
         for text, variable in [
-            ("自动方向修正", self.auto_orient_var),
+            ("安全自动方向修正", self.auto_orient_var),
             ("彩色/黑白检查", self.grayscale_var),
             ("人脸数量检查", self.face_var),
             ("反光与过曝检查", self.glare_var),
@@ -106,6 +140,8 @@ class PhotoProcessingWorkbench:
             ("灰度得分", self.gray_threshold_var, 0.0, 1.0, 0.01),
             ("通道差", self.gray_delta_var, 0, 60, 1),
             ("人脸置信度", self.face_confidence_var, 0.05, 0.99, 0.01),
+            ("旋转最低置信度", self.orientation_min_confidence_var, 0.05, 0.99, 0.01),
+            ("旋转领先分数", self.orientation_confidence_margin_var, 0.0, 0.5, 0.01),
             ("反光面积", self.glare_threshold_var, 0.0, 1.0, 0.01),
             ("反光亮度", self.glare_luma_var, 1, 255, 1),
             ("翻拍得分", self.recapture_threshold_var, 0.0, 1.0, 0.01),
@@ -146,37 +182,50 @@ class PhotoProcessingWorkbench:
         ]:
             ttk.Entry(hivision_values, textvariable=variable, width=width).pack(side="left", padx=(0, 4))
 
+        ttk.Checkbutton(
+            processing,
+            text="最终成片裁切",
+            variable=self.crop_enabled_var,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(7, 2))
+        crop_values = ttk.Frame(processing)
+        crop_values.grid(row=8, column=0, columnspan=2, sticky="ew")
+        ttk.Label(crop_values, text="宽").pack(side="left")
+        ttk.Entry(crop_values, textvariable=self.crop_width_var, width=7).pack(side="left", padx=(4, 8))
+        ttk.Label(crop_values, text="× 高").pack(side="left")
+        ttk.Entry(crop_values, textvariable=self.crop_height_var, width=7).pack(side="left", padx=(4, 0))
+
         self.run_button = ttk.Button(controls, text="运行全部步骤／按参数重跑", command=self.run_async)
         self.run_button.pack(fill="x", pady=(12, 0))
         self.save_button = ttk.Button(controls, text="另存最终结果…", command=self.save_output, state="disabled")
         self.save_button.pack(fill="x", pady=(7, 0))
 
-        preview = ttk.Frame(panes)
+        def scroll_controls(event) -> str:
+            delta = int(-event.delta / 120) if event.delta else 0
+            controls_canvas.yview_scroll(delta or (1 if event.delta < 0 else -1), "units")
+            return "break"
+
+        def bind_controls_mousewheel(widget) -> None:
+            widget.bind("<MouseWheel>", scroll_controls)
+            for child in widget.winfo_children():
+                bind_controls_mousewheel(child)
+
+        bind_controls_mousewheel(controls_canvas)
+        bind_controls_mousewheel(controls)
+
+        preview = ttk.Frame(workspace)
         preview.columnconfigure(0, weight=1)
         preview.rowconfigure(0, weight=1)
-        panes.add(preview, weight=1)
+        preview.grid(row=0, column=1, sticky="nsew")
         self.notebook = ttk.Notebook(preview)
         self.notebook.grid(row=0, column=0, sticky="nsew")
         placeholder = ttk.Frame(self.notebook, padding=30)
         ttk.Label(placeholder, text="运行后将在这里按顺序显示每一步的图片、状态和计算指标。", anchor="center").pack(expand=True)
         self.notebook.add(placeholder, text="等待处理")
 
-        # ttk.Panedwindow does not reliably keep the requested frame width on
-        # every Windows scaling setting.  Set the sash after layout so the
-        # parameter column stays usable instead of collapsing to a few pixels.
-        self.window.after_idle(self._restore_control_pane_width)
-
         footer = ttk.Frame(self.window, padding=(12, 4, 12, 12))
         footer.grid(row=2, column=0, sticky="ew")
         footer.columnconfigure(0, weight=1)
         ttk.Label(footer, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
-
-    def _restore_control_pane_width(self) -> None:
-        try:
-            available_width = max(self.window.winfo_width() - 24, 1)
-            self.panes.sashpos(0, min(330, max(285, available_width // 3)))
-        except self.tk.TclError:
-            pass
 
     def choose_image(self) -> None:
         path = self.filedialog.askopenfilename(
@@ -198,6 +247,8 @@ class PhotoProcessingWorkbench:
             grayscale_ratio_threshold=float(self.gray_threshold_var.get()),
             grayscale_delta_limit=int(self.gray_delta_var.get()),
             face_confidence_threshold=float(self.face_confidence_var.get()),
+            orientation_min_confidence=float(self.orientation_min_confidence_var.get()),
+            orientation_confidence_margin=float(self.orientation_confidence_margin_var.get()),
             glare_ratio_threshold=float(self.glare_threshold_var.get()),
             glare_luma_threshold=int(self.glare_luma_var.get()),
             recapture_score_threshold=float(self.recapture_threshold_var.get()),
@@ -209,6 +260,9 @@ class PhotoProcessingWorkbench:
             hivision_width=int(self.hivision_width_var.get()),
             hivision_height=int(self.hivision_height_var.get()),
             hivision_dpi=int(self.hivision_dpi_var.get()),
+            crop_enabled=bool(self.crop_enabled_var.get()),
+            crop_width=int(self.crop_width_var.get()),
+            crop_height=int(self.crop_height_var.get()),
         )
 
     def _set_busy(self, busy: bool) -> None:

@@ -64,6 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="背景处理：none/quick/ai/hivision，默认 ai",
     )
     parser.add_argument("--background-color", default="#438EDB", help="背景色，例如 #438EDB")
+    parser.add_argument("--crop", action="store_true", help="启用最终成片裁切")
+    parser.add_argument("--crop-width", type=int, default=295, help="最终图片宽度，默认 295")
+    parser.add_argument("--crop-height", type=int, default=413, help="最终图片高度，默认 413")
     parser.add_argument("--hivision-url", default="http://127.0.0.1:8080", help="可选 Hivision API 地址")
     parser.add_argument("--workers", type=int, default=6, help="并发数 1-16，默认 6")
     parser.add_argument("--force-refresh", action="store_true", help="重新下载已存在照片")
@@ -105,6 +108,9 @@ def _cli_main(args: argparse.Namespace) -> int:
         auto_orient=not args.no_auto_orient,
         background_mode=args.background_mode,
         background_color=args.background_color,
+        crop_enabled=args.crop,
+        crop_width=args.crop_width,
+        crop_height=args.crop_height,
         hivision_url=args.hivision_url,
         workers=args.workers,
         force_refresh=args.force_refresh,
@@ -163,6 +169,8 @@ class PhotoExporterApp:
         self.grayscale_threshold_var = tk.DoubleVar(value=0.85)
         self.grayscale_delta_var = tk.IntVar(value=10)
         self.face_confidence_var = tk.DoubleVar(value=0.75)
+        self.orientation_min_confidence_var = tk.DoubleVar(value=0.85)
+        self.orientation_confidence_margin_var = tk.DoubleVar(value=0.08)
         self.glare_threshold_var = tk.DoubleVar(value=0.08)
         self.glare_luma_var = tk.IntVar(value=245)
         self.recapture_threshold_var = tk.DoubleVar(value=0.72)
@@ -174,6 +182,9 @@ class PhotoExporterApp:
         self.hivision_height_var = tk.IntVar(value=413)
         self.hivision_width_var = tk.IntVar(value=295)
         self.hivision_dpi_var = tk.IntVar(value=300)
+        self.crop_enabled_var = tk.BooleanVar(value=False)
+        self.crop_width_var = tk.IntVar(value=295)
+        self.crop_height_var = tk.IntVar(value=413)
         self.workers_var = tk.IntVar(value=6)
         self.force_var = tk.BooleanVar(value=False)
         self.open_gallery_var = tk.BooleanVar(value=True)
@@ -248,6 +259,21 @@ class PhotoExporterApp:
         ).grid(row=1, column=3, padx=(0, 6), pady=(7, 2))
         ttk.Button(options, text="自定义…", command=self.choose_color).grid(row=1, column=4, padx=(0, 8), pady=(7, 2))
         ttk.Label(options, textvariable=self.custom_color_var, width=9).grid(row=1, column=5, pady=(7, 2), sticky="w")
+
+        ttk.Checkbutton(
+            options,
+            text="最终图片裁切",
+            variable=self.crop_enabled_var,
+        ).grid(row=2, column=0, padx=(0, 6), pady=(7, 2), sticky="w")
+        ttk.Label(options, text="宽").grid(row=2, column=1, pady=(7, 2), sticky="e")
+        ttk.Spinbox(options, from_=32, to=10000, textvariable=self.crop_width_var, width=7).grid(
+            row=2, column=2, padx=(5, 8), pady=(7, 2), sticky="w"
+        )
+        ttk.Label(options, text="×  高").grid(row=2, column=3, pady=(7, 2), sticky="e")
+        ttk.Spinbox(options, from_=32, to=10000, textvariable=self.crop_height_var, width=7).grid(
+            row=2, column=4, padx=(5, 8), pady=(7, 2), sticky="w"
+        )
+        ttk.Label(options, text="像素（默认 295×413）").grid(row=2, column=5, pady=(7, 2), sticky="w")
 
         advanced = ttk.Frame(settings)
         advanced.grid(row=5, column=0, columnspan=6, sticky="ew", pady=(6, 0))
@@ -342,6 +368,8 @@ class PhotoExporterApp:
             grayscale_ratio_threshold=float(self.grayscale_threshold_var.get()),
             grayscale_delta_limit=int(self.grayscale_delta_var.get()),
             face_confidence_threshold=float(self.face_confidence_var.get()),
+            orientation_min_confidence=float(self.orientation_min_confidence_var.get()),
+            orientation_confidence_margin=float(self.orientation_confidence_margin_var.get()),
             glare_ratio_threshold=float(self.glare_threshold_var.get()),
             glare_luma_threshold=int(self.glare_luma_var.get()),
             recapture_score_threshold=float(self.recapture_threshold_var.get()),
@@ -353,6 +381,9 @@ class PhotoExporterApp:
             hivision_height=int(self.hivision_height_var.get()),
             hivision_width=int(self.hivision_width_var.get()),
             hivision_dpi=int(self.hivision_dpi_var.get()),
+            crop_enabled=bool(self.crop_enabled_var.get()),
+            crop_width=int(self.crop_width_var.get()),
+            crop_height=int(self.crop_height_var.get()),
         )
 
     def open_quality_settings(self) -> None:
@@ -366,7 +397,7 @@ class PhotoExporterApp:
 
         steps = ttk.LabelFrame(body, text="参与处理的步骤", padding=10)
         steps.grid(row=0, column=0, sticky="ew")
-        ttk.Checkbutton(steps, text="自动判断并修正 90°/180°/270°方向", variable=self.auto_orient_var).grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(steps, text="自动判断并安全修正 90°/180°/270°方向", variable=self.auto_orient_var).grid(row=0, column=0, sticky="w", pady=2)
         ttk.Checkbutton(steps, text="彩色/黑白检查", variable=self.grayscale_var).grid(row=1, column=0, sticky="w", pady=2)
         ttk.Checkbutton(steps, text="人脸数量检查", variable=self.face_var).grid(row=2, column=0, sticky="w", pady=2)
         ttk.Checkbutton(steps, text="反光与过曝检查", variable=self.glare_var).grid(row=3, column=0, sticky="w", pady=2)
@@ -379,6 +410,8 @@ class PhotoExporterApp:
             ("灰度得分阈值", self.grayscale_threshold_var, 0.0, 1.0, 0.01),
             ("灰度通道差上限", self.grayscale_delta_var, 0, 60, 1),
             ("人脸置信度阈值", self.face_confidence_var, 0.05, 0.99, 0.01),
+            ("旋转最低置信度", self.orientation_min_confidence_var, 0.05, 0.99, 0.01),
+            ("旋转领先分数", self.orientation_confidence_margin_var, 0.0, 0.5, 0.01),
             ("反光面积阈值", self.glare_threshold_var, 0.0, 1.0, 0.01),
             ("反光亮度阈值", self.glare_luma_var, 1, 255, 1),
             ("二次拍摄得分阈值", self.recapture_threshold_var, 0.0, 1.0, 0.01),
@@ -420,6 +453,8 @@ class PhotoExporterApp:
             self.grayscale_threshold_var.set(0.85)
             self.grayscale_delta_var.set(10)
             self.face_confidence_var.set(0.75)
+            self.orientation_min_confidence_var.set(0.85)
+            self.orientation_confidence_margin_var.set(0.08)
             self.glare_threshold_var.set(0.08)
             self.glare_luma_var.set(245)
             self.recapture_threshold_var.set(0.72)
@@ -585,6 +620,8 @@ class PhotoExporterApp:
                 grayscale_ratio_threshold=float(self.grayscale_threshold_var.get()),
                 grayscale_delta_limit=int(self.grayscale_delta_var.get()),
                 face_confidence_threshold=float(self.face_confidence_var.get()),
+                orientation_min_confidence=float(self.orientation_min_confidence_var.get()),
+                orientation_confidence_margin=float(self.orientation_confidence_margin_var.get()),
                 glare_ratio_threshold=float(self.glare_threshold_var.get()),
                 glare_luma_threshold=int(self.glare_luma_var.get()),
                 recapture_score_threshold=float(self.recapture_threshold_var.get()),
@@ -596,6 +633,9 @@ class PhotoExporterApp:
                 hivision_height=int(self.hivision_height_var.get()),
                 hivision_width=int(self.hivision_width_var.get()),
                 hivision_dpi=int(self.hivision_dpi_var.get()),
+                crop_enabled=bool(self.crop_enabled_var.get()),
+                crop_width=int(self.crop_width_var.get()),
+                crop_height=int(self.crop_height_var.get()),
                 workers=int(self.workers_var.get()),
                 force_refresh=bool(self.force_var.get()),
             )
