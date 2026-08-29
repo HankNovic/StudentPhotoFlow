@@ -49,7 +49,7 @@ NS = {
     "a": ART_NS,
 }
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 STATE_SCHEMA = 3
 MAX_IMAGE_BYTES = 30 * 1024 * 1024
 VOLATILE_QUERY_RE = re.compile(
@@ -873,29 +873,6 @@ def _load_upright_image(data: bytes):
         return ImageOps.exif_transpose(image)
     except Exception as exc:
         raise ExportError(f"图片解码失败：{exc}") from exc
-
-
-def _detect_faces(data: bytes) -> int:
-    try:
-        import cv2
-        import numpy as np
-    except ImportError as exc:
-        raise ExportError("缺少 OpenCV；请重新运行“启动工具.bat”自动检查依赖") from exc
-    image = _load_upright_image(data).convert("RGB")
-    array = np.asarray(image)
-    gray = cv2.cvtColor(array, cv2.COLOR_RGB2GRAY)
-    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-    cascade = cv2.CascadeClassifier(str(cascade_path))
-    if cascade.empty():
-        raise ExportError("OpenCV 人脸检测模型加载失败")
-    minimum = max(30, min(gray.shape[:2]) // 12)
-    faces = cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(minimum, minimum),
-    )
-    return len(faces)
 
 
 def _quick_replace_background(data: bytes, color: str) -> bytes:

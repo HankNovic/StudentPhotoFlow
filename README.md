@@ -8,7 +8,7 @@
 
 便携版适用于 64 位 Windows 10、Windows 11，不需要安装 Python，也不需要单独安装图片或 AI 依赖。
 
-1. 完整解压 `StudentPhotoFlow_Windows_x64_v1.2.0.zip`。
+1. 完整解压 `StudentPhotoFlow_Windows_x64_v1.2.1.zip`。
 2. 不要只复制 EXE 或 BAT；`PhotoExporter.exe`、`启动工具.bat` 和 `_internal` 文件夹必须放在一起。
 3. 双击唯一的 `启动工具.bat`。也可以把 `.xlsx` 文件拖到这个 BAT 上。
 

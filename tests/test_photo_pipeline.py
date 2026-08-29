@@ -12,7 +12,12 @@ from PIL import Image
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from photo_pipeline import PipelineOptions, run_pipeline, save_pipeline_stages  # noqa: E402
+from photo_pipeline import (  # noqa: E402
+    PipelineOptions,
+    _load_haar_cascade,
+    run_pipeline,
+    save_pipeline_stages,
+)
 
 
 def encoded_image(color: tuple[int, int, int]) -> bytes:
@@ -23,6 +28,28 @@ def encoded_image(color: tuple[int, int, int]) -> bytes:
 
 
 class PhotoPipelineTests(unittest.TestCase):
+    def test_haar_fallback_loads_from_memory_when_path_loader_fails(self) -> None:
+        import cv2
+
+        class EmptyCascade:
+            @staticmethod
+            def empty() -> bool:
+                return True
+
+        class PathFailingCv2:
+            data = cv2.data
+            FileStorage = cv2.FileStorage
+            FILE_STORAGE_READ = cv2.FILE_STORAGE_READ
+            FILE_STORAGE_MEMORY = cv2.FILE_STORAGE_MEMORY
+            error = cv2.error
+
+            @staticmethod
+            def CascadeClassifier(path: str | None = None):
+                return EmptyCascade() if path is not None else cv2.CascadeClassifier()
+
+        cascade = _load_haar_cascade(PathFailingCv2)
+        self.assertFalse(cascade.empty())
+
     def test_grayscale_photo_is_rejected_and_stages_are_saved(self) -> None:
         options = PipelineOptions(
             quality_enabled=True,

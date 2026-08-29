@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 
-PIPELINE_VERSION = 1
+PIPELINE_VERSION = 2
 
 
 class PipelineError(RuntimeError):
@@ -92,6 +92,34 @@ def _yunet_model_path() -> Path | None:
 @lru_cache(maxsize=1)
 def _yunet_model_bytes(path: str) -> bytes:
     return Path(path).read_bytes()
+
+
+def _load_haar_cascade(cv2):
+    """Load OpenCV's fallback cascade without depending on a Unicode path."""
+    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+    cascade = cv2.CascadeClassifier(str(cascade_path))
+    if not cascade.empty():
+        return cascade
+
+    # OpenCV's Windows filename bridge can reject paths containing Chinese
+    # characters. Python can still read the file, and FileStorage can parse the
+    # XML from memory, which keeps this fallback portable on those paths.
+    try:
+        cascade_xml = cascade_path.read_text(encoding="utf-8")
+        storage = cv2.FileStorage(
+            cascade_xml,
+            cv2.FILE_STORAGE_READ | cv2.FILE_STORAGE_MEMORY,
+        )
+        try:
+            memory_cascade = cv2.CascadeClassifier()
+            loaded = storage.isOpened() and memory_cascade.read(storage.getFirstTopLevelNode())
+        finally:
+            storage.release()
+    except (OSError, UnicodeError, cv2.error) as exc:
+        raise PipelineError(f"OpenCV 备用人脸模型加载失败：{exc}") from exc
+    if not loaded or memory_cascade.empty():
+        raise PipelineError("OpenCV 备用人脸模型加载失败")
+    return memory_cascade
 
 
 def _parse_color(color: str) -> tuple[int, int, int]:
@@ -179,10 +207,7 @@ def _detect_faces(image, confidence: float) -> tuple[list[dict[str, Any]], str]:
             # A damaged or incompatible ONNX file must not stop original export.
             pass
 
-    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-    cascade = cv2.CascadeClassifier(str(cascade_path))
-    if cascade.empty():
-        raise PipelineError("YuNet 不可用，并且 OpenCV 备用人脸模型加载失败")
+    cascade = _load_haar_cascade(cv2)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     minimum = max(30, min(gray.shape[:2]) // 12)
     raw_faces = cascade.detectMultiScale(
