@@ -8,11 +8,13 @@
 
 便携版适用于 64 位 Windows 10、Windows 11，不需要安装 Python，也不需要单独安装图片或 AI 依赖。
 
-1. 完整解压 `StudentPhotoFlow_Windows_x64_v1.5.0.zip`。
+1. 完整解压 `StudentPhotoFlow_Windows_x64_v1.7.0.zip`。
 2. 不要只复制 EXE 或 BAT；`PhotoExporter.exe`、`启动工具.bat` 和 `_internal` 文件夹必须放在一起。
 3. 双击唯一的 `启动工具.bat`。也可以把 `.xlsx` 文件拖到这个 BAT 上。
 
-启动器会自动检查内置 Python 运行时、Tkinter 图形界面、`rembg/u2netp` 和 `YuNet ONNX` 等关键文件。如果文件不完整或程序异常，窗口不会立即关闭，并会在当前目录生成 `启动错误.log`。所有默认组件均已包含在便携包中，首次处理不需要联网下载模型。
+启动器会自动检查内置 Python 运行时、Tkinter 图形界面、`rembg/u2netp` 和 `YuNet ONNX` 等关键文件。成功启动主程序后，黑色 BAT 窗口会立即自行关闭；只有便携包缺文件或启动命令失败时才会保留窗口显示错误。主程序自身异常会在当前目录生成 `启动错误.log`。所有组件均已包含在便携包中，首次处理不需要联网下载模型。
+
+默认“换背景”为“不处理”。处理参数、预检阈值、Hivision 地址、裁切尺寸、输出目录、工作表和列选择等会自动保存到便携目录的 `StudentPhotoFlow.settings.json`，下次启动自动恢复；也可以点击“保存当前配置”立即保存。点击“导出配置”可生成可迁移的 JSON 配置，另一份便携版可用“导入配置”应用并保存。强制重新下载和强制重新处理属于一次性操作，不会被记住。
 
 项目只发布和支持完整便携版；源码目录中的 `启动工具.bat` 不承担依赖安装功能。
 
@@ -24,7 +26,16 @@
 4. 点击“1. 导出原图”。这一阶段只读取 Excel、下载新增或变化的照片并按学号保存，不会执行预检、换背景或裁切。
 5. 设置预检、换背景、Hivision 和裁切参数；需要调试阈值时可先打开“可视化处理工作台”。
 6. 点击“2. 处理图片”。这一阶段只读取 `原始图片` 和 `export_state.json`，不访问 Excel 中的图片链接；关闭软件或移走 Excel 后仍可重新调参处理。
-7. 两个阶段运行中都可点击“暂停”；已启动任务会安全收尾，点击“继续”后从当前进度接着执行。
+7. 两个阶段运行中都可点击“暂停”；已启动任务会安全收尾，点击“继续”后从当前进度接着执行。需要结束本批时点击“中断任务”，程序会保存已完成项和未完成恢复清单后停止。
+
+如果电脑断电、进程被任务管理器结束，或运行时确认强制关闭主程序，每完成一名学生后的状态都已经原子写入 `export_state.json`。下次使用相同 Excel/列设置继续导出，或使用相同处理参数继续处理时，程序会识别中断批次，只补做未完成学号。手动点击“中断任务”会生成 `cancelled` 状态；异常强制关闭会在下次启动同一阶段时识别为 `interrupted`。批次目录的 `run_status.json` 会标明 `running`、`cancelled`、`interrupted` 或 `completed`。
+
+## 批次网页筛选与批量操作
+
+- 新生成的批次网页可按学号/说明搜索，并按成功、失败、需重传、处理警告、新增、更新、修复或重新处理筛选。
+- 可以全选当前筛选结果、逐项勾选或清空选择；“导出选中信息 CSV”会下载仅含所选学生的明细，可直接用 Excel 打开。
+- “按已保存配置重新处理选中项”只处理勾选的学号，参数严格读取便携目录当前保存的 `StudentPhotoFlow.settings.json`，不会使用网页临时拼接参数。
+- 批量重处理需要主程序保持打开，并从主程序的“查看最新批次”打开网页。程序会临时启动一个仅绑定 `127.0.0.1`、带随机报告令牌的本地服务；它不会向局域网或互联网公开学生照片。直接双击 `index.html` 时仍可筛选和导出 CSV，但不能调用本机重处理。
 
 原图始终保持服务器返回的原始字节，不会因为开启换背景而被覆盖。处理结果单独保存在“处理后图片”目录。
 
@@ -56,12 +67,13 @@
 │     ├─ index.html          横向展示每一步的可视化合集
 │     ├─ manifest.csv        可用 Excel 打开的完整明细
 │     ├─ 需重传名单.csv      本批预检不合格名单（有不合格时生成）
+│     ├─ run_status.json      运行检查点与中断状态
 │     └─ batch.json          本批机器可读记录
 ├─ export_state.json         跨批次增量状态
 └─ 查看最新批次.html
 ```
 
-`export_state.json` 采用 UTF-8 JSON，保存每个学号的来源指纹、图片哈希、预检状态、退回原因、检测指标、处理引擎、输出文件和历次批次摘要。带签名的完整照片网址不会写入状态文件，只记录去掉签名后的地址。
+`export_state.json` 采用 UTF-8 JSON，保存每个学号的来源指纹、图片哈希、预检状态、退回原因、检测指标、处理引擎、输出文件、逐项恢复检查点和历次批次摘要。带签名的完整照片网址不会写入状态文件，只记录去掉签名后的地址。
 
 ## 分步骤预检与图片处理
 
@@ -71,7 +83,7 @@
 - YuNet 仅做离线人脸检测和五官定位，不做人脸身份识别，也不建立人脸库。
 - “可视化处理工作台”按顺序显示原图解码、方向、人脸、黑白、反光、翻拍和换背景结果；调整阈值后可立即整条重跑并另存图片与 JSON 参数记录。
 - “快速纯色背景替换”适合原背景较均匀的证件照，速度快且无需额外模型。头发边缘复杂或背景杂乱时，建议改用 AI 模式。
-- 默认的“AI 智能抠图换背景”使用便携包内置的 `rembg/u2netp`，无需联网。
+- 默认不换背景。需要时可选择“AI 智能抠图换背景”，它使用便携包内置的 `rembg/u2netp`，无需联网。
 - “Hivision API”仅是可选 HTTP 接入。Hivision 服务和模型不会打进便携包，只有用户主动选择该模式时才会访问填写的地址。
 - Hivision 页签和可视化工作台可调 API 地址、超时、宽高、DPI、抠图模型、人脸模型、标准/高清结果、人脸对齐、面部占比、面部中心高度、头顶留白、亮度、对比度、锐化和饱和度；这些值会写入批次 JSON 和增量处理指纹。
 - Hivision 参数页提供“测试 API”：只读取服务的 `openapi.json`，检查 `POST /idphoto` 和当前 16 个表单参数是否兼容，不会上传任何学生照片。
@@ -104,7 +116,7 @@ PhotoExporter.exe --cli --operation process --output "D:\照片导出" --quality
 PhotoExporter.exe --cli --operation process --output "D:\照片导出" --quality-check --crop --crop-width 295 --crop-height 413
 ```
 
-不指定 `--background-mode` 时默认使用 `ai`。选择可选 Hivision 服务时可使用：
+不指定 `--background-mode` 时默认使用 `none`（不换背景）。选择可选 Hivision 服务时可使用：
 
 ```powershell
 PhotoExporter.exe --cli --operation process --output "D:\照片导出" --background-mode hivision --hivision-url https://photo-api.example.com --hivision-matting-model hivision_modnet --hivision-face-model mtcnn --hivision-face-align --hivision-head-measure-ratio 0.20 --hivision-top-distance-max 0.12 --hivision-top-distance-min 0.10

@@ -17,6 +17,7 @@ release/
 
 # Runtime logs and local configuration
 *.log
+StudentPhotoFlow.settings.json
 .env
 .env.*
 

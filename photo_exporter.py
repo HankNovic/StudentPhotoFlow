@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import os
 import queue
+import secrets
 import sys
+import tempfile
 import threading
 import traceback
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+import urllib.parse
 
 from photo_pipeline import HIVISION_FACE_MODELS, HIVISION_MATTING_MODELS, PipelineOptions, test_hivision_api
 from xlsx_photo_core import (
@@ -40,11 +45,252 @@ COLOR_PRESETS = {
     "红色 #D9001B": "#D9001B",
 }
 
+SETTINGS_FILENAME = "StudentPhotoFlow.settings.json"
+SETTINGS_SCHEMA = 1
+
+
+def _startup_trace(stage: str) -> None:
+    trace_path = os.environ.get("STUDENT_PHOTO_FLOW_STARTUP_TRACE", "").strip()
+    if not trace_path:
+        return
+    try:
+        with Path(trace_path).open("a", encoding="utf-8") as stream:
+            stream.write(f"{datetime.now().isoformat(timespec='milliseconds')} {stage}\n")
+    except OSError:
+        pass
+
+
+def load_portable_settings(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"配置文件无法读取：{exc}") from exc
+    if not isinstance(payload, dict) or int(payload.get("schema_version", 0)) != SETTINGS_SCHEMA:
+        raise ValueError("配置文件版本不受支持")
+    settings = payload.get("settings", {})
+    if not isinstance(settings, dict):
+        raise ValueError("配置文件内容无效")
+    return settings
+
+
+def save_portable_settings(path: Path, settings: dict[str, Any]) -> None:
+    payload = {
+        "schema_version": SETTINGS_SCHEMA,
+        "app_version": APP_VERSION,
+        "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "settings": settings,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temp_name = tempfile.mkstemp(prefix=".settings_", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, path)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def pipeline_options_from_settings(settings: dict[str, Any]) -> PipelineOptions:
+    mode_value = str(settings.get("background_mode", "不处理"))
+    background_mode = BACKGROUND_MODES.get(mode_value, mode_value)
+    if background_mode not in set(BACKGROUND_MODES.values()):
+        background_mode = "none"
+    preset = str(settings.get("color_preset", "标准蓝 #438EDB"))
+    background_color = COLOR_PRESETS.get(preset, str(settings.get("custom_color", "#438EDB")))
+    return PipelineOptions(
+        quality_enabled=bool(settings.get("quality_enabled", False)),
+        auto_orient=bool(settings.get("auto_orient", True)),
+        check_grayscale=bool(settings.get("check_grayscale", True)),
+        check_face=bool(settings.get("check_face", True)),
+        check_glare=bool(settings.get("check_glare", True)),
+        check_recapture=bool(settings.get("check_recapture", True)),
+        stop_on_reject=bool(settings.get("stop_on_reject", True)),
+        grayscale_ratio_threshold=float(settings.get("grayscale_ratio_threshold", 0.85)),
+        grayscale_delta_limit=int(settings.get("grayscale_delta_limit", 10)),
+        face_confidence_threshold=float(settings.get("face_confidence_threshold", 0.75)),
+        orientation_min_confidence=float(settings.get("orientation_min_confidence", 0.85)),
+        orientation_confidence_margin=float(settings.get("orientation_confidence_margin", 0.08)),
+        glare_ratio_threshold=float(settings.get("glare_ratio_threshold", 0.08)),
+        glare_luma_threshold=int(settings.get("glare_luma_threshold", 245)),
+        recapture_score_threshold=float(settings.get("recapture_score_threshold", 0.72)),
+        background_mode=background_mode,
+        background_color=background_color,
+        hivision_url=str(settings.get("hivision_url", "http://127.0.0.1:8080")).strip(),
+        hivision_timeout=int(settings.get("hivision_timeout", 120)),
+        hivision_height=int(settings.get("hivision_height", 413)),
+        hivision_width=int(settings.get("hivision_width", 295)),
+        hivision_dpi=int(settings.get("hivision_dpi", 300)),
+        hivision_matting_model=str(settings.get("hivision_matting_model", HIVISION_MATTING_MODELS[0])).strip(),
+        hivision_face_model=str(settings.get("hivision_face_model", HIVISION_FACE_MODELS[0])).strip(),
+        hivision_hd=bool(settings.get("hivision_hd", False)),
+        hivision_face_align=bool(settings.get("hivision_face_align", False)),
+        hivision_head_measure_ratio=float(settings.get("hivision_head_measure_ratio", 0.20)),
+        hivision_head_height_ratio=float(settings.get("hivision_head_height_ratio", 0.45)),
+        hivision_top_distance_max=float(settings.get("hivision_top_distance_max", 0.12)),
+        hivision_top_distance_min=float(settings.get("hivision_top_distance_min", 0.10)),
+        hivision_brightness_strength=float(settings.get("hivision_brightness", 0.0)),
+        hivision_contrast_strength=float(settings.get("hivision_contrast", 0.0)),
+        hivision_sharpen_strength=float(settings.get("hivision_sharpen", 0.0)),
+        hivision_saturation_strength=float(settings.get("hivision_saturation", 0.0)),
+        crop_enabled=bool(settings.get("crop_enabled", False)),
+        crop_width=int(settings.get("crop_width", 295)),
+        crop_height=int(settings.get("crop_height", 413)),
+    )
+
 
 def application_directory() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
+
+class GalleryReportServer:
+    def __init__(self, on_reprocess: Callable[[Path, list[str]], tuple[bool, str]]):
+        self.on_reprocess = on_reprocess
+        self.server: ThreadingHTTPServer | None = None
+        self.thread: threading.Thread | None = None
+        self.reports: dict[str, dict[str, Any]] = {}
+        self.lock = threading.Lock()
+
+    def start(self) -> None:
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, _format: str, *_args: Any) -> None:
+                return
+
+            def send_json(self, status: int, payload: dict[str, Any]) -> None:
+                data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self) -> None:
+                parsed = urllib.parse.urlparse(self.path)
+                parts = [urllib.parse.unquote(part) for part in parsed.path.split("/") if part]
+                if len(parts) < 3 or parts[0] != "reports":
+                    self.send_error(404)
+                    return
+                token = parts[1]
+                with owner.lock:
+                    entry = owner.reports.get(token)
+                if entry is None:
+                    self.send_error(404)
+                    return
+                base = Path(entry["report_path"]).parent.resolve()
+                relative = Path(*parts[2:])
+                candidate = (base / relative).resolve()
+                if candidate != base and base not in candidate.parents:
+                    self.send_error(403)
+                    return
+                if not candidate.is_file():
+                    self.send_error(404)
+                    return
+                try:
+                    if candidate.suffix.lower() in {".html", ".htm"}:
+                        data = candidate.read_text(encoding="utf-8").replace(
+                            "__STUDENT_PHOTO_FLOW_REPORT_TOKEN__", token,
+                        ).encode("utf-8")
+                    else:
+                        data = candidate.read_bytes()
+                except OSError:
+                    self.send_error(500)
+                    return
+                content_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_POST(self) -> None:
+                if urllib.parse.urlparse(self.path).path != "/api/reprocess":
+                    self.send_error(404)
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    length = 0
+                if length < 2 or length > 1024 * 1024:
+                    self.send_json(400, {"message": "请求内容大小无效"})
+                    return
+                try:
+                    payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    token = str(payload.get("report_token", ""))
+                    student_ids = list(dict.fromkeys(
+                        str(value).strip() for value in payload.get("student_ids", []) if str(value).strip()
+                    ))
+                except (UnicodeDecodeError, json.JSONDecodeError, TypeError, AttributeError):
+                    self.send_json(400, {"message": "请求格式无效"})
+                    return
+                with owner.lock:
+                    entry = owner.reports.get(token)
+                if entry is None:
+                    self.send_json(403, {"message": "报告令牌无效，请从主程序重新打开报告"})
+                    return
+                if not student_ids or len(student_ids) > 5000:
+                    self.send_json(400, {"message": "请选择 1–5000 名学生"})
+                    return
+                allowed_ids = entry["student_ids"]
+                if any(student_id not in allowed_ids for student_id in student_ids):
+                    self.send_json(400, {"message": "选中内容与当前报告不匹配"})
+                    return
+                accepted, message = owner.on_reprocess(Path(entry["output_root"]), student_ids)
+                self.send_json(202 if accepted else 409, {"message": message})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, name="gallery-report-server", daemon=True)
+        self.thread.start()
+
+    def register(self, report_path: Path) -> str:
+        if self.server is None:
+            self.start()
+        report_path = report_path.resolve()
+        batch_payload_path = report_path.parent / "batch.json"
+        try:
+            batch_payload = json.loads(batch_payload_path.read_text(encoding="utf-8"))
+            student_ids = {
+                str(item.get("student_id", "")).strip()
+                for item in batch_payload.get("results", [])
+                if str(item.get("student_id", "")).strip()
+            }
+        except (OSError, json.JSONDecodeError, TypeError, AttributeError) as exc:
+            raise RuntimeError(f"批次报告数据无法读取：{exc}") from exc
+        token = secrets.token_urlsafe(24)
+        output_root = report_path.parent.parent.parent.resolve()
+        with self.lock:
+            self.reports[token] = {
+                "report_path": report_path,
+                "output_root": output_root,
+                "student_ids": student_ids,
+            }
+            if len(self.reports) > 20:
+                oldest = next(iter(self.reports))
+                self.reports.pop(oldest, None)
+        port = self.server.server_address[1]
+        return f"http://127.0.0.1:{port}/reports/{token}/{urllib.parse.quote(report_path.name)}"
+
+    def close(self) -> None:
+        if self.server is None:
+            return
+        self.server.shutdown()
+        self.server.server_close()
+        self.server = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -65,8 +311,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--background-mode",
         choices=["none", "quick", "ai", "hivision"],
-        default="ai",
-        help="背景处理：none/quick/ai/hivision，默认 ai",
+        default="none",
+        help="背景处理：none/quick/ai/hivision，默认 none",
     )
     parser.add_argument("--background-color", default="#438EDB", help="背景色，例如 #438EDB")
     parser.add_argument("--crop", action="store_true", help="启用最终成片裁切")
@@ -197,11 +443,13 @@ def _cli_main(args: argparse.Namespace) -> int:
 
 class PhotoExporterApp:
     def __init__(self, initial_xlsx: str | None = None):
+        _startup_trace("app_init_enter")
         try:
             import tkinter as tk
             from tkinter import colorchooser, filedialog, messagebox, ttk
         except ImportError as exc:
             raise RuntimeError("当前 Python 没有 Tkinter，请安装带 Tcl/Tk 的 Windows Python") from exc
+        _startup_trace("tkinter_imported")
 
         self.tk = tk
         self.ttk = ttk
@@ -209,6 +457,7 @@ class PhotoExporterApp:
         self.messagebox = messagebox
         self.colorchooser = colorchooser
         self.root = tk.Tk()
+        _startup_trace("tk_root_created")
         self.root.title(f"StudentPhotoFlow｜学生照片导出与处理工具 {APP_VERSION}")
         self.root.geometry("1220x820")
         self.root.minsize(980, 690)
@@ -240,7 +489,7 @@ class PhotoExporterApp:
         self.glare_threshold_var = tk.DoubleVar(value=0.08)
         self.glare_luma_var = tk.IntVar(value=245)
         self.recapture_threshold_var = tk.DoubleVar(value=0.72)
-        self.background_mode_var = tk.StringVar(value="AI 智能抠图换背景")
+        self.background_mode_var = tk.StringVar(value="不处理")
         self.color_preset_var = tk.StringVar(value="标准蓝 #438EDB")
         self.custom_color_var = tk.StringVar(value="#438EDB")
         self.hivision_url_var = tk.StringVar(value="http://127.0.0.1:8080")
@@ -272,13 +521,181 @@ class PhotoExporterApp:
         self.progress_text_var = tk.StringVar(value="就绪")
         self.export_run_event = threading.Event()
         self.export_run_event.set()
+        self.cancel_event = threading.Event()
         self.export_paused = False
         self.current_operation = ""
+        self.settings_path = script_dir / SETTINGS_FILENAME
+        self.settings_save_job: str | None = None
+        self.settings_load_warning = ""
+        self.web_action_pending = False
+        self.web_action_lock = threading.Lock()
+        self.gallery_server = GalleryReportServer(self._queue_web_reprocess)
+        _startup_trace("variables_created")
 
+        self._load_saved_settings()
+        _startup_trace("settings_loaded")
         self._build_ui()
+        _startup_trace("ui_built")
+        self._register_settings_autosave()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(120, self._poll_events)
+        if self.settings_load_warning:
+            self._append_log(self.settings_load_warning)
         if initial_xlsx:
             self.root.after(250, self.inspect_async)
+        _startup_trace("app_init_complete")
+
+    def _settings_bindings(self) -> dict[str, Any]:
+        return {
+            "output_dir": self.output_var,
+            "sheet_name": self.sheet_var,
+            "header_row": self.header_row_var,
+            "id_column": self.id_col_var,
+            "image_column": self.image_col_var,
+            "quality_enabled": self.quality_var,
+            "auto_orient": self.auto_orient_var,
+            "check_grayscale": self.grayscale_var,
+            "check_face": self.face_var,
+            "check_glare": self.glare_var,
+            "check_recapture": self.recapture_var,
+            "stop_on_reject": self.stop_on_reject_var,
+            "grayscale_ratio_threshold": self.grayscale_threshold_var,
+            "grayscale_delta_limit": self.grayscale_delta_var,
+            "face_confidence_threshold": self.face_confidence_var,
+            "orientation_min_confidence": self.orientation_min_confidence_var,
+            "orientation_confidence_margin": self.orientation_confidence_margin_var,
+            "glare_ratio_threshold": self.glare_threshold_var,
+            "glare_luma_threshold": self.glare_luma_var,
+            "recapture_score_threshold": self.recapture_threshold_var,
+            "background_mode": self.background_mode_var,
+            "color_preset": self.color_preset_var,
+            "custom_color": self.custom_color_var,
+            "hivision_url": self.hivision_url_var,
+            "hivision_timeout": self.hivision_timeout_var,
+            "hivision_height": self.hivision_height_var,
+            "hivision_width": self.hivision_width_var,
+            "hivision_dpi": self.hivision_dpi_var,
+            "hivision_matting_model": self.hivision_matting_model_var,
+            "hivision_face_model": self.hivision_face_model_var,
+            "hivision_hd": self.hivision_hd_var,
+            "hivision_face_align": self.hivision_face_align_var,
+            "hivision_head_measure_ratio": self.hivision_head_measure_ratio_var,
+            "hivision_head_height_ratio": self.hivision_head_height_ratio_var,
+            "hivision_top_distance_max": self.hivision_top_distance_max_var,
+            "hivision_top_distance_min": self.hivision_top_distance_min_var,
+            "hivision_brightness": self.hivision_brightness_var,
+            "hivision_contrast": self.hivision_contrast_var,
+            "hivision_sharpen": self.hivision_sharpen_var,
+            "hivision_saturation": self.hivision_saturation_var,
+            "crop_enabled": self.crop_enabled_var,
+            "crop_width": self.crop_width_var,
+            "crop_height": self.crop_height_var,
+            "workers": self.workers_var,
+            "open_gallery": self.open_gallery_var,
+        }
+
+    def _load_saved_settings(self) -> None:
+        try:
+            settings = load_portable_settings(self.settings_path)
+            self._apply_settings(settings)
+        except Exception as exc:
+            self.settings_load_warning = f"配置未载入，已使用安全默认值：{exc}"
+
+    def _apply_settings(self, settings: dict[str, Any]) -> None:
+        clean = dict(settings)
+        if clean.get("background_mode") not in BACKGROUND_MODES:
+            clean.pop("background_mode", None)
+        if clean.get("color_preset") not in {*COLOR_PRESETS, ""}:
+            clean.pop("color_preset", None)
+        for key, variable in self._settings_bindings().items():
+            if key in clean:
+                variable.set(clean[key])
+
+    def _collect_settings(self) -> dict[str, Any]:
+        return {key: variable.get() for key, variable in self._settings_bindings().items()}
+
+    def _save_settings(self, show_message: bool = False) -> bool:
+        try:
+            save_portable_settings(self.settings_path, self._collect_settings())
+        except Exception as exc:
+            if show_message:
+                self.messagebox.showerror("保存配置失败", str(exc))
+            return False
+        if show_message:
+            self._append_log(f"配置已保存：{self.settings_path.name}")
+            self.messagebox.showinfo("配置已保存", "当前处理参数会在下次启动时自动恢复。")
+        return True
+
+    def save_settings_now(self) -> None:
+        self._save_settings(show_message=True)
+
+    def export_settings_file(self) -> None:
+        path = self.filedialog.asksaveasfilename(
+            title="导出 StudentPhotoFlow 配置",
+            defaultextension=".json",
+            initialfile="StudentPhotoFlow配置.json",
+            filetypes=[("StudentPhotoFlow 配置", "*.json"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            save_portable_settings(Path(path), self._collect_settings())
+        except Exception as exc:
+            self.messagebox.showerror("导出配置失败", str(exc))
+            return
+        self._append_log(f"配置已导出：{path}")
+        self.messagebox.showinfo("配置已导出", f"当前脚本配置已导出到：\n{path}")
+
+    def import_settings_file(self) -> None:
+        path = self.filedialog.askopenfilename(
+            title="导入 StudentPhotoFlow 配置",
+            filetypes=[("StudentPhotoFlow 配置", "*.json"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            settings = load_portable_settings(Path(path))
+            self._apply_settings(settings)
+            save_portable_settings(self.settings_path, self._collect_settings())
+        except Exception as exc:
+            self.messagebox.showerror("导入配置失败", str(exc))
+            return
+        self._append_log(f"配置已导入并保存：{path}")
+        self.messagebox.showinfo("配置已导入", "配置已经应用，并保存为便携版当前配置。")
+
+    def _schedule_settings_save(self, *_args: Any) -> None:
+        if self.settings_save_job is not None:
+            try:
+                self.root.after_cancel(self.settings_save_job)
+            except Exception:
+                pass
+        self.settings_save_job = self.root.after(700, self._autosave_settings)
+
+    def _autosave_settings(self) -> None:
+        self.settings_save_job = None
+        self._save_settings(show_message=False)
+
+    def _register_settings_autosave(self) -> None:
+        for variable in self._settings_bindings().values():
+            variable.trace_add("write", self._schedule_settings_save)
+
+    def _on_close(self) -> None:
+        if self.busy:
+            confirmed = self.messagebox.askyesno(
+                "中断当前任务？",
+                "当前批次仍在运行。每名已完成学生都已写入恢复检查点；强制关闭后，"
+                "下次点击同一阶段会跳过已完成项并继续。\n\n确定立即关闭吗？",
+                icon="warning",
+            )
+            if not confirmed:
+                return
+            self._save_settings(show_message=False)
+            self.gallery_server.close()
+            self.root.destroy()
+            os._exit(0)
+        self._save_settings(show_message=False)
+        self.gallery_server.close()
+        self.root.destroy()
 
     def _build_ui(self) -> None:
         tk, ttk = self.tk, self.ttk
@@ -317,7 +734,7 @@ class PhotoExporterApp:
 
         ttk.Label(
             settings,
-            text="流程已分离：第一步从 Excel 增量导出原图；第二步只读取输出目录中的原图进行处理。",
+            text="流程已分离：第一步导出原图；第二步处理已导出原图。每名完成后自动写入中断恢复检查点。",
             foreground="#475467",
         ).grid(row=4, column=0, columnspan=6, sticky="w", pady=(8, 2))
 
@@ -373,6 +790,12 @@ class PhotoExporterApp:
         ttk.Checkbutton(advanced, text="强制重新处理全部原图", variable=self.force_process_var).pack(side="left", padx=(0, 18))
         ttk.Checkbutton(advanced, text="完成后打开本次合集", variable=self.open_gallery_var).pack(side="left")
 
+        config_actions = ttk.Frame(settings)
+        config_actions.grid(row=7, column=0, columnspan=6, sticky="e", pady=(5, 0))
+        ttk.Button(config_actions, text="保存当前配置", command=self.save_settings_now).pack(side="left")
+        ttk.Button(config_actions, text="导出配置…", command=self.export_settings_file).pack(side="left", padx=(8, 0))
+        ttk.Button(config_actions, text="导入配置…", command=self.import_settings_file).pack(side="left", padx=(8, 0))
+
         content = ttk.Panedwindow(self.root, orient="vertical")
         content.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 8))
 
@@ -421,10 +844,12 @@ class PhotoExporterApp:
         ttk.Button(footer, text="查看最新批次", command=self.open_latest).grid(row=0, column=3, padx=(8, 0))
         self.pause_button = ttk.Button(footer, text="暂停", command=self.toggle_export_pause, state="disabled")
         self.pause_button.grid(row=0, column=4, padx=(12, 0))
+        self.cancel_button = ttk.Button(footer, text="中断任务", command=self.cancel_current_task, state="disabled")
+        self.cancel_button.grid(row=0, column=5, padx=(8, 0))
         self.export_button = ttk.Button(footer, text="1. 导出原图", command=self.export_async)
-        self.export_button.grid(row=0, column=5, padx=(8, 0))
+        self.export_button.grid(row=0, column=6, padx=(8, 0))
         self.process_button = ttk.Button(footer, text="2. 处理图片", command=self.process_async)
-        self.process_button.grid(row=0, column=6, padx=(8, 0))
+        self.process_button.grid(row=0, column=7, padx=(8, 0))
 
     def choose_xlsx(self) -> None:
         path = self.filedialog.askopenfilename(
@@ -451,47 +876,7 @@ class PhotoExporterApp:
         return COLOR_PRESETS.get(self.color_preset_var.get(), self.custom_color_var.get())
 
     def _pipeline_options_from_ui(self):
-        from photo_pipeline import PipelineOptions
-
-        return PipelineOptions(
-            quality_enabled=bool(self.quality_var.get()),
-            auto_orient=bool(self.auto_orient_var.get()),
-            check_grayscale=bool(self.grayscale_var.get()),
-            check_face=bool(self.face_var.get()),
-            check_glare=bool(self.glare_var.get()),
-            check_recapture=bool(self.recapture_var.get()),
-            grayscale_ratio_threshold=float(self.grayscale_threshold_var.get()),
-            grayscale_delta_limit=int(self.grayscale_delta_var.get()),
-            face_confidence_threshold=float(self.face_confidence_var.get()),
-            orientation_min_confidence=float(self.orientation_min_confidence_var.get()),
-            orientation_confidence_margin=float(self.orientation_confidence_margin_var.get()),
-            glare_ratio_threshold=float(self.glare_threshold_var.get()),
-            glare_luma_threshold=int(self.glare_luma_var.get()),
-            recapture_score_threshold=float(self.recapture_threshold_var.get()),
-            stop_on_reject=bool(self.stop_on_reject_var.get()),
-            background_mode=BACKGROUND_MODES[self.background_mode_var.get()],
-            background_color=self._selected_color(),
-            hivision_url=self.hivision_url_var.get().strip(),
-            hivision_timeout=int(self.hivision_timeout_var.get()),
-            hivision_height=int(self.hivision_height_var.get()),
-            hivision_width=int(self.hivision_width_var.get()),
-            hivision_dpi=int(self.hivision_dpi_var.get()),
-            hivision_matting_model=self.hivision_matting_model_var.get().strip(),
-            hivision_face_model=self.hivision_face_model_var.get().strip(),
-            hivision_hd=bool(self.hivision_hd_var.get()),
-            hivision_face_align=bool(self.hivision_face_align_var.get()),
-            hivision_head_measure_ratio=float(self.hivision_head_measure_ratio_var.get()),
-            hivision_head_height_ratio=float(self.hivision_head_height_ratio_var.get()),
-            hivision_top_distance_max=float(self.hivision_top_distance_max_var.get()),
-            hivision_top_distance_min=float(self.hivision_top_distance_min_var.get()),
-            hivision_brightness_strength=float(self.hivision_brightness_var.get()),
-            hivision_contrast_strength=float(self.hivision_contrast_var.get()),
-            hivision_sharpen_strength=float(self.hivision_sharpen_var.get()),
-            hivision_saturation_strength=float(self.hivision_saturation_var.get()),
-            crop_enabled=bool(self.crop_enabled_var.get()),
-            crop_width=int(self.crop_width_var.get()),
-            crop_height=int(self.crop_height_var.get()),
-        )
+        return pipeline_options_from_settings(self._collect_settings())
 
     def open_quality_settings(self) -> None:
         ttk = self.ttk
@@ -733,9 +1118,12 @@ class PhotoExporterApp:
         self.inspect_button.configure(state=state)
         self.export_button.configure(state=state)
         self.process_button.configure(state=state)
+        can_interrupt = busy and self.current_operation in {"export", "process"}
+        self.cancel_button.configure(state="normal" if can_interrupt else "disabled")
         if not busy:
             self.export_paused = False
             self.export_run_event.set()
+            self.cancel_event.clear()
             self.pause_button.configure(text="暂停", state="disabled")
         if text:
             self.progress_text_var.set(text)
@@ -755,6 +1143,25 @@ class PhotoExporterApp:
             self.pause_button.configure(text="继续")
             self.progress_text_var.set("已暂停；正在处理的任务会安全收尾")
             self._append_log("已暂停：不再启动新任务；正在执行的任务会安全完成。")
+
+    def cancel_current_task(self) -> None:
+        if not self.busy or self.current_operation not in {"export", "process"}:
+            return
+        confirmed = self.messagebox.askyesno(
+            "中断当前任务？",
+            "将停止启动新的学生任务；当前正在执行的少量任务会安全收尾。\n\n"
+            "已完成项会保留，未完成项写入恢复清单，下次用同样配置运行会继续。",
+            icon="warning",
+        )
+        if not confirmed:
+            return
+        self.cancel_event.set()
+        self.export_run_event.set()
+        self.export_paused = False
+        self.pause_button.configure(text="暂停", state="disabled")
+        self.cancel_button.configure(state="disabled")
+        self.progress_text_var.set("正在安全中断；等待已启动任务收尾…")
+        self._append_log("已请求中断：正在保存已完成结果和未完成恢复清单。")
 
     def _append_log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -778,6 +1185,7 @@ class PhotoExporterApp:
         selected_sheet = self.sheet_var.get().strip()
         selected_id = self.id_col_var.get().strip()
         selected_image = self.image_col_var.get().strip()
+        self.current_operation = "inspect"
         self._set_busy(True, "正在检查表格…")
         self.progress.configure(value=0)
         self._append_log(f"检查工作簿：{path}")
@@ -885,6 +1293,7 @@ class PhotoExporterApp:
             return
 
         self.current_operation = "export"
+        self.cancel_event.clear()
         self._set_busy(True, "准备导出原图…")
         self.export_paused = False
         self.export_run_event.set()
@@ -897,7 +1306,7 @@ class PhotoExporterApp:
 
         def worker() -> None:
             try:
-                result = run_export(options, progress, self.export_run_event)
+                result = run_export(options, progress, self.export_run_event, self.cancel_event)
                 self.events.put(("export_done", result))
             except Exception as exc:
                 self.events.put(("error", ("导出失败", str(exc))))
@@ -922,6 +1331,7 @@ class PhotoExporterApp:
             return
 
         self.current_operation = "process"
+        self.cancel_event.clear()
         self._set_busy(True, "准备处理已导出原图…")
         self.export_paused = False
         self.export_run_event.set()
@@ -934,16 +1344,86 @@ class PhotoExporterApp:
 
         def worker() -> None:
             try:
-                result = run_processing(options, progress, self.export_run_event)
+                result = run_processing(options, progress, self.export_run_event, self.cancel_event)
                 self.events.put(("export_done", result))
             except Exception as exc:
                 self.events.put(("error", ("图片处理失败", str(exc))))
 
         threading.Thread(target=worker, name="run-processing", daemon=True).start()
 
+    def _queue_web_reprocess(self, output_root: Path, student_ids: list[str]) -> tuple[bool, str]:
+        with self.web_action_lock:
+            if self.busy or self.web_action_pending:
+                return False, "主程序当前有任务，请完成或中断后再提交"
+            self.web_action_pending = True
+        self.events.put(("web_reprocess", (output_root, student_ids)))
+        return True, f"已提交 {len(student_ids)} 名学生；请回到主程序查看进度"
+
+    def _start_selected_processing(self, payload: Any) -> None:
+        output_root, student_ids = payload
+        with self.web_action_lock:
+            self.web_action_pending = False
+        if self.busy:
+            self._append_log("网页批量重处理未启动：主程序已有任务。")
+            return
+        try:
+            settings = load_portable_settings(self.settings_path)
+            pipeline = pipeline_options_from_settings(settings)
+            if not (pipeline.quality_enabled or pipeline.background_mode != "none" or pipeline.crop_enabled):
+                raise ValueError("当前保存配置未启用预检、换背景或最终裁切，无法重新处理")
+            options = ProcessingOptions(
+                output_dir=Path(output_root),
+                pipeline=pipeline,
+                workers=max(1, min(16, int(settings.get("workers", 6)))),
+                force_process=True,
+                save_intermediate_steps=True,
+                selected_student_ids=list(student_ids),
+            )
+        except (OSError, TypeError, ValueError, KeyError) as exc:
+            self._append_log(f"网页批量重处理未启动：{exc}")
+            self.messagebox.showerror("无法批量重处理", str(exc))
+            return
+
+        self.current_operation = "process"
+        self.cancel_event.clear()
+        self._set_busy(True, f"准备重新处理选中的 {len(student_ids)} 名学生…")
+        self.export_paused = False
+        self.export_run_event.set()
+        self.pause_button.configure(text="暂停", state="normal")
+        self.progress.configure(value=0)
+        self._append_log(
+            f"网页批量操作：按 {self.settings_path.name} 的已保存配置重新处理 {len(student_ids)} 名学生"
+        )
+
+        def progress(done: int, total: int, message: str) -> None:
+            self.events.put(("progress", (done, total, message)))
+
+        def worker() -> None:
+            try:
+                result = run_processing(options, progress, self.export_run_event, self.cancel_event)
+                self.events.put(("export_done", result))
+            except Exception as exc:
+                self.events.put(("error", ("批量重新处理失败", str(exc))))
+
+        threading.Thread(target=worker, name="run-selected-processing", daemon=True).start()
+
+    def _open_gallery_path(self, path: Path) -> None:
+        try:
+            url = self.gallery_server.register(path)
+            os.startfile(url)  # type: ignore[attr-defined]
+        except (OSError, RuntimeError) as exc:
+            self._append_log(f"本地批量操作服务不可用，已用只读方式打开报告：{exc}")
+            os.startfile(path)  # type: ignore[attr-defined]
+
     def _show_export_done(self, result: Any) -> None:
         summary = result.summary
-        if getattr(result, "operation", "export") == "process":
+        if getattr(result, "cancelled", False):
+            title = "任务已安全中断"
+            message = (
+                f"批次 {result.batch_id} 已中断：已完成 {len([item for item in result.results if item.executed])}，"
+                f"待继续 {summary.get('pending', 0)}。已完成结果和恢复清单均已保存。"
+            )
+        elif getattr(result, "operation", "export") == "process":
             title = "图片处理完成"
             message = (
                 f"处理批次 {result.batch_id} 完成：本次处理 {summary['reprocessed']}，"
@@ -956,14 +1436,15 @@ class PhotoExporterApp:
                 f"导出批次 {result.batch_id} 完成：新增 {summary['new']}，更新 {summary['updated']}，"
                 f"修复 {summary['repair']}，未变化 {summary['unchanged']}，失败 {summary['failed']}。"
             )
-        self.progress.configure(value=100)
+        if not getattr(result, "cancelled", False):
+            self.progress.configure(value=100)
         self._set_busy(False, title)
         self._append_log(message)
         if summary.get("processing_warnings"):
             self._append_log(f"其中 {summary['processing_warnings']} 条有图片处理警告，请查看本次合集。")
         if self.open_gallery_var.get():
             try:
-                os.startfile(result.gallery_path)  # type: ignore[attr-defined]
+                self._open_gallery_path(result.gallery_path)
             except OSError as exc:
                 self._append_log(f"无法自动打开合集：{exc}")
         self.messagebox.showinfo(title, message)
@@ -978,13 +1459,17 @@ class PhotoExporterApp:
                     done, total, message = payload
                     percent = 100 if total == 0 else min(100, done * 100 / total)
                     self.progress.configure(value=percent)
-                    if self.export_paused:
+                    if self.cancel_event.is_set():
+                        self.progress_text_var.set(f"正在安全中断｜{done}/{total} 已完成")
+                    elif self.export_paused:
                         self.progress_text_var.set(f"已暂停｜{done}/{total} 已启动任务收尾中")
                     else:
                         self.progress_text_var.set(f"{done}/{total} {message}")
                     self._append_log(message)
                 elif event == "export_done":
                     self._show_export_done(payload)
+                elif event == "web_reprocess":
+                    self._start_selected_processing(payload)
                 elif event == "api_test_done":
                     self.hivision_test_status_var.set(payload["message"])
                     try:
@@ -1030,12 +1515,14 @@ class PhotoExporterApp:
             self.messagebox.showerror("无法打开目录", str(exc))
 
     def open_latest(self) -> None:
-        path = Path(self.output_var.get()) / "查看最新批次.html"
-        if not path.is_file():
+        batch_root = Path(self.output_var.get()) / "批次记录"
+        candidates = list(batch_root.glob("*/index.html")) if batch_root.is_dir() else []
+        if not candidates:
             self.messagebox.showwarning("没有批次", "尚未生成批次结果。")
             return
+        path = max(candidates, key=lambda item: item.parent.name)
         try:
-            os.startfile(path)  # type: ignore[attr-defined]
+            self._open_gallery_path(path)
         except OSError as exc:
             self.messagebox.showerror("无法打开合集", str(exc))
 
@@ -1044,11 +1531,13 @@ class PhotoExporterApp:
 
 
 def main() -> int:
+    _startup_trace("main_enter")
     parser = build_parser()
     args = parser.parse_args()
     if args.cli or args.inspect:
         return _cli_main(args)
     app = PhotoExporterApp(args.xlsx)
+    _startup_trace("mainloop_enter")
     app.run()
     return 0
 

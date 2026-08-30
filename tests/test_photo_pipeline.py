@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,13 +27,21 @@ from photo_pipeline import (  # noqa: E402
     save_pipeline_stages,
     test_hivision_api,
 )
+from photo_exporter import (  # noqa: E402
+    GalleryReportServer,
+    load_portable_settings,
+    pipeline_options_from_settings,
+    save_portable_settings,
+)
 from xlsx_photo_core import (  # noqa: E402
     ExportOptions,
+    JobResult,
     ProcessingOptions,
     SelectedRow,
     SourceRef,
     _execute_job,
     _execute_job_after_resume,
+    _write_gallery,
     run_processing,
 )
 
@@ -45,6 +54,44 @@ def encoded_image(color: tuple[int, int, int]) -> bytes:
 
 
 class PhotoPipelineTests(unittest.TestCase):
+    def test_portable_settings_round_trip(self) -> None:
+        settings = {
+            "background_mode": "不处理",
+            "quality_enabled": True,
+            "crop_width": 295,
+            "hivision_url": "https://photo-api.example.com",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "StudentPhotoFlow.settings.json"
+            save_portable_settings(path, settings)
+            self.assertEqual(load_portable_settings(path), settings)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema_version"], 1)
+
+    def test_default_pipeline_does_not_replace_background(self) -> None:
+        self.assertEqual(PipelineOptions().background_mode, "none")
+
+    def test_saved_settings_build_the_same_processing_pipeline(self) -> None:
+        pipeline = pipeline_options_from_settings({
+            "quality_enabled": True,
+            "background_mode": "Hivision API（可选）",
+            "color_preset": "白色 #FFFFFF",
+            "hivision_timeout": 45,
+            "crop_enabled": True,
+            "crop_width": 295,
+            "crop_height": 413,
+        })
+        self.assertTrue(pipeline.quality_enabled)
+        self.assertEqual(pipeline.background_mode, "hivision")
+        self.assertEqual(pipeline.background_color, "#FFFFFF")
+        self.assertEqual(pipeline.hivision_timeout, 45)
+        self.assertTrue(pipeline.crop_enabled)
+
+    def test_portable_launcher_does_not_wait_for_gui_exit(self) -> None:
+        launcher = (PROJECT_ROOT / "启动工具.bat").read_text(encoding="utf-8")
+        self.assertIn('start "" "%APP_EXE%" %*', launcher)
+        self.assertNotIn("/wait", launcher.lower())
+
     def test_hivision_api_check_reads_openapi_without_uploading_photo(self) -> None:
         fields = {
             name: {"type": "string"}
@@ -175,6 +222,272 @@ class PhotoPipelineTests(unittest.TestCase):
                 self.assertEqual(output.size, (295, 413))
             batch = json.loads((result.batch_dir / "batch.json").read_text(encoding="utf-8"))
             self.assertEqual(batch["operation"], "process")
+
+    def test_processing_resumes_only_unfinished_students_after_forced_interruption(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            original_dir = root / "原始图片"
+            original_dir.mkdir(parents=True)
+            records: dict[str, object] = {}
+            for index, student_id in enumerate(("2600000101", "2600000102"), start=2):
+                original = original_dir / f"{student_id}.jpg"
+                original.write_bytes(encoded_image((70, 125, 210)))
+                records[student_id] = {
+                    "student_id": student_id,
+                    "row": index,
+                    "source_fingerprint": f"source-{index}",
+                    "source_display": "test",
+                    "original_file": f"原始图片/{student_id}.jpg",
+                    "original_sha256": "old",
+                    "processing": {"status": "pending"},
+                }
+            state = {
+                "schema_version": 3,
+                "app_version": "1.6.0",
+                "records": records,
+                "batches": [],
+            }
+            state_path = root / "export_state.json"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            options = ProcessingOptions(
+                output_dir=root,
+                pipeline=PipelineOptions(
+                    quality_enabled=True,
+                    auto_orient=False,
+                    check_grayscale=False,
+                    check_face=False,
+                    check_glare=False,
+                    check_recapture=False,
+                    background_mode="none",
+                ),
+                workers=1,
+            )
+
+            first_calls: list[str] = []
+
+            def interrupted(_event, row, existing, _options, _batch_id, _cancel_event):
+                first_calls.append(row.student_id)
+                if row.student_id == "2600000102":
+                    raise KeyboardInterrupt("simulated forced close")
+                return JobResult(
+                    student_id=row.student_id,
+                    row_number=row.row_number,
+                    change="reprocessed",
+                    status="success",
+                    original_file=existing["original_file"],
+                    processing_status="success",
+                    quality_status="success",
+                )
+
+            with patch("xlsx_photo_core._execute_processing_job_after_resume", side_effect=interrupted):
+                with self.assertRaises(KeyboardInterrupt):
+                    run_processing(options)
+
+            interrupted_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(interrupted_state["active_run"]["status"], "running")
+            self.assertEqual(interrupted_state["active_run"]["completed_ids"], ["2600000101"])
+            self.assertEqual(
+                interrupted_state["records"]["2600000101"]["processing"]["status"],
+                "success",
+            )
+
+            second_calls: list[str] = []
+
+            def resumed(_event, row, existing, _options, _batch_id, _cancel_event):
+                second_calls.append(row.student_id)
+                return JobResult(
+                    student_id=row.student_id,
+                    row_number=row.row_number,
+                    change="reprocessed",
+                    status="success",
+                    original_file=existing["original_file"],
+                    processing_status="success",
+                    quality_status="success",
+                )
+
+            with patch("xlsx_photo_core._execute_processing_job_after_resume", side_effect=resumed):
+                result = run_processing(options)
+
+            self.assertEqual(first_calls, ["2600000101", "2600000102"])
+            self.assertEqual(second_calls, ["2600000102"])
+            self.assertEqual(result.summary["reprocessed"], 1)
+            self.assertEqual(result.summary["unchanged"], 1)
+            final_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("active_run", final_state)
+            self.assertEqual(final_state["interrupted_runs"][-1]["pending_count"], 1)
+
+    def test_manual_cancellation_keeps_pending_students_for_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            original_dir = root / "原始图片"
+            original_dir.mkdir(parents=True)
+            records: dict[str, object] = {}
+            for row_number, student_id in enumerate(("2600000201", "2600000202"), start=2):
+                (original_dir / f"{student_id}.jpg").write_bytes(encoded_image((70, 125, 210)))
+                records[student_id] = {
+                    "student_id": student_id,
+                    "row": row_number,
+                    "source_fingerprint": student_id,
+                    "source_display": "test",
+                    "original_file": f"原始图片/{student_id}.jpg",
+                    "original_sha256": "old",
+                    "processing": {"status": "pending"},
+                }
+            state_path = root / "export_state.json"
+            state_path.write_text(json.dumps({
+                "schema_version": 3,
+                "app_version": "1.7.0",
+                "records": records,
+                "batches": [],
+            }), encoding="utf-8")
+            options = ProcessingOptions(
+                output_dir=root,
+                pipeline=PipelineOptions(
+                    quality_enabled=True,
+                    auto_orient=False,
+                    check_grayscale=False,
+                    check_face=False,
+                    check_glare=False,
+                    check_recapture=False,
+                    background_mode="none",
+                ),
+                workers=1,
+            )
+            cancel_event = threading.Event()
+            cancel_event.set()
+            result = run_processing(options, cancel_event=cancel_event)
+
+            self.assertTrue(result.cancelled)
+            self.assertTrue(result.summary["cancelled"])
+            self.assertEqual(result.summary["pending"], 2)
+            final_state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("active_run", final_state)
+            self.assertEqual(final_state["resume_runs"]["process"]["status"], "cancelled")
+            self.assertEqual(final_state["resume_runs"]["process"]["pending_count"], 2)
+            run_status = json.loads((result.batch_dir / "run_status.json").read_text(encoding="utf-8"))
+            self.assertEqual(run_status["status"], "cancelled")
+
+    def test_selected_processing_only_runs_requested_student_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            original_dir = root / "原始图片"
+            original_dir.mkdir(parents=True)
+            records: dict[str, object] = {}
+            for row_number, student_id in enumerate(("2600000301", "2600000302"), start=2):
+                (original_dir / f"{student_id}.jpg").write_bytes(encoded_image((70, 125, 210)))
+                records[student_id] = {
+                    "student_id": student_id,
+                    "row": row_number,
+                    "source_fingerprint": student_id,
+                    "source_display": "test",
+                    "original_file": f"原始图片/{student_id}.jpg",
+                    "original_sha256": "old",
+                    "processing": {"status": "pending"},
+                }
+            (root / "export_state.json").write_text(json.dumps({
+                "schema_version": 3,
+                "app_version": "1.7.0",
+                "records": records,
+                "batches": [],
+            }), encoding="utf-8")
+            options = ProcessingOptions(
+                output_dir=root,
+                pipeline=PipelineOptions(
+                    quality_enabled=True,
+                    auto_orient=False,
+                    check_grayscale=False,
+                    check_face=False,
+                    check_glare=False,
+                    check_recapture=False,
+                    background_mode="none",
+                ),
+                workers=1,
+                force_process=True,
+                selected_student_ids=["2600000302"],
+            )
+            calls: list[str] = []
+
+            def selected(_event, row, existing, _options, _batch_id, _cancel_event):
+                calls.append(row.student_id)
+                return JobResult(
+                    student_id=row.student_id,
+                    row_number=row.row_number,
+                    change="reprocessed",
+                    status="success",
+                    original_file=existing["original_file"],
+                    processing_status="success",
+                    quality_status="success",
+                )
+
+            with patch("xlsx_photo_core._execute_processing_job_after_resume", side_effect=selected):
+                result = run_processing(options)
+
+            self.assertEqual(calls, ["2600000302"])
+            self.assertEqual(result.summary["total_rows"], 1)
+            self.assertEqual(result.summary["reprocessed"], 1)
+            batch = json.loads((result.batch_dir / "batch.json").read_text(encoding="utf-8"))
+            self.assertEqual(batch["options"]["selected_student_ids"], ["2600000302"])
+
+    def test_gallery_has_filter_selection_csv_and_reprocess_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            batch_dir = Path(temp_dir)
+            result = JobResult(
+                student_id="2600000401",
+                row_number=8,
+                change="reprocessed",
+                status="success",
+                quality_status="rejected",
+                processing_status="rejected",
+                processing_message="无法识别人脸",
+            )
+            path = _write_gallery(batch_dir, "batch-test", [result], {}, {
+                "reprocessed": 1,
+                "quality_rejected": 1,
+            })
+            page = path.read_text(encoding="utf-8")
+            self.assertIn('id="resultFilter"', page)
+            self.assertIn('id="selectVisible"', page)
+            self.assertIn('id="exportSelected"', page)
+            self.assertIn('id="reprocessButton"', page)
+            self.assertIn('data-student-id="2600000401"', page)
+            self.assertIn("__STUDENT_PHOTO_FLOW_REPORT_TOKEN__", page)
+
+    def test_local_gallery_server_validates_report_and_queues_reprocess(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_root = Path(temp_dir)
+            batch_dir = output_root / "批次记录" / "batch-test"
+            batch_dir.mkdir(parents=True)
+            (batch_dir / "index.html").write_text(
+                '<html>__STUDENT_PHOTO_FLOW_REPORT_TOKEN__</html>', encoding="utf-8",
+            )
+            (batch_dir / "batch.json").write_text(json.dumps({
+                "results": [{"student_id": "2600000501"}],
+            }), encoding="utf-8")
+            queued: list[tuple[Path, list[str]]] = []
+            server = GalleryReportServer(
+                lambda root, ids: (queued.append((root, ids)) is None, "已提交"),
+            )
+            try:
+                url = server.register(batch_dir / "index.html")
+                with urllib.request.urlopen(url, timeout=3) as response:
+                    page = response.read().decode("utf-8")
+                self.assertNotIn("__STUDENT_PHOTO_FLOW_REPORT_TOKEN__", page)
+                token = url.split("/reports/", 1)[1].split("/", 1)[0]
+                request = urllib.request.Request(
+                    url.rsplit("/reports/", 1)[0] + "/api/reprocess",
+                    data=json.dumps({
+                        "report_token": token,
+                        "student_ids": ["2600000501"],
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(payload["message"], "已提交")
+                self.assertEqual(queued, [(output_root.resolve(), ["2600000501"])])
+            finally:
+                server.close()
 
     def test_hivision_sends_adjustable_parameters_and_uses_hd_response(self) -> None:
         def png_base64(size: tuple[int, int], color: tuple[int, int, int, int]) -> str:

@@ -50,7 +50,7 @@ NS = {
     "a": ART_NS,
 }
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.7.0"
 STATE_SCHEMA = 3
 MAX_IMAGE_BYTES = 30 * 1024 * 1024
 VOLATILE_QUERY_RE = re.compile(
@@ -71,6 +71,12 @@ class WorkbookError(RuntimeError):
 
 
 class ExportError(RuntimeError):
+    pass
+
+
+class TaskCancelled(RuntimeError):
+    """Raised inside a worker before it starts when a batch is cancelled."""
+
     pass
 
 
@@ -134,7 +140,7 @@ class ExportOptions:
     recapture_score_threshold: float = 0.72
     stop_on_reject: bool = True
     save_intermediate_steps: bool = True
-    background_mode: str = "ai"  # none | quick | ai | hivision
+    background_mode: str = "none"  # none | quick | ai | hivision
     background_color: str = "#438EDB"
     hivision_url: str = "http://127.0.0.1:8080"
     hivision_timeout: int = 120
@@ -168,6 +174,7 @@ class ProcessingOptions:
     workers: int = 6
     force_process: bool = False
     save_intermediate_steps: bool = True
+    selected_student_ids: list[str] | None = None
 
 
 @dataclass
@@ -204,6 +211,7 @@ class BatchResult:
     summary: dict[str, Any]
     results: list[JobResult] = field(default_factory=list)
     operation: str = "export"
+    cancelled: bool = False
 
 
 def now_local() -> datetime:
@@ -752,6 +760,173 @@ def _load_state(path: Path) -> dict[str, Any]:
     return state
 
 
+def _recover_interrupted_run(root: Path, state: dict[str, Any]) -> dict[str, Any] | None:
+    active = state.pop("active_run", None)
+    if not isinstance(active, dict) or active.get("status") != "running":
+        return None
+    recovered = dict(active)
+    completed_ids = set(str(value) for value in recovered.get("completed_ids", []))
+    planned = recovered.get("planned", {})
+    if not isinstance(planned, dict):
+        planned = {}
+        recovered["planned"] = planned
+    recovered.update({
+        "status": "interrupted",
+        "interrupted_at": iso_now(),
+        "completed_count": len(completed_ids),
+        "pending_count": max(0, len(planned) - len(completed_ids)),
+    })
+    operation = str(recovered.get("operation", ""))
+    if operation in {"export", "process"}:
+        state.setdefault("resume_runs", {})[operation] = recovered
+    interrupted = state.setdefault("interrupted_runs", [])
+    interrupted.append(recovered)
+    if len(interrupted) > 100:
+        del interrupted[:-100]
+    old_dir = _safe_state_file(root, recovered.get("batch_directory"))
+    if old_dir is not None:
+        try:
+            _atomic_write_json(old_dir / "run_status.json", recovered)
+        except OSError:
+            pass
+    return recovered
+
+
+def _take_matching_resume_run(
+    state: dict[str, Any],
+    operation: str,
+    context: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, str]]:
+    resume_runs = state.setdefault("resume_runs", {})
+    candidate = resume_runs.get(operation)
+    if not isinstance(candidate, dict) or candidate.get("context") != context:
+        return None, {}
+    planned = candidate.get("planned", {})
+    if not isinstance(planned, dict):
+        planned = {}
+    completed_ids = set(str(value) for value in candidate.get("completed_ids", []))
+    pending = {
+        str(student_id): str(change)
+        for student_id, change in planned.items()
+        if str(student_id) not in completed_ids
+    }
+    resume_runs.pop(operation, None)
+    return candidate, pending
+
+
+def _begin_run_checkpoint(
+    root: Path,
+    state_path: Path,
+    state: dict[str, Any],
+    batch_id: str,
+    batch_dir: Path,
+    operation: str,
+    context: dict[str, Any],
+    planned: dict[str, str],
+) -> dict[str, Any]:
+    active = {
+        "batch_id": batch_id,
+        "operation": operation,
+        "status": "running",
+        "started_at": iso_now(),
+        "checkpoint_at": iso_now(),
+        "batch_directory": _relative(root, batch_dir),
+        "context": context,
+        "planned": planned,
+        "planned_count": len(planned),
+        "completed_ids": [],
+        "completed_count": 0,
+        "attempted_count": 0,
+        "failed_count": 0,
+    }
+    state["active_run"] = active
+    state["updated_at"] = active["checkpoint_at"]
+    _atomic_write_json(state_path, state)
+    _atomic_write_json(batch_dir / "run_status.json", active)
+    return active
+
+
+def _checkpoint_run_item(
+    state_path: Path,
+    state: dict[str, Any],
+    batch_dir: Path,
+    item: JobResult,
+) -> None:
+    active = state.get("active_run")
+    if not isinstance(active, dict):
+        return
+    active["attempted_count"] = int(active.get("attempted_count", 0)) + 1
+    if item.status == "success" and item.student_id:
+        completed_ids = active.setdefault("completed_ids", [])
+        if item.student_id not in completed_ids:
+            completed_ids.append(item.student_id)
+        active["completed_count"] = len(completed_ids)
+    else:
+        active["failed_count"] = int(active.get("failed_count", 0)) + 1
+    active["last_student_id"] = item.student_id
+    active["checkpoint_at"] = iso_now()
+    state["updated_at"] = active["checkpoint_at"]
+    _atomic_write_json(state_path, state)
+    _atomic_write_json(batch_dir / "run_status.json", active)
+
+
+def _active_run_pending_count(state: dict[str, Any]) -> int:
+    active = state.get("active_run")
+    if not isinstance(active, dict):
+        return 0
+    planned = active.get("planned", {})
+    if not isinstance(planned, dict):
+        return 0
+    completed_ids = {str(value) for value in active.get("completed_ids", [])}
+    return max(0, len(planned) - len(completed_ids))
+
+
+def _finish_run_checkpoint(
+    state: dict[str, Any],
+    batch_dir: Path,
+    summary: dict[str, Any],
+) -> None:
+    active = state.pop("active_run", None)
+    if not isinstance(active, dict):
+        return
+    active.update({
+        "status": "completed",
+        "completed_at": iso_now(),
+        "summary": summary,
+    })
+    _atomic_write_json(batch_dir / "run_status.json", active)
+
+
+def _cancel_run_checkpoint(
+    state: dict[str, Any],
+    batch_dir: Path,
+    summary: dict[str, Any],
+) -> None:
+    active = state.pop("active_run", None)
+    if not isinstance(active, dict):
+        return
+    completed_ids = set(str(value) for value in active.get("completed_ids", []))
+    planned = active.get("planned", {})
+    if not isinstance(planned, dict):
+        planned = {}
+        active["planned"] = planned
+    active.update({
+        "status": "cancelled",
+        "cancelled_at": iso_now(),
+        "completed_count": len(completed_ids),
+        "pending_count": max(0, len(planned) - len(completed_ids)),
+        "summary": summary,
+    })
+    operation = str(active.get("operation", ""))
+    if operation in {"export", "process"}:
+        state.setdefault("resume_runs", {})[operation] = active
+    interrupted = state.setdefault("interrupted_runs", [])
+    interrupted.append(active)
+    if len(interrupted) > 100:
+        del interrupted[:-100]
+    _atomic_write_json(batch_dir / "run_status.json", active)
+
+
 def _processing_fingerprint(options: PipelineOptions) -> str:
     settings = asdict(options)
     settings["hivision_url"] = str(settings.get("hivision_url", "")).rstrip("/")
@@ -1271,14 +1446,33 @@ def _write_gallery(
             visual = f'<div class="steps"><figure><img loading="lazy" src="{encoded}" alt="{html.escape(item.student_id)}"><figcaption><strong>结果</strong></figcaption></figure></div>'
         else:
             visual = '<div class="no-image">无可用图片</div>'
-        status_class = "reject" if item.quality_status == "rejected" else (
-            "ok" if item.status == "success" and item.processing_status != "warning" else "warn"
-        )
+        if item.quality_status == "rejected":
+            result_kind = "rejected"
+            status_class = "reject"
+        elif item.status == "failed":
+            result_kind = "failed"
+            status_class = "warn"
+        elif item.processing_status == "warning":
+            result_kind = "warning"
+            status_class = "warn"
+        else:
+            result_kind = "success"
+            status_class = "ok"
         note = item.message or item.processing_message or "处理完成"
         face = "" if item.face_count is None else f" · 人脸 {item.face_count}"
+        disabled = " disabled" if not item.student_id else ""
         cards.append(f"""
-        <article class="card {status_class}">
+        <article class="card {status_class}"
+          data-student-id="{html.escape(item.student_id, quote=True)}"
+          data-row="{item.row_number}"
+          data-change="{html.escape(item.change, quote=True)}"
+          data-result="{result_kind}"
+          data-status="{html.escape(item.status, quote=True)}"
+          data-quality-status="{html.escape(item.quality_status, quote=True)}"
+          data-processing-status="{html.escape(item.processing_status, quote=True)}"
+          data-note="{html.escape(note, quote=True)}">
           <div class="meta">
+            <label class="select-line"><input class="item-select" type="checkbox"{disabled}> 选择此项</label>
             <h2>{html.escape(item.student_id or '(空学号)')}</h2>
             <p>{html.escape(change_labels.get(item.change, item.change))} · Excel 第 {item.row_number} 行{face}</p>
             <p class="note">{html.escape(note)}</p>
@@ -1295,6 +1489,105 @@ def _write_gallery(
         f"需重传 {summary.get('quality_rejected', 0)}",
         f"失败 {summary.get('failed', 0)}",
     ])
+    client_script = r"""
+  const reportToken = "__STUDENT_PHOTO_FLOW_REPORT_TOKEN__";
+  const cards = [...document.querySelectorAll("article.card")];
+  const searchBox = document.getElementById("searchBox");
+  const resultFilter = document.getElementById("resultFilter");
+  const selectionCount = document.getElementById("selectionCount");
+  const actionStatus = document.getElementById("actionStatus");
+
+  function selectedCards() {
+    return cards.filter(card => card.querySelector(".item-select")?.checked);
+  }
+  function updateCount() {
+    const selected = selectedCards().length;
+    const visible = cards.filter(card => !card.hidden).length;
+    selectionCount.textContent = `已选 ${selected} 项｜当前显示 ${visible} 项`;
+  }
+  function applyFilters() {
+    const query = searchBox.value.trim().toLowerCase();
+    const filter = resultFilter.value;
+    cards.forEach(card => {
+      const matchesText = !query || card.dataset.studentId.toLowerCase().includes(query)
+        || card.dataset.note.toLowerCase().includes(query);
+      const matchesResult = filter === "all" || card.dataset.result === filter
+        || card.dataset.change === filter;
+      card.hidden = !(matchesText && matchesResult);
+    });
+    updateCount();
+  }
+  function csvCell(value) {
+    return `"${String(value ?? "").replaceAll('"', '""')}"`;
+  }
+  function downloadSelectedCsv() {
+    const chosen = selectedCards();
+    if (!chosen.length) {
+      alert("请先选择至少一项。");
+      return;
+    }
+    const rows = [["学号", "Excel行号", "变更类型", "导出状态", "预检状态", "处理状态", "说明"]];
+    chosen.forEach(card => rows.push([
+      card.dataset.studentId, card.dataset.row, card.dataset.change, card.dataset.status,
+      card.dataset.qualityStatus, card.dataset.processingStatus, card.dataset.note,
+    ]));
+    const csv = "\ufeff" + rows.map(row => row.map(csvCell).join(",")).join("\r\n");
+    const url = URL.createObjectURL(new Blob([csv], {type: "text/csv;charset=utf-8"}));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `选中学生信息_${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+  async function reprocessSelected() {
+    const chosen = selectedCards();
+    if (!chosen.length) {
+      alert("请先选择至少一项。");
+      return;
+    }
+    if (location.protocol !== "http:" || reportToken.startsWith("__")) {
+      alert("批量重处理需要保持主程序打开，并从主程序的“查看最新批次”进入本页。");
+      return;
+    }
+    const button = document.getElementById("reprocessButton");
+    button.disabled = true;
+    actionStatus.textContent = "正在提交到 StudentPhotoFlow…";
+    try {
+      const response = await fetch("/api/reprocess", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          report_token: reportToken,
+          student_ids: chosen.map(card => card.dataset.studentId),
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.message || `HTTP ${response.status}`);
+      actionStatus.textContent = payload.message;
+    } catch (error) {
+      actionStatus.textContent = `提交失败：${error.message}`;
+    } finally {
+      button.disabled = false;
+    }
+  }
+  searchBox.addEventListener("input", applyFilters);
+  resultFilter.addEventListener("change", applyFilters);
+  cards.forEach(card => card.querySelector(".item-select")?.addEventListener("change", updateCount));
+  document.getElementById("selectVisible").addEventListener("click", () => {
+    cards.filter(card => !card.hidden).forEach(card => {
+      const checkbox = card.querySelector(".item-select");
+      if (checkbox && !checkbox.disabled) checkbox.checked = true;
+    });
+    updateCount();
+  });
+  document.getElementById("clearSelection").addEventListener("click", () => {
+    cards.forEach(card => { const checkbox = card.querySelector(".item-select"); if (checkbox) checkbox.checked = false; });
+    updateCount();
+  });
+  document.getElementById("exportSelected").addEventListener("click", downloadSelectedCsv);
+  document.getElementById("reprocessButton").addEventListener("click", reprocessSelected);
+  applyFilters();
+"""
     document = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1304,9 +1597,16 @@ def _write_gallery(
   <style>
     :root {{ color-scheme: light; font-family: "Microsoft YaHei", system-ui, sans-serif; }}
     body {{ margin: 0; background: #f4f7fb; color: #172033; }}
-    header {{ position: sticky; top: 0; z-index: 2; padding: 22px 28px; background: #17365d; color: white; box-shadow: 0 2px 12px #0002; }}
+    header {{ padding: 22px 28px; background: #17365d; color: white; box-shadow: 0 2px 12px #0002; }}
     h1 {{ margin: 0 0 8px; font-size: 24px; }} header p {{ margin: 0; opacity: .9; }}
+    .toolbar {{ position: sticky; top: 0; z-index: 3; display: flex; flex-wrap: wrap; gap: 9px; align-items: center; padding: 12px 24px; background: #fff; box-shadow: 0 2px 12px #17203318; }}
+    .toolbar input, .toolbar select, .toolbar button {{ min-height: 36px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 6px 10px; font: inherit; }}
+    .toolbar input {{ min-width: 210px; }} .toolbar button {{ cursor: pointer; background: #f8fafc; }}
+    .toolbar button.primary {{ color: white; background: #175cd3; border-color: #175cd3; }}
+    .toolbar button:disabled {{ opacity: .55; cursor: wait; }}
+    #selectionCount {{ color: #475467; font-size: 13px; }} #actionStatus {{ flex-basis: 100%; color: #175cd3; font-size: 13px; }}
     main {{ padding: 24px; display: grid; gap: 18px; }}
+    .card[hidden] {{ display: none; }}
     .card {{ overflow: hidden; border-radius: 12px; background: white; box-shadow: 0 5px 20px #1c355714; border: 1px solid #dce5ef; }}
     .card.warn {{ border-color: #e4a11b; }}
     .card.reject {{ border-color: #d92d20; }}
@@ -1320,13 +1620,31 @@ def _write_gallery(
     .stage-status.rejected {{ color: #b42318; background: #fef3f2; }}
     .no-image {{ display: grid; place-items: center; color: #758195; }}
     .meta {{ padding: 14px; }} h2 {{ margin: 0 0 7px; font-size: 18px; }}
+    .select-line {{ float: right; color: #475467; font-size: 13px; cursor: pointer; }}
     .meta p {{ margin: 4px 0; color: #5d6879; font-size: 13px; }} .note {{ color: #9a5c00 !important; }}
     .empty {{ grid-column: 1 / -1; padding: 40px; text-align: center; background: white; border-radius: 12px; }}
   </style>
 </head>
 <body>
   <header><h1>学生照片批次 {html.escape(batch_id)}</h1><p>{html.escape(summary_text)}</p></header>
+  <section class="toolbar">
+    <input id="searchBox" type="search" placeholder="搜索学号或说明">
+    <select id="resultFilter">
+      <option value="all">全部结果</option>
+      <option value="success">成功</option><option value="failed">失败</option>
+      <option value="rejected">需重传</option><option value="warning">处理警告</option>
+      <option value="new">本次新增</option><option value="updated">本次更新</option>
+      <option value="repair">本次修复</option><option value="reprocessed">本次重新处理</option>
+    </select>
+    <button id="selectVisible" type="button">全选当前筛选</button>
+    <button id="clearSelection" type="button">清空选择</button>
+    <span id="selectionCount"></span>
+    <button id="exportSelected" type="button">导出选中信息 CSV</button>
+    <button id="reprocessButton" class="primary" type="button">按已保存配置重新处理选中项</button>
+    <span id="actionStatus">提示：批量重处理需保持 StudentPhotoFlow 主程序打开。</span>
+  </section>
   <main>{''.join(cards)}</main>
+  <script>{client_script}</script>
 </body>
 </html>"""
     path = batch_dir / "index.html"
@@ -1341,9 +1659,12 @@ def _execute_job_after_resume(
     existing: dict[str, Any] | None,
     options: ExportOptions,
     batch_id: str,
+    cancel_event: threading.Event | None = None,
 ) -> JobResult:
     if run_event is not None:
         run_event.wait()
+    if cancel_event is not None and cancel_event.is_set():
+        raise TaskCancelled("batch cancelled before export job started")
     return _execute_job(row, change, existing, options, batch_id)
 
 
@@ -1353,16 +1674,100 @@ def _execute_processing_job_after_resume(
     existing: dict[str, Any],
     options: ProcessingOptions,
     batch_id: str,
+    cancel_event: threading.Event | None = None,
 ) -> JobResult:
     if run_event is not None:
         run_event.wait()
+    if cancel_event is not None and cancel_event.is_set():
+        raise TaskCancelled("batch cancelled before processing job started")
     return _execute_processing_job(row, existing, options, batch_id)
+
+
+def _store_export_record(
+    records: dict[str, dict[str, Any]],
+    item: JobResult,
+    options: ExportOptions,
+    batch_id: str,
+    current_time: str,
+) -> None:
+    if not item.student_id or item.status != "success" or not item.original_file:
+        return
+    existing = records.get(item.student_id)
+    if item.change in {"new", "updated"}:
+        processing = {
+            "config_fingerprint": None,
+            "status": "pending",
+            "processed_file": None,
+            "face_count": None,
+            "quality_status": "not_requested",
+            "quality_reasons": [],
+            "quality_metrics": {},
+            "rotation_ccw": 0,
+            "detector": "not_used",
+            "background_engine": "none",
+            "step_files": [],
+            "message": "等待第二步图片处理",
+            "last_processed_at": None,
+        }
+    elif existing:
+        processing = existing.get("processing", {})
+    else:
+        processing = {"status": "pending", "message": "等待第二步图片处理"}
+    records[item.student_id] = {
+        "student_id": item.student_id,
+        "sheet": options.sheet_name,
+        "row": item.row_number,
+        "source_fingerprint": item.source_fingerprint,
+        "source_display": item.source_display,
+        "original_file": item.original_file,
+        "original_sha256": item.original_sha256,
+        "first_exported_at": (existing or {}).get("first_exported_at", current_time),
+        "last_exported_at": (
+            current_time
+            if item.executed and item.change != "reprocessed"
+            else (existing or {}).get("last_exported_at", current_time)
+        ),
+        "last_seen_at": current_time,
+        "last_batch_id": batch_id if item.executed else (existing or {}).get("last_batch_id"),
+        "processing": processing,
+    }
+
+
+def _store_processing_record(
+    records: dict[str, dict[str, Any]],
+    item: JobResult,
+    processing_fp: str,
+    batch_id: str,
+    current_time: str,
+) -> None:
+    if not item.executed or item.status != "success" or not item.original_file:
+        return
+    existing = records.get(item.student_id)
+    if not existing:
+        return
+    existing["processing"] = {
+        "config_fingerprint": processing_fp,
+        "status": item.processing_status,
+        "processed_file": item.processed_file,
+        "face_count": item.face_count,
+        "quality_status": item.quality_status,
+        "quality_reasons": item.quality_reasons,
+        "quality_metrics": item.quality_metrics,
+        "rotation_ccw": item.rotation_ccw,
+        "detector": item.detector,
+        "background_engine": item.background_engine,
+        "step_files": item.step_files,
+        "message": item.processing_message,
+        "last_processed_at": current_time,
+    }
+    existing["last_batch_id"] = batch_id
 
 
 def run_export(
     options: ExportOptions,
     progress: Callable[[int, int, str], None] | None = None,
     run_event: threading.Event | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> BatchResult:
     options.xlsx_path = Path(options.xlsx_path)
     options.output_dir = Path(options.output_dir)
@@ -1388,6 +1793,15 @@ def run_export(
     state_path = options.output_dir / "export_state.json"
     state = _load_state(state_path)
     records: dict[str, dict[str, Any]] = state["records"]
+    _recover_interrupted_run(options.output_dir, state)
+    run_context = {
+        "source_workbook": str(options.xlsx_path.resolve()),
+        "sheet": options.sheet_name,
+        "header_row": options.header_row,
+        "id_column": options.id_col,
+        "image_column": options.image_col,
+    }
+    resumed_run, resume_pending = _take_matching_resume_run(state, "export", run_context)
 
     id_counts = Counter(row.student_id for row in report.rows if row.student_id)
     duplicate_ids = {student_id for student_id, count in id_counts.items() if count > 1}
@@ -1430,7 +1844,10 @@ def run_export(
             options.output_dir,
             existing.get("original_file") if existing else None,
         )
-        if existing is None:
+        resumed_change = resume_pending.get(row.student_id)
+        if resumed_change in {"new", "updated", "repair"}:
+            change = resumed_change
+        elif existing is None:
             change = "new"
         elif options.force_refresh or existing.get("source_fingerprint") != row.source.fingerprint:
             change = "updated"
@@ -1464,10 +1881,24 @@ def run_export(
         else:
             jobs.append((row, change, existing))
 
+    _begin_run_checkpoint(
+        options.output_dir,
+        state_path,
+        state,
+        batch_id,
+        batch_dir,
+        "export",
+        run_context,
+        {row.student_id: change for row, change, _existing in jobs},
+    )
     total = len(jobs) + len(immediate)
     completed = len(immediate)
     if progress:
-        progress(completed, total, f"已检查 {len(report.rows)} 行，需导出 {len(jobs)} 条原图")
+        prefix = (
+            f"已从中断批次恢复 {len(resume_pending)} 条待办；"
+            if resumed_run is not None else ""
+        )
+        progress(completed, total, f"{prefix}已检查 {len(report.rows)} 行，需导出 {len(jobs)} 条原图")
     executed_results: list[JobResult] = list(immediate)
     if jobs:
         with ThreadPoolExecutor(max_workers=options.workers, thread_name_prefix="photo-export") as pool:
@@ -1480,6 +1911,7 @@ def run_export(
                     existing,
                     options,
                     batch_id,
+                    cancel_event,
                 ): (row, change)
                 for row, change, existing in jobs
             }
@@ -1487,6 +1919,8 @@ def run_export(
                 row, change = futures[future]
                 try:
                     item = future.result()
+                except TaskCancelled:
+                    continue
                 except Exception as exc:
                     item = JobResult(
                         student_id=row.student_id,
@@ -1498,52 +1932,20 @@ def run_export(
                         source_fingerprint=row.source.fingerprint,
                     )
                 executed_results.append(item)
+                _store_export_record(records, item, options, batch_id, iso_now())
+                _checkpoint_run_item(state_path, state, batch_dir, item)
                 completed += 1
                 if progress:
                     label = "成功" if item.status == "success" else "失败"
                     progress(completed, total, f"{item.student_id}：{label}")
 
+    cancelled = bool(cancel_event is not None and cancel_event.is_set())
     all_results = sorted(executed_results + unchanged_results, key=lambda item: item.row_number)
     current_time = iso_now()
     for item in all_results:
         if not item.student_id:
             continue
-        existing = records.get(item.student_id)
-        if item.status == "success" and item.original_file:
-            if item.change in {"new", "updated"}:
-                processing = {
-                    "config_fingerprint": None,
-                    "status": "pending",
-                    "processed_file": None,
-                    "face_count": None,
-                    "quality_status": "not_requested",
-                    "quality_reasons": [],
-                    "quality_metrics": {},
-                    "rotation_ccw": 0,
-                    "detector": "not_used",
-                    "background_engine": "none",
-                    "step_files": [],
-                    "message": "等待第二步图片处理",
-                    "last_processed_at": None,
-                }
-            elif existing:
-                processing = existing.get("processing", {})
-            else:
-                processing = {"status": "pending", "message": "等待第二步图片处理"}
-            records[item.student_id] = {
-                "student_id": item.student_id,
-                "sheet": options.sheet_name,
-                "row": item.row_number,
-                "source_fingerprint": item.source_fingerprint,
-                "source_display": item.source_display,
-                "original_file": item.original_file,
-                "original_sha256": item.original_sha256,
-                "first_exported_at": (existing or {}).get("first_exported_at", current_time),
-                "last_exported_at": current_time if item.executed and item.change != "reprocessed" else (existing or {}).get("last_exported_at", current_time),
-                "last_seen_at": current_time,
-                "last_batch_id": batch_id if item.executed else (existing or {}).get("last_batch_id"),
-                "processing": processing,
-            }
+        _store_export_record(records, item, options, batch_id, current_time)
 
     counts = Counter(item.change for item in all_results if item.status == "success")
     failed = sum(1 for item in all_results if item.status == "failed")
@@ -1564,6 +1966,8 @@ def run_export(
         "processing_warnings": processing_warnings,
         "quality_rejected": quality_rejected,
         "missing_from_current_workbook": missing_current,
+        "cancelled": cancelled,
+        "pending": _active_run_pending_count(state) if cancelled else 0,
     }
 
     copied: dict[tuple[str, int], dict[str, Any]] = {}
@@ -1626,14 +2030,19 @@ def run_export(
         "image_column": column_label(options.image_col),
     }
     state["batches"].append(batch_history)
+    if cancelled:
+        _cancel_run_checkpoint(state, batch_dir, summary)
+    else:
+        _finish_run_checkpoint(state, batch_dir, summary)
     _atomic_write_json(state_path, state)
-    return BatchResult(batch_id, batch_dir, gallery, state_path, summary, all_results, "export")
+    return BatchResult(batch_id, batch_dir, gallery, state_path, summary, all_results, "export", cancelled)
 
 
 def run_processing(
     options: ProcessingOptions,
     progress: Callable[[int, int, str], None] | None = None,
     run_event: threading.Event | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> BatchResult:
     options.output_dir = Path(options.output_dir)
     options.workers = max(1, min(16, int(options.workers)))
@@ -1659,6 +2068,22 @@ def run_processing(
     batch_dir.mkdir(parents=True, exist_ok=True)
     processing_fp = _processing_fingerprint(options.pipeline)
     output_expected = options.pipeline.background_mode != "none" or options.pipeline.crop_enabled
+    _recover_interrupted_run(options.output_dir, state)
+    run_context = {"config_fingerprint": processing_fp}
+    selected_ids = (
+        {str(value).strip() for value in options.selected_student_ids if str(value).strip()}
+        if options.selected_student_ids is not None else None
+    )
+    if selected_ids is not None:
+        if not selected_ids:
+            raise ExportError("没有选择要重新处理的学生")
+        missing_ids = sorted(selected_ids - set(records))
+        if missing_ids:
+            preview = "、".join(missing_ids[:8])
+            suffix = "…" if len(missing_ids) > 8 else ""
+            raise ExportError(f"选中的学号不在导出状态中：{preview}{suffix}")
+        run_context["selected_student_ids"] = sorted(selected_ids)
+    resumed_run, resume_pending = _take_matching_resume_run(state, "process", run_context)
 
     jobs: list[tuple[SelectedRow, dict[str, Any]]] = []
     immediate: list[JobResult] = []
@@ -1668,6 +2093,8 @@ def run_processing(
         key=lambda pair: (int(pair[1].get("row", 0) or 0), pair[0]),
     )
     for student_id, existing in ordered_records:
+        if selected_ids is not None and student_id not in selected_ids:
+            continue
         row_number = int(existing.get("row", 0) or 0)
         original_path = _safe_state_file(options.output_dir, existing.get("original_file"))
         if original_path is None or not original_path.is_file():
@@ -1685,7 +2112,8 @@ def run_processing(
         processed_path = _safe_state_file(options.output_dir, previous.get("processed_file"))
         terminal = previous.get("status") in {"success", "warning", "rejected"}
         needs_processing = (
-            options.force_process
+            student_id in resume_pending
+            or options.force_process
             or previous.get("config_fingerprint") != processing_fp
             or not terminal
             or (output_expected and (processed_path is None or not processed_path.is_file()))
@@ -1728,10 +2156,24 @@ def run_processing(
                 executed=False,
             ))
 
+    _begin_run_checkpoint(
+        options.output_dir,
+        state_path,
+        state,
+        batch_id,
+        batch_dir,
+        "process",
+        run_context,
+        {row.student_id: "reprocessed" for row, _existing in jobs},
+    )
     total = len(jobs) + len(immediate)
     completed = len(immediate)
     if progress:
-        progress(completed, total, f"找到 {len(records)} 条已导出原图，需处理 {len(jobs)} 条")
+        prefix = (
+            f"已从中断批次恢复 {len(resume_pending)} 条待办；"
+            if resumed_run is not None else ""
+        )
+        progress(completed, total, f"{prefix}找到 {len(records)} 条已导出原图，需处理 {len(jobs)} 条")
     executed_results: list[JobResult] = list(immediate)
     if jobs:
         with ThreadPoolExecutor(max_workers=options.workers, thread_name_prefix="photo-process") as pool:
@@ -1743,6 +2185,7 @@ def run_processing(
                     existing,
                     options,
                     batch_id,
+                    cancel_event,
                 ): row
                 for row, existing in jobs
             }
@@ -1750,6 +2193,8 @@ def run_processing(
                 row = futures[future]
                 try:
                     item = future.result()
+                except TaskCancelled:
+                    continue
                 except Exception as exc:
                     item = JobResult(
                         student_id=row.student_id,
@@ -1759,42 +2204,25 @@ def run_processing(
                         message=f"任务异常：{type(exc).__name__}: {exc}",
                     )
                 executed_results.append(item)
+                _store_processing_record(records, item, processing_fp, batch_id, iso_now())
+                _checkpoint_run_item(state_path, state, batch_dir, item)
                 completed += 1
                 if progress:
                     label = "完成" if item.status == "success" else "失败"
                     progress(completed, total, f"{item.student_id}：{label}")
 
+    cancelled = bool(cancel_event is not None and cancel_event.is_set())
     all_results = sorted(
         executed_results + unchanged_results,
         key=lambda item: (item.row_number, item.student_id),
     )
     current_time = iso_now()
     for item in all_results:
-        if not item.executed or item.status != "success" or not item.original_file:
-            continue
-        existing = records.get(item.student_id)
-        if not existing:
-            continue
-        existing["processing"] = {
-            "config_fingerprint": processing_fp,
-            "status": item.processing_status,
-            "processed_file": item.processed_file,
-            "face_count": item.face_count,
-            "quality_status": item.quality_status,
-            "quality_reasons": item.quality_reasons,
-            "quality_metrics": item.quality_metrics,
-            "rotation_ccw": item.rotation_ccw,
-            "detector": item.detector,
-            "background_engine": item.background_engine,
-            "step_files": item.step_files,
-            "message": item.processing_message,
-            "last_processed_at": current_time,
-        }
-        existing["last_batch_id"] = batch_id
+        _store_processing_record(records, item, processing_fp, batch_id, current_time)
 
     counts = Counter(item.change for item in all_results if item.status == "success")
     summary = {
-        "total_rows": len(records),
+        "total_rows": len(ordered_records) if selected_ids is None else len(selected_ids),
         "new": 0,
         "updated": 0,
         "repair": 0,
@@ -1804,6 +2232,8 @@ def run_processing(
         "processing_warnings": sum(1 for item in all_results if item.processing_status == "warning"),
         "quality_rejected": sum(1 for item in all_results if item.quality_status == "rejected"),
         "missing_from_current_workbook": 0,
+        "cancelled": cancelled,
+        "pending": _active_run_pending_count(state) if cancelled else 0,
     }
 
     copied: dict[tuple[str, int], dict[str, Any]] = {}
@@ -1837,6 +2267,7 @@ def run_processing(
             "workers": options.workers,
             "force_process": options.force_process,
             "save_intermediate_steps": options.save_intermediate_steps,
+            "selected_student_ids": sorted(selected_ids) if selected_ids is not None else None,
         },
         "summary": summary,
         "results": [asdict(item) for item in all_results],
@@ -1863,8 +2294,12 @@ def run_processing(
     state["last_batch_id"] = batch_id
     state["last_processing_configuration"] = batch_payload["options"]
     state["batches"].append(batch_history)
+    if cancelled:
+        _cancel_run_checkpoint(state, batch_dir, summary)
+    else:
+        _finish_run_checkpoint(state, batch_dir, summary)
     _atomic_write_json(state_path, state)
-    return BatchResult(batch_id, batch_dir, gallery, state_path, summary, all_results, "process")
+    return BatchResult(batch_id, batch_dir, gallery, state_path, summary, all_results, "process", cancelled)
 
 
 def suggest_columns(headers: Iterable[str]) -> tuple[int, int]:

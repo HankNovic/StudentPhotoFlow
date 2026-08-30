@@ -54,7 +54,7 @@ class PipelineOptions:
     orientation_min_confidence: float = 0.85
     orientation_confidence_margin: float = 0.08
     stop_on_reject: bool = True
-    background_mode: str = "ai"  # none | quick | ai | hivision
+    background_mode: str = "none"  # none | quick | ai | hivision
     background_color: str = "#438EDB"
     hivision_url: str = "http://127.0.0.1:8080"
     hivision_timeout: int = 120
