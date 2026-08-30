@@ -17,6 +17,11 @@ from typing import Any, Callable
 import urllib.parse
 
 from photo_pipeline import HIVISION_FACE_MODELS, HIVISION_MATTING_MODELS, PipelineOptions, test_hivision_api
+from photo_review import (
+    ReviewError, load_roster, mark_review, parse_roster_text, read_roster_file,
+    review_queue, save_roster, set_review_enabled, student_detail, undo_review,
+)
+from review_web import enhance_gallery_html, review_page
 from xlsx_photo_core import (
     APP_VERSION,
     ExportOptions,
@@ -179,6 +184,27 @@ class GalleryReportServer:
 
             def do_GET(self) -> None:
                 parsed = urllib.parse.urlparse(self.path)
+                if parsed.path == "/api/review":
+                    query = urllib.parse.parse_qs(parsed.query)
+                    token = query.get("report_token", [""])[0]
+                    with owner.lock:
+                        entry = owner.reports.get(token)
+                    if entry is None:
+                        self.send_json(403, {"message": "报告令牌无效，请从主程序重新打开报告"})
+                        return
+                    try:
+                        root = Path(entry["output_root"])
+                        action = query.get("action", [""])[0]
+                        if action == "queue":
+                            data = review_queue(root, query.get("filter", ["pending"])[0])
+                        elif action == "student":
+                            data = student_detail(root, query.get("student_id", [""])[0].strip())
+                        else:
+                            raise ReviewError("查询操作无效")
+                        self.send_json(200, data)
+                    except (ReviewError, OSError) as exc:
+                        self.send_json(409, {"message": str(exc)})
+                    return
                 parts = [urllib.parse.unquote(part) for part in parsed.path.split("/") if part]
                 if len(parts) < 3 or parts[0] != "reports":
                     self.send_error(404)
@@ -189,8 +215,17 @@ class GalleryReportServer:
                 if entry is None:
                     self.send_error(404)
                     return
+                if parts[2:] == ["review.html"]:
+                    self.send_content(review_page().encode("utf-8"), "text/html; charset=utf-8")
+                    return
                 base = Path(entry["report_path"]).parent.resolve()
                 relative = Path(*parts[2:])
+                if parts[2] == "output":
+                    base = Path(entry["output_root"]).resolve()
+                    relative = Path(*parts[3:])
+                    if relative.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}:
+                        self.send_error(403)
+                        return
                 candidate = (base / relative).resolve()
                 if candidate != base and base not in candidate.parents:
                     self.send_error(403)
@@ -200,7 +235,7 @@ class GalleryReportServer:
                     return
                 try:
                     if candidate.suffix.lower() in {".html", ".htm"}:
-                        data = candidate.read_text(encoding="utf-8").replace(
+                        data = enhance_gallery_html(candidate.read_text(encoding="utf-8")).replace(
                             "__STUDENT_PHOTO_FLOW_REPORT_TOKEN__", token,
                         ).encode("utf-8")
                     else:
@@ -209,6 +244,9 @@ class GalleryReportServer:
                     self.send_error(500)
                     return
                 content_type = mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+                self.send_content(data, content_type)
+
+            def send_content(self, data: bytes, content_type: str) -> None:
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
@@ -218,8 +256,13 @@ class GalleryReportServer:
                 self.wfile.write(data)
 
             def do_POST(self) -> None:
-                if urllib.parse.urlparse(self.path).path != "/api/reprocess":
+                route = urllib.parse.urlparse(self.path).path
+                if route not in {"/api/reprocess", "/api/review"}:
                     self.send_error(404)
+                    return
+                origin = self.headers.get("Origin")
+                if origin and origin != f"http://127.0.0.1:{owner.server.server_address[1]}":
+                    self.send_json(403, {"message": "不允许跨站修改本地结果"})
                     return
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
@@ -230,6 +273,8 @@ class GalleryReportServer:
                     return
                 try:
                     payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    if not isinstance(payload, dict) or not isinstance(payload.get("student_ids", []), list):
+                        raise TypeError("请求必须是对象，学号必须是列表")
                     token = str(payload.get("report_token", ""))
                     student_ids = list(dict.fromkeys(
                         str(value).strip() for value in payload.get("student_ids", []) if str(value).strip()
@@ -241,6 +286,22 @@ class GalleryReportServer:
                     entry = owner.reports.get(token)
                 if entry is None:
                     self.send_json(403, {"message": "报告令牌无效，请从主程序重新打开报告"})
+                    return
+                if route == "/api/review":
+                    try:
+                        root = Path(entry["output_root"])
+                        if payload.get("action") == "mark":
+                            data = mark_review(
+                                root, str(payload.get("student_id", "")).strip(), str(payload.get("decision", "")),
+                                str(payload.get("expected_version", "")), str(payload.get("expected_revision", "")),
+                            )
+                        elif payload.get("action") == "undo":
+                            data = undo_review(root, str(payload.get("action_id", "")))
+                        else:
+                            raise ReviewError("审核操作无效")
+                        self.send_json(200, data)
+                    except (ReviewError, OSError) as exc:
+                        self.send_json(409, {"message": str(exc)})
                     return
                 if not student_ids or len(student_ids) > 5000:
                     self.send_json(400, {"message": "请选择 1–5000 名学生"})
@@ -663,6 +724,112 @@ class PhotoExporterApp:
         self._append_log(f"配置已导入并保存：{path}")
         self.messagebox.showinfo("配置已导入", "配置已经应用，并保存为便携版当前配置。")
 
+    def manage_grade_roster(self) -> None:
+        if self.busy:
+            self.messagebox.showwarning("任务运行中", "请先完成或中断当前任务，再修改全年级名单与归档开关。")
+            return
+        if not self.output_var.get().strip():
+            self.messagebox.showwarning("请选择输出目录", "名单与审核状态保存在当前输出目录。")
+            return
+        root = Path(self.output_var.get()).resolve()
+        tk, ttk = self.tk, self.ttk
+        window = tk.Toplevel(self.root)
+        window.title("全年级学号名单 · 审核归档")
+        window.geometry("780x620")
+        window.minsize(680, 540)
+        window.transient(self.root)
+        window.grab_set()
+        frame = ttk.Frame(window, padding=18)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(3, weight=1)
+        ttk.Label(frame, text=f"当前输出目录：{root}", wraplength=720).grid(row=0, column=0, sticky="w")
+        ttk.Label(frame, text="导入 TXT / CSV / XLSX，或粘贴学号（一行一个）。保留前导零。\n"
+                  "表格须有唯一的“学号”表头，或只含一列学号；重复、空学号、非法字符将阻止保存。",
+                  wraplength=720).grid(row=1, column=0, sticky="w", pady=(10, 8))
+        status = tk.StringVar(value="尚未读取名单")
+        ttk.Label(frame, textvariable=status, wraplength=720).grid(row=2, column=0, sticky="w", pady=6)
+        text_frame = ttk.Frame(frame)
+        text_frame.grid(row=3, column=0, sticky="nsew")
+        editor = tk.Text(text_frame, height=15, width=70, wrap="none", undo=True)
+        scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=editor.yview)
+        editor.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        editor.pack(side="left", fill="both", expand=True)
+        confirmed = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, variable=confirmed, text="我确认这是全年级完整学号名单（程序无法仅凭已采集照片判断是否齐全）").grid(
+            row=4, column=0, sticky="w", pady=(12, 6))
+        ttk.Label(frame, text="保存名单后需单独启用。通过即保存归档副本，强制 / 批量重处理也会跳过；\n"
+                  "新原图或结果变化后需重审。“撤销”可解除通过状态，归档副本仍保留。",
+                  wraplength=720).grid(row=5, column=0, sticky="w", pady=6)
+        actions = ttk.Frame(frame)
+        actions.grid(row=6, column=0, sticky="w", pady=12)
+        source = {"name": "手动输入"}
+
+        def update_status() -> None:
+            roster = load_roster(root)
+            enabled = bool(roster.get("enabled"))
+            status.set(f"已校验保存 {roster.get('count', 0)} 人｜审核归档：{'已启用' if enabled else '未启用'}")
+            enable_button.configure(state="normal" if roster and not enabled else "disabled")
+            disable_button.configure(state="normal" if enabled else "disabled")
+
+        def import_file() -> None:
+            path = self.filedialog.askopenfilename(parent=window, title="导入全年级学号名单",
+                filetypes=[("名单文件", "*.txt *.csv *.xlsx"), ("所有文件", "*.*")])
+            if not path:
+                return
+            try:
+                ids = read_roster_file(Path(path))
+                editor.delete("1.0", "end")
+                editor.insert("1.0", "\n".join(ids))
+                confirmed.set(False)
+                source["name"] = Path(path).name
+                status.set(f"文件校验通过：{len(ids)} 人；请确认完整名单后保存，当前编辑尚未生效。")
+            except Exception as exc:
+                self.messagebox.showerror("名单导入失败", str(exc), parent=window)
+
+        def save() -> None:
+            try:
+                ids = parse_roster_text(editor.get("1.0", "end-1c"))
+                if not confirmed.get():
+                    raise ReviewError("请先确认这是全年级完整学号名单")
+                if not self.messagebox.askyesno("保存全年级名单", f"校验通过：{len(ids)} 个唯一学号。\n"
+                        "保存会关闭审核开关，需重新启用；既有审核记录不会删除。\n\n确认保存？", parent=window):
+                    return
+                save_roster(root, ids, confirmed_complete=True, source=source["name"])
+                update_status()
+                self._append_log(f"全年级名单已校验保存：{len(ids)} 人，目录 {root}")
+            except Exception as exc:
+                self.messagebox.showerror("名单未保存", str(exc), parent=window)
+
+        def toggle(enabled: bool) -> None:
+            try:
+                roster = load_roster(root)
+                if enabled and parse_roster_text(editor.get("1.0", "end-1c")) != roster.get("student_ids"):
+                    raise ReviewError("编辑区与已保存名单不同，请先校验保存再启用")
+                if not enabled and not self.messagebox.askyesno("关闭归档保护？",
+                        "关闭后已通过的照片将参与普通和强制处理。既有审核记录及副本不会删除。确认关闭？", parent=window):
+                    return
+                set_review_enabled(root, enabled)
+                update_status()
+                self._append_log(f"审核归档{'已启用' if enabled else '已关闭'}：{root}")
+            except Exception as exc:
+                self.messagebox.showerror("无法更改审核开关", str(exc), parent=window)
+
+        ttk.Button(actions, text="导入名单…", command=import_file).pack(side="left")
+        ttk.Button(actions, text="校验并保存名单", command=save).pack(side="left", padx=8)
+        enable_button = ttk.Button(actions, text="启用审核归档", command=lambda: toggle(True), state="disabled")
+        enable_button.pack(side="left")
+        disable_button = ttk.Button(actions, text="关闭归档保护", command=lambda: toggle(False), state="disabled")
+        disable_button.pack(side="left", padx=8)
+        ttk.Button(actions, text="完成", command=window.destroy).pack(side="left")
+        try:
+            roster = load_roster(root)
+            editor.insert("1.0", "\n".join(roster.get("student_ids", [])))
+            update_status()
+        except ReviewError as exc:
+            status.set(str(exc))
+
     def _schedule_settings_save(self, *_args: Any) -> None:
         if self.settings_save_job is not None:
             try:
@@ -795,6 +962,7 @@ class PhotoExporterApp:
         ttk.Button(config_actions, text="保存当前配置", command=self.save_settings_now).pack(side="left")
         ttk.Button(config_actions, text="导出配置…", command=self.export_settings_file).pack(side="left", padx=(8, 0))
         ttk.Button(config_actions, text="导入配置…", command=self.import_settings_file).pack(side="left", padx=(8, 0))
+        ttk.Button(config_actions, text="全年级名单 / 审核归档…", command=self.manage_grade_roster).pack(side="left", padx=(8, 0))
 
         content = ttk.Panedwindow(self.root, orient="vertical")
         content.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 8))
@@ -1428,6 +1596,7 @@ class PhotoExporterApp:
             message = (
                 f"处理批次 {result.batch_id} 完成：本次处理 {summary['reprocessed']}，"
                 f"参数未变 {summary['unchanged']}，需重传 {summary.get('quality_rejected', 0)}，"
+                f"归档跳过 {summary.get('archived_skipped', 0)}，"
                 f"警告 {summary.get('processing_warnings', 0)}，失败 {summary['failed']}。"
             )
         else:

@@ -18,6 +18,10 @@ release/
 # Runtime logs and local configuration
 *.log
 StudentPhotoFlow.settings.json
+grade_roster.json
+review_state.json
+.studentphotoflow.lock
+审核归档/
 .env
 .env.*
 

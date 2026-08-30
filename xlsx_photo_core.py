@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from xml.etree import ElementTree as ET
+from photo_review import archive_context, is_archived, locked_batch
 
 from photo_pipeline import (
     PIPELINE_VERSION,
@@ -50,7 +51,7 @@ NS = {
     "a": ART_NS,
 }
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 STATE_SCHEMA = 3
 MAX_IMAGE_BYTES = 30 * 1024 * 1024
 VOLATILE_QUERY_RE = re.compile(
@@ -323,12 +324,16 @@ class WorkbookReader:
             self.zf = zipfile.ZipFile(self.path)
         except (zipfile.BadZipFile, OSError) as exc:
             raise WorkbookError(f"无法打开工作簿：{exc}") from exc
-        self.names = set(self.zf.namelist())
-        self.workbook_part = _office_document_part(self.zf)
-        self.workbook_rels = _relationship_map(self.zf, self.workbook_part)
-        self.shared_strings = self._read_shared_strings()
-        self.number_formats = self._read_number_formats()
-        self.sheets = self._read_sheets()
+        try:
+            self.names = set(self.zf.namelist())
+            self.workbook_part = _office_document_part(self.zf)
+            self.workbook_rels = _relationship_map(self.zf, self.workbook_part)
+            self.shared_strings = self._read_shared_strings()
+            self.number_formats = self._read_number_formats()
+            self.sheets = self._read_sheets()
+        except Exception as exc:
+            self.zf.close()
+            raise WorkbookError(f"工作簿结构无效：{exc}") from exc
 
     def close(self) -> None:
         self.zf.close()
@@ -1419,7 +1424,7 @@ def _write_gallery(
     cards: list[str] = []
     change_labels = {
         "new": "新增", "updated": "更新", "repair": "修复",
-        "reprocessed": "重新处理", "unchanged": "未变化", "invalid": "失败",
+        "reprocessed": "重新处理", "unchanged": "未变化", "invalid": "失败", "archived": "已审核归档（跳过处理）",
     }
     visible = [item for item in results if item.change != "unchanged" or item.status == "failed"]
     for item in visible:
@@ -1486,6 +1491,7 @@ def _write_gallery(
         f"更新 {summary.get('updated', 0)}",
         f"重新处理 {summary.get('reprocessed', 0)}",
         f"未变化 {summary.get('unchanged', 0)}",
+        f"归档跳过 {summary.get('archived_skipped', 0)}",
         f"需重传 {summary.get('quality_rejected', 0)}",
         f"失败 {summary.get('failed', 0)}",
     ])
@@ -1648,6 +1654,8 @@ def _write_gallery(
 </body>
 </html>"""
     path = batch_dir / "index.html"
+    from review_web import enhance_gallery_html
+    document = enhance_gallery_html(document)
     path.write_text(document, encoding="utf-8")
     return path
 
@@ -1746,6 +1754,7 @@ def _store_processing_record(
     if not existing:
         return
     existing["processing"] = {
+        "input_sha256": item.original_sha256,
         "config_fingerprint": processing_fp,
         "status": item.processing_status,
         "processed_file": item.processed_file,
@@ -1763,6 +1772,7 @@ def _store_processing_record(
     existing["last_batch_id"] = batch_id
 
 
+@locked_batch
 def run_export(
     options: ExportOptions,
     progress: Callable[[int, int, str], None] | None = None,
@@ -2038,6 +2048,7 @@ def run_export(
     return BatchResult(batch_id, batch_dir, gallery, state_path, summary, all_results, "export", cancelled)
 
 
+@locked_batch
 def run_processing(
     options: ProcessingOptions,
     progress: Callable[[int, int, str], None] | None = None,
@@ -2062,6 +2073,7 @@ def run_processing(
     records: dict[str, dict[str, Any]] = state["records"]
     if not records:
         raise ExportError("当前状态中没有已导出的学生原图")
+    review_context = archive_context(options.output_dir)
 
     batch_id = now_local().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     batch_dir = options.output_dir / "批次记录" / batch_id
@@ -2111,8 +2123,16 @@ def run_processing(
         previous = existing.get("processing", {})
         processed_path = _safe_state_file(options.output_dir, previous.get("processed_file"))
         terminal = previous.get("status") in {"success", "warning", "rejected"}
-        needs_processing = (
-            student_id in resume_pending
+        archived = is_archived(options.output_dir, student_id, existing, review_context)
+        approved_input_changed = bool(
+            not archived and review_context[0].get("enabled")
+            and student_id in review_context[0].get("student_ids", [])
+            and review_context[1]["reviews"].get(student_id, {}).get("status") == "approved"
+            and hashlib.sha256(original_path.read_bytes()).hexdigest()
+            != previous.get("input_sha256", existing.get("original_sha256"))
+        )
+        needs_processing = not archived and (
+            approved_input_changed or student_id in resume_pending
             or options.force_process
             or previous.get("config_fingerprint") != processing_fp
             or not terminal
@@ -2136,7 +2156,7 @@ def run_processing(
             unchanged_results.append(JobResult(
                 student_id=student_id,
                 row_number=row_number,
-                change="unchanged",
+                change="archived" if archived else "unchanged",
                 status="success",
                 source_display=str(existing.get("source_display", "")),
                 source_fingerprint=str(existing.get("source_fingerprint", "")),
@@ -2152,7 +2172,7 @@ def run_processing(
                 background_engine=previous.get("background_engine", "none"),
                 step_files=previous.get("step_files", []),
                 processing_status=previous.get("status", "not_requested"),
-                processing_message=previous.get("message", ""),
+                processing_message="人工审核已通过并归档，已跳过处理" if archived else previous.get("message", ""),
                 executed=False,
             ))
 
@@ -2223,6 +2243,7 @@ def run_processing(
     counts = Counter(item.change for item in all_results if item.status == "success")
     summary = {
         "total_rows": len(ordered_records) if selected_ids is None else len(selected_ids),
+        "archived_skipped": counts.get("archived", 0),
         "new": 0,
         "updated": 0,
         "repair": 0,
