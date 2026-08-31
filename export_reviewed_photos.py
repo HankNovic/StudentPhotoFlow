@@ -41,9 +41,9 @@ def resolve_source(path: str | Path) -> Path:
     if candidate.name == "审核归档":
         options.append(candidate.parent)
     for root in options:
-        if all((root / name).is_file() for name in STATE_FILES):
+        if all((root / name).is_file() for name in ("grade_roster.json", "export_state.json")):
             return root
-    raise DeliveryError("请选择包含 grade_roster.json、review_state.json、export_state.json 的“导出结果”目录。\n"
+    raise DeliveryError("请选择包含 grade_roster.json、export_state.json 及已有 review_state.json 的“导出结果”目录。\n"
                         "只复制“审核归档”文件夹不足以判断哪些审核已撤销，也无法得到全年级剩余学号。")
 
 
@@ -87,6 +87,10 @@ def source_lock(root: Path):
 def load_states(root: Path) -> tuple[dict, dict[str, str]]:
     states, hashes = {}, {}
     for name in STATE_FILES:
+        if name == "review_state.json" and not (root / name).exists():
+            states[name] = {"schema_version": 1, "reviews": {}, "actions": []}
+            hashes[name] = None  # A newly saved roster need not have any reviews yet.
+            continue
         try:
             data = (root / name).read_bytes()
             payload = json.loads(data.decode("utf-8-sig"))
@@ -422,6 +426,92 @@ def write_processing_lists(delivery: Path, processed: list, no_evidence: list, w
     return {label: len(ids) for label, ids in categories.items()}
 
 
+def collect_review_data(root: Path, states: dict, progress=None) -> dict:
+    """Shared full-grade computation for the portable UI and standalone delivery."""
+    ids, reviews, records = validate_states(states)
+    historical, warnings, history_hashes = processing_history(root, states["export_state.json"], progress)
+    approved, remaining, details, processed, no_evidence, statuses = [], [], [], [], [], {}
+    for index, sid in enumerate(ids, 1):
+        if progress and (index == 1 or index % 100 == 0 or index == len(ids)):
+            progress(f"检查 {index}/{len(ids)}")
+        review, record = reviews.get(sid, {}), records.get(sid, {})
+        status, reason = effective_status(root, review, record)
+        statuses[sid] = status
+        if status == "approved":
+            approved.append(sid)
+            continue
+        remaining.append(sid)
+        detail = [sid, status, reason, record.get("processing", {}).get("status", "pending")]
+        details.append(detail)
+        row = processed_detail(sid, status, reason, review, record, historical.get(sid, []), warnings)
+        if row is None:
+            no_evidence.append(detail)
+        else:
+            processed.append(row)
+    return dict(ids=ids, reviews=reviews, records=records, statuses=statuses, approved=approved,
+                remaining=remaining, details=details, processed=processed, no_evidence=no_evidence,
+                warnings=warnings, history_hashes=history_hashes,
+                outside=sorted((set(reviews) | set(records) | set(historical)) - set(ids)))
+
+
+def roster_overview(source: str | Path) -> dict:
+    """Read-only, coherent report. Tasks holding the app lock must finish first."""
+    root = resolve_source(source)
+    with source_lock(root):
+        states, hashes = load_states(root)
+        data = collect_review_data(root, states)
+        if load_states(root)[1] != hashes:
+            raise DeliveryError("统计期间审核或流程记录变化，请刷新重试。")
+        verify_history(root, data["history_hashes"])
+        labels = {
+            "all": "全年级学生", "approved": "有效已审核归档", "remaining": "剩余未通过",
+            "processed_remaining": "已处理但未通过", "awaiting_review": "处理成功待审核",
+            "rejected": "人工审核不通过", "skipped": "人工审核跳过", "stale": "审核已失效",
+            "old_approved": "历史通过已失效", "machine_rejected": "机器检查不通过",
+            "processing_failed": "处理失败", "processing_warning": "处理警告或异常",
+            "no_evidence": "未发现处理记录", "not_exported": "尚无导出记录", "history_only": "仅历史处理记录",
+        }
+        groups = {key: {"label": label, "count": 0} for key, label in labels.items()}
+        processing_rows = {row[0]: row for row in data["processed"]}
+        rows = []
+        for sid in data["ids"]:
+            status = data["statuses"][sid]
+            record, review = data["records"].get(sid, {}), data["reviews"].get(sid, {})
+            process, detail = record.get("processing", {}), processing_rows.get(sid)
+            keys = ["all", "approved" if status == "approved" else "remaining"]
+            if status in {"rejected", "skipped", "stale"}:
+                keys.append(status)
+            if status == "stale" and review.get("status") == "approved":
+                keys.append("old_approved")
+            if not record:
+                keys.append("not_exported")
+            if detail:
+                keys.append("processed_remaining")
+                for match, key in [("处理失败", "processing_failed"), ("机器检查不通过", "machine_rejected"),
+                                   ("处理警告或异常", "processing_warning")]:
+                    if detail[3] == match:
+                        keys.append(key)
+                if detail[1] == "已处理待审核":
+                    keys.append("awaiting_review")
+                if detail[8].startswith("仅历史版本"):
+                    keys.append("history_only")
+            elif status != "approved":
+                keys.append("no_evidence")
+            for key in keys:
+                groups[key]["count"] += 1
+            rows.append({"student_id": sid, "groups": keys, "review_status": status,
+                         "category": detail[1] if detail else ("有效已审核归档" if status == "approved" else "未发现处理记录"),
+                         "processing_status": detail[4] if detail else process.get("status", "pending"),
+                         "message": detail[6] if detail else process.get("message", "尚未上传 / 导出照片"),
+                         "review_message": detail[5] if detail else ("当前有效审核通过" if status == "approved" else "未找到图片处理证据"),
+                         "version_note": detail[8] if detail else "", "batch_id": detail[9] if detail else record.get("last_batch_id", ""),
+                         "at": detail[10] if detail else process.get("last_processed_at", ""),
+                         "evidence": detail[11] if detail else "export_state.json / review_state.json"})
+        return {"generated_at": datetime.now().astimezone().isoformat(timespec="seconds"), "groups": groups, "rows": rows,
+                "enabled": bool(states["grade_roster.json"].get("enabled")), "warnings": data["warnings"],
+                "history_scan_complete": not data["warnings"], "outside_roster": data["outside"]}
+
+
 def history_number(path: Path) -> int:
     match = HISTORY_NAME.fullmatch(path.name)
     return int(match[1] or 0) if match else 0
@@ -547,25 +637,16 @@ def export_delivery(source: str | Path, output_parent: str | Path | None = None,
         approved_ids, remaining, details, manifest, failures = [], [], [], [], []
         processed, no_evidence = [], []
         try:
-            historical, query_warnings, history_hashes = processing_history(root, states["export_state.json"], progress)
+            collected = collect_review_data(root, states, progress)
+            query_warnings, history_hashes = collected["warnings"], collected["history_hashes"]
+            approved_ids, remaining, details = collected["approved"], collected["remaining"], collected["details"]
+            processed, no_evidence = collected["processed"], collected["no_evidence"]
             summary["source_history_sha256"] = history_hashes
-            summary["ignored_outside_roster"] = sorted((set(reviews) | set(records) | set(historical)) - set(ids))
-            for index, sid in enumerate(ids, 1):
-                if progress and (index == 1 or index % 100 == 0 or index == len(ids)):
-                    progress(f"检查 {index}/{len(ids)}")
-                review, record = reviews.get(sid, {}), records.get(sid, {})
-                status, reason = effective_status(root, review, record)
-                if status != "approved":
-                    remaining.append(sid)
-                    detail = [sid, status, reason, record.get("processing", {}).get("status", "pending")]
-                    details.append(detail)
-                    row = processed_detail(sid, status, reason, review, record, historical.get(sid, []), query_warnings)
-                    if row is not None:
-                        processed.append(row)
-                    else:
-                        no_evidence.append(detail)
-                    continue
-                approved_ids.append(sid)
+            summary["ignored_outside_roster"] = collected["outside"]
+            for index, sid in enumerate(approved_ids, 1):
+                if progress and (index == 1 or index % 100 == 0 or index == len(approved_ids)) and not lists_only:
+                    progress(f"交付照片 {index}/{len(approved_ids)}")
+                review = reviews[sid]
                 if lists_only:
                     continue
                 if sid in previous_set:

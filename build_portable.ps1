@@ -7,9 +7,10 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BuildRoot = Join-Path $ProjectRoot ".portable-build"
 $VenvRoot = Join-Path $BuildRoot "venv"
-$DistRoot = Join-Path $BuildRoot "dist"
 $ReleaseRoot = Join-Path $ProjectRoot "release"
-$Version = "1.8.0"
+$Version = "1.9.0"
+# Keep earlier release builds intact; these directories contain generated files only.
+$DistRoot = Join-Path $BuildRoot "dist-v$Version"
 
 if (-not $Python) {
     $PyLauncher = Get-Command py -ErrorAction SilentlyContinue
@@ -31,24 +32,29 @@ if (-not (Test-Path (Join-Path $VenvRoot "Scripts\python.exe"))) {
     } else {
         & $Python -m venv $VenvRoot
     }
+    if ($LASTEXITCODE -ne 0) { throw "创建构建环境失败。" }
 }
 $BuildPython = Join-Path $VenvRoot "Scripts\python.exe"
 
 if (-not $SkipInstall) {
     & $BuildPython -m pip install --upgrade pip
+    if ($LASTEXITCODE -ne 0) { throw "更新 pip 失败。" }
     & $BuildPython -m pip install -r (Join-Path $ProjectRoot "requirements-ai.txt") "pyinstaller>=6.16,<7"
+    if ($LASTEXITCODE -ne 0) { throw "安装构建依赖失败。" }
 }
 
 & $BuildPython -m PyInstaller `
     --noconfirm `
     --clean `
     --distpath $DistRoot `
-    --workpath (Join-Path $BuildRoot "work") `
+    --workpath (Join-Path $BuildRoot "work-v$Version") `
     (Join-Path $ProjectRoot "StudentPhotoFlow.spec")
+if ($LASTEXITCODE -ne 0) { throw "便携版构建失败，未打包旧文件。" }
 
 $PortableRoot = Join-Path $DistRoot "StudentPhotoFlow"
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "启动工具.bat") -Destination $PortableRoot -Force
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "README.md") -Destination $PortableRoot -Force
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "审核结果独立导出说明.md") -Destination $PortableRoot -Force
 
 New-Item -ItemType Directory -Force -Path $ReleaseRoot | Out-Null
 $ZipPath = Join-Path $ReleaseRoot "StudentPhotoFlow_Windows_x64_v$Version.zip"

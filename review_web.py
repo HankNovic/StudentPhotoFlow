@@ -65,12 +65,16 @@ SHARED_SCRIPT = r"""
      return data;
    } catch(error){document.getElementById('spf-gate').textContent=error.message;return null;}
  }
- window.SPF={get,post,fileUrl,detailView,refreshGate,labels};
+ async function openStudent(sid){
+   document.getElementById('spf-student-id').value=sid;
+   if(document.getElementById('spf-shared-search').dataset.mode==='review'){await window.loadReviewStudent(sid);}
+   else{const detail=await get('student',{student_id:sid});detailView(detail,document.getElementById('spf-detail-body'));document.getElementById('spf-detail').showModal();}
+ }
+ window.SPF={get,post,fileUrl,detailView,refreshGate,labels,openStudent};
  const form=document.getElementById('spf-search-form');
  form.addEventListener('submit',async event=>{
    event.preventDefault();const sid=document.getElementById('spf-student-id').value.trim();if(!sid)return;
-   try{if(document.getElementById('spf-shared-search').dataset.mode==='review'){await window.loadReviewStudent(sid);}
-   else{const detail=await get('student',{student_id:sid});detailView(detail,document.getElementById('spf-detail-body'));document.getElementById('spf-detail').showModal();}}
+   try{await openStudent(sid);}
    catch(error){alert(error.message);}
  });
  document.getElementById('spf-close-detail').onclick=()=>document.getElementById('spf-detail').close();
@@ -81,12 +85,120 @@ SHARED_SCRIPT = r"""
 """
 
 
+OVERVIEW_STYLE = """
+<style>
+.spf-overview{margin:18px 24px;padding:20px;background:white;border:1px solid #dbe3ed;border-radius:14px;color:#172033}
+.spf-overview h2{font-size:20px;margin:0}.spf-overview .spf-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:12px 0}
+.spf-overview button,.spf-overview select,.spf-overview input{font:inherit;padding:8px 10px;border:1px solid #b9c9db;background:white;border-radius:7px;color:#17365d}
+.spf-overview button{cursor:pointer}.spf-overview button:disabled{opacity:.45;cursor:not-allowed}.spf-overview button:focus-visible,.spf-overview input:focus-visible{outline:3px solid #84adff}
+.spf-overview p,.spf-overview small{font-size:13px;color:#52657e}.spf-overview #spf-overview-note{white-space:pre-wrap}
+.spf-overview #spf-overview-note.error{color:#b42318}.spf-overview #spf-overview-note.warning{color:#956000}
+.spf-stats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin:14px 0}
+.spf-stats button{text-align:left;background:#f5f8fc;border-color:#e1e8f1;padding:12px;min-height:76px}
+.spf-stats button:nth-child(2){background:#ecfdf3}.spf-stats button:nth-child(3){background:#fffaeb}
+.spf-stats button[aria-pressed=true]{outline:2px solid #175cd3}.spf-stats strong{display:block;font-size:26px;line-height:1.3;color:#172033}
+.spf-table-wrap{max-height:410px;overflow:auto;border:1px solid #e1e8f1;border-radius:8px}.spf-overview table{width:100%;border-collapse:collapse;min-width:720px}
+.spf-overview th{position:sticky;top:0;background:#f1f5fa;text-align:left;font-size:13px;z-index:1}.spf-overview th,.spf-overview td{padding:10px;border-bottom:1px solid #e8eef4;vertical-align:top}
+.spf-overview td{font-size:13px}.spf-overview td small{display:block;font-size:12px}.spf-overview td:first-child button{padding:0;border:0;background:none;color:#175cd3;font-weight:600;white-space:nowrap}
+.spf-overview .spf-reason{max-width:380px;min-width:180px;overflow-wrap:anywhere;white-space:pre-wrap}.spf-overview .spf-batch{overflow-wrap:anywhere;max-width:160px}
+.spf-overview textarea{width:100%;box-sizing:border-box;min-height:120px;font:14px/1.6 Consolas,monospace;border:1px solid #c8d5e5;border-radius:7px;margin-top:8px;padding:10px}
+@media(max-width:1000px){.spf-stats{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:700px){.spf-overview{margin:12px;padding:14px}.spf-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.spf-overview #spf-roster-query{width:100%}}
+</style>
+"""
+
+
+def overview_markup() -> str:
+    return """<section class="spf-overview" id="spf-overview" aria-label="全年级综合统计">
+<div class="spf-bar"><h2>全年级综合统计与学号</h2><button id="spf-overview-refresh">刷新全量统计</button><small id="spf-overview-time"></small></div>
+<p>跨全部历史批次，以已保存的全年级名单为准。全年级 = 有效已归档 + 剩余未通过；其余分类可交叉，不要相加。统计不会修改审核。</p>
+<p id="spf-overview-note" role="status">正在核对全年级审核、图片版本与历史处理记录…</p>
+<details id="spf-warning-details" hidden><summary>查看统计提示</summary><ul id="spf-warning-list"></ul></details>
+<div class="spf-stats" id="spf-stats"></div>
+<div class="spf-bar"><label>学号范围 <select id="spf-roster-group" aria-label="综合名单范围"></select></label>
+<input id="spf-roster-query" aria-label="筛选综合名单" placeholder="筛选学号、分类或错误原因" autocomplete="off">
+<button id="spf-roster-txt" disabled>导出筛选学号 TXT</button><button id="spf-roster-csv" disabled>导出筛选明细 CSV</button></div>
+<p id="spf-roster-count">点击统计卡片查看相应学号；点击学号查看详细流程。</p>
+<div class="spf-table-wrap"><table><thead><tr><th>学号 / 流程</th><th>分类</th><th>人工审核</th><th>处理状态</th><th>原因 / 版本说明</th><th>处理批次</th></tr></thead><tbody id="spf-roster-body"></tbody></table></div>
+<div class="spf-bar"><button id="spf-roster-prev" disabled>上一页</button><span id="spf-roster-page">0 / 0</span><button id="spf-roster-next" disabled>下一页</button><small>每页 20 人；TXT / CSV 包含所有符合筛选的学号，不仅本页。</small></div>
+<details><summary>展开当前筛选的全部学号（可复制）</summary><textarea id="spf-roster-ids" aria-label="筛选后的全部学号" readonly></textarea></details>
+<p>需要按学号导出已归档照片、初次导入或新增交付：在主程序点击“审核结果导出…”。</p>
+</section>"""
+
+
+OVERVIEW_SCRIPT = r"""
+<script>
+(() => {
+ const $=id=>document.getElementById(id);if(!$('spf-overview'))return;
+ const processLabels={success:'成功',warning:'警告 / 异常',rejected:'机器不通过',failed:'失败',error:'失败',pending:'等待处理',not_requested:'未请求',unknown:'结果待核实'};
+ let data=null,filtered=[],page=0,loading=false;const pageSize=20;
+ function render(){
+   if(!data)return;const key=$('spf-roster-group').value,query=$('spf-roster-query').value.trim().toLowerCase();
+   filtered=data.rows.filter(row=>row.groups.includes(key)&&(!query||[row.student_id,row.category,row.message,row.review_message,row.version_note].join(' ').toLowerCase().includes(query)));
+   const pages=Math.ceil(filtered.length/pageSize);page=Math.max(0,Math.min(page,Math.max(0,pages-1)));
+   $('spf-roster-body').replaceChildren();
+   filtered.slice(page*pageSize,(page+1)*pageSize).forEach(row=>{
+     const tr=document.createElement('tr'),idCell=document.createElement('td'),link=document.createElement('button');
+     link.textContent=row.student_id;link.title='查看该学号完整流程';link.onclick=()=>SPF.openStudent(row.student_id).catch(error=>alert(error.message));idCell.append(link);tr.append(idCell);
+     [row.category,SPF.labels[row.review_status]||row.review_status,processLabels[row.processing_status]||row.processing_status].forEach(value=>{const td=document.createElement('td');td.textContent=value;tr.append(td);});
+     const reason=document.createElement('td');reason.className='spf-reason';reason.textContent=row.message||row.review_message;
+     if(row.version_note){const small=document.createElement('small');small.textContent=row.version_note;reason.append(small);}tr.append(reason);
+     const batch=document.createElement('td');batch.className='spf-batch';batch.textContent=row.batch_id||'—';const time=document.createElement('small');time.textContent=row.at||'';batch.append(time);tr.append(batch);
+     $('spf-roster-body').append(tr);
+   });
+   if(!filtered.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=6;td.textContent='当前筛选没有学生';tr.append(td);$('spf-roster-body').append(tr);}
+   $('spf-roster-count').textContent=`${data.groups[key].label}：共 ${filtered.length} 人${query?'（已应用关键词筛选）':''}。点击学号查看详细流程。`;
+   $('spf-roster-page').textContent=`${pages?page+1:0} / ${pages}`;$('spf-roster-prev').disabled=page===0;$('spf-roster-next').disabled=page+1>=pages;
+   $('spf-roster-ids').value=filtered.map(row=>row.student_id).join('\n');
+   $('spf-roster-txt').disabled=!filtered.length;$('spf-roster-csv').disabled=!filtered.length;
+   $('spf-stats').querySelectorAll('button').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.group===key)));
+ }
+ async function refresh(){
+   if(loading)return;loading=true;$('spf-overview-refresh').disabled=true;$('spf-overview-note').className='';
+   $('spf-overview-note').textContent='正在核对全年级审核、图片版本与历史处理记录…';
+   try{
+     const updated=await SPF.get('overview');data=updated;const previous=$('spf-roster-group').value||'remaining';
+     $('spf-stats').replaceChildren();$('spf-roster-group').replaceChildren();
+     Object.entries(data.groups).forEach(([key,group])=>{
+       const option=document.createElement('option');option.value=key;option.textContent=group.label+'（'+group.count+'）';$('spf-roster-group').append(option);
+       const button=document.createElement('button');button.dataset.group=key;button.textContent=group.label;const count=document.createElement('strong');count.textContent=String(group.count);button.append(count);
+       button.onclick=()=>{$('spf-roster-group').value=key;page=0;render();};$('spf-stats').append(button);
+     });
+     $('spf-roster-group').value=previous in data.groups?previous:'remaining';
+     $('spf-overview-time').textContent='统计时间：'+data.generated_at;
+     const notes=[data.enabled?'审核归档保护已开启。':'审核归档保护未开启：请在主程序开启，已审核照片才能跳过处理。'];
+     if(data.outside_roster.length)notes.push(`另有 ${data.outside_roster.length} 个名单外学号未计入。`);
+     if(data.warnings.length)notes.push(`有 ${data.warnings.length} 项统计提示，历史记录可能不完整；下载名单前请核查。`);
+     $('spf-overview-note').textContent=notes.join(' ');$('spf-overview-note').className=data.warnings.length?'warning':'';
+     $('spf-warning-details').hidden=!data.warnings.length;$('spf-warning-list').replaceChildren();
+     data.warnings.forEach(item=>{const li=document.createElement('li');li.textContent=item.join('：');$('spf-warning-list').append(li);});render();
+   }catch(error){$('spf-overview-note').className='error';$('spf-overview-note').textContent=(data?'刷新失败，下面保留上次统计，不是实时数据。':'暂时无法统计。')+error.message;}
+   finally{loading=false;$('spf-overview-refresh').disabled=false;}
+ }
+ function save(text,suffix,mime){
+   const blob=new Blob(['\ufeff',text],{type:mime+';charset=utf-8'}),url=URL.createObjectURL(blob),link=document.createElement('a');
+   const label=data.groups[$('spf-roster-group').value].label;link.href=url;link.download='全年级_'+label+'_'+suffix;document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+ }
+ function csvCell(value){let text=String(value??'');if(/^\s*[=+@-]/.test(text))text="'"+text;return '"'+text.replaceAll('"','""')+'"';}
+ $('spf-roster-txt').onclick=()=>save(filtered.map(row=>row.student_id).join('\r\n')+'\r\n','学号.txt','text/plain');
+ $('spf-roster-csv').onclick=()=>{
+   const rows=[['学号','分类','人工审核状态','处理状态','处理说明','审核说明','版本说明','处理批次','记录时间','依据文件'],
+     ...filtered.map(row=>[row.student_id,row.category,SPF.labels[row.review_status]||row.review_status,row.processing_status,row.message,row.review_message,row.version_note,row.batch_id,row.at,row.evidence])];
+   save(rows.map(row=>row.map(csvCell).join(',')).join('\r\n')+'\r\n','明细.csv','text/csv');
+ };
+ $('spf-overview-refresh').onclick=refresh;$('spf-roster-group').onchange=()=>{page=0;render();};$('spf-roster-query').oninput=()=>{page=0;render();};
+ $('spf-roster-prev').onclick=()=>{page--;render();};$('spf-roster-next').onclick=()=>{page++;render();};window.addEventListener('focus',refresh);refresh();
+})();
+</script>
+"""
+
+
 def enhance_gallery_html(document: str) -> str:
     if 'id="spf-shared-search"' in document:
         return document
-    document = document.replace("</head>", SHARED_STYLE + "</head>", 1)
-    document = document.replace("</header>", "</header>" + search_markup("gallery"), 1)
-    return document.replace("</body>", SHARED_SCRIPT + "</body>", 1)
+    document = document.replace("</head>", SHARED_STYLE + OVERVIEW_STYLE + "</head>", 1)
+    document = document.replace("</header>", "</header>" + search_markup("gallery") + overview_markup(), 1)
+    return document.replace("</body>", SHARED_SCRIPT + OVERVIEW_SCRIPT + "</body>", 1)
 
 
 def review_page() -> str:

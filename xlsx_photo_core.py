@@ -51,7 +51,7 @@ NS = {
     "a": ART_NS,
 }
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 STATE_SCHEMA = 3
 MAX_IMAGE_BYTES = 30 * 1024 * 1024
 VOLATILE_QUERY_RE = re.compile(
@@ -1192,6 +1192,30 @@ def _execute_job(
             original_path = previous_original
         else:
             data = _fetch_source(row.source, options.timeout_seconds)
+            # A refreshed URL or a forced download is not proof of a new photo.
+            # Keep file timestamps and processing snapshots intact for identical bytes.
+            digest = hashlib.sha256(data).hexdigest()
+            if (change == "updated" and existing and previous_original and previous_original.is_file()
+                    and existing.get("original_sha256") == digest
+                    and previous_original.read_bytes() == data):
+                previous = existing.get("processing", {})
+                result.change = "unchanged"
+                result.status = "success"
+                result.message = "已重新下载核对，图片内容相同；保留原文件、处理结果和审核状态"
+                result.original_file = _relative(root, previous_original)
+                result.original_sha256 = digest
+                result.processed_file = previous.get("processed_file")
+                result.processing_status = previous.get("status", "pending")
+                result.processing_message = previous.get("message", "")
+                result.face_count = previous.get("face_count")
+                result.quality_status = previous.get("quality_status", "not_requested")
+                result.quality_reasons = previous.get("quality_reasons", [])
+                result.quality_metrics = previous.get("quality_metrics", {})
+                result.rotation_ccw = previous.get("rotation_ccw", 0)
+                result.detector = previous.get("detector", "not_used")
+                result.background_engine = previous.get("background_engine", "none")
+                result.step_files = previous.get("step_files", [])
+                return result
             extension = detect_image_extension(data, row.source.hint)
             original_path = root / "原始图片" / f"{row.student_id}{extension}"
             history = root / "历史版本" / batch_id / "原始图片"

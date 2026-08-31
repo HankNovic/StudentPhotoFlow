@@ -22,6 +22,8 @@ from photo_review import (
     review_queue, save_roster, set_review_enabled, student_detail, undo_review,
 )
 from review_web import enhance_gallery_html, review_page
+from export_reviewed_photos import (DeliveryError, choose_mode, export_delivery, find_previous_file,
+                                    resolve_source, roster_overview)
 from xlsx_photo_core import (
     APP_VERSION,
     ExportOptions,
@@ -199,10 +201,12 @@ class GalleryReportServer:
                             data = review_queue(root, query.get("filter", ["pending"])[0])
                         elif action == "student":
                             data = student_detail(root, query.get("student_id", [""])[0].strip())
+                        elif action == "overview":
+                            data = roster_overview(root)
                         else:
                             raise ReviewError("查询操作无效")
                         self.send_json(200, data)
-                    except (ReviewError, OSError) as exc:
+                    except (ReviewError, OSError, DeliveryError) as exc:
                         self.send_json(409, {"message": str(exc)})
                     return
                 parts = [urllib.parse.unquote(part) for part in parsed.path.split("/") if part]
@@ -362,6 +366,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--operation", choices=["export", "process"], default="export", help="export 只导出原图；process 只处理已导出的原图")
     parser.add_argument("--test-hivision-api", action="store_true", help="只测试 Hivision OpenAPI 和 /idphoto 参数兼容性")
     parser.add_argument("--output", help="输出目录")
+    parser.add_argument("--review-export", choices=["initial", "incremental", "lists"], help="导出审核结果：初次 / 新增 / 仅名单；--output 为已有源目录")
+    parser.add_argument("--delivery-output", help="审核照片交付或名单查询的保存父目录")
+    parser.add_argument("--previous-delivery", help="新增审核交付使用的历史累计学号 TXT")
     parser.add_argument("--sheet", help="工作表名称，默认第一张表")
     parser.add_argument("--header-row", type=int, default=1, help="表头行号，默认 1")
     parser.add_argument("--id-column", help="学号列：列字母、列序号或表头名称")
@@ -436,6 +443,13 @@ def _pipeline_options_from_args(args: argparse.Namespace) -> PipelineOptions:
 
 
 def _cli_main(args: argparse.Namespace) -> int:
+    if args.review_export:
+        if not args.output:
+            raise SystemExit("审核交付必须提供 --output 已有导出结果目录")
+        result = export_delivery(args.output, args.delivery_output, mode="incremental" if args.review_export == "incremental" else "initial",
+            previous_file=args.previous_delivery, lists_only=args.review_export == "lists")
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 2 if result["errors"] or result["query_warnings"] else 0
     if args.test_hivision_api:
         print(json.dumps(test_hivision_api(args.hivision_url, args.hivision_timeout), ensure_ascii=False, indent=2))
         return 0
@@ -848,10 +862,13 @@ class PhotoExporterApp:
 
     def _on_close(self) -> None:
         if self.busy:
+            close_note = ("正在导出审核结果。强制关闭会留下未完成的交付目录，不能交付或用作新增依据；"
+                          "源照片和审核状态不会修改。" if self.current_operation == "delivery" else
+                          "当前批次仍在运行。每名已完成学生都已写入恢复检查点；强制关闭后，"
+                          "下次点击同一阶段会跳过已完成项并继续。")
             confirmed = self.messagebox.askyesno(
                 "中断当前任务？",
-                "当前批次仍在运行。每名已完成学生都已写入恢复检查点；强制关闭后，"
-                "下次点击同一阶段会跳过已完成项并继续。\n\n确定立即关闭吗？",
+                close_note + "\n\n确定立即关闭吗？",
                 icon="warning",
             )
             if not confirmed:
@@ -963,6 +980,8 @@ class PhotoExporterApp:
         ttk.Button(config_actions, text="导出配置…", command=self.export_settings_file).pack(side="left", padx=(8, 0))
         ttk.Button(config_actions, text="导入配置…", command=self.import_settings_file).pack(side="left", padx=(8, 0))
         ttk.Button(config_actions, text="全年级名单 / 审核归档…", command=self.manage_grade_roster).pack(side="left", padx=(8, 0))
+        self.delivery_button = ttk.Button(config_actions, text="审核结果导出…", command=self.export_review_delivery)
+        self.delivery_button.pack(side="left", padx=(8, 0))
 
         content = ttk.Panedwindow(self.root, orient="vertical")
         content.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 8))
@@ -1286,6 +1305,7 @@ class PhotoExporterApp:
         self.inspect_button.configure(state=state)
         self.export_button.configure(state=state)
         self.process_button.configure(state=state)
+        self.delivery_button.configure(state=state)
         can_interrupt = busy and self.current_operation in {"export", "process"}
         self.cancel_button.configure(state="normal" if can_interrupt else "disabled")
         if not busy:
@@ -1618,6 +1638,67 @@ class PhotoExporterApp:
                 self._append_log(f"无法自动打开合集：{exc}")
         self.messagebox.showinfo(title, message)
 
+    def export_review_delivery(self) -> None:
+        """Portable users run the same exporter without a separate Python install."""
+        if self.busy:
+            return
+        try:
+            source = resolve_source(self.output_var.get().strip())
+            choice = choose_mode(self.root)
+            if choice is None:
+                return
+            destination = self.filedialog.askdirectory(parent=self.root, title="选择交付父目录：新增时选择上次的目录",
+                initialdir=str(source.parent))
+            if not destination:
+                return
+            previous = None
+            if choice == "incremental":
+                try:
+                    previous = find_previous_file(Path(destination))
+                except DeliveryError as exc:
+                    self.messagebox.showinfo("选择历史累计学号", str(exc), parent=self.root)
+                    previous = self.filedialog.askopenfilename(parent=self.root, title="选择审核通过学号 TXT",
+                        filetypes=[("累计学号名单", "*.txt")])
+                    if not previous:
+                        return
+        except (DeliveryError, OSError) as exc:
+            self.messagebox.showerror("无法导出审核结果", str(exc), parent=self.root)
+            return
+        self.current_operation = "delivery"
+        self._set_busy(True, "正在导出审核结果 / 综合名单…")
+        self.progress.configure(value=0)
+        self._append_log("审核结果交付：只读取源数据，不重新处理照片、不修改审核。")
+
+        def worker():
+            try:
+                result = export_delivery(source, destination,
+                    progress=lambda message: self.events.put(("delivery_progress", message)),
+                    mode="incremental" if choice == "incremental" else "initial",
+                    previous_file=previous, lists_only=choice == "lists")
+                self.events.put(("delivery_done", result))
+            except Exception as exc:
+                self.events.put(("error", ("审核结果导出失败", str(exc))))
+        threading.Thread(target=worker, name="review-delivery", daemon=True).start()
+
+    def _show_delivery_done(self, result: dict) -> None:
+        self._set_busy(False, "审核结果导出完成")
+        self.progress.configure(value=100)
+        message = (f"全年级 {result['roster_total']} 人；当前有效通过 {result['approved']} 人；"
+                   f"剩余未通过 {result['not_approved']} 人。\n"
+                   f"已处理但未通过 {result['processed_not_approved']} 人；本次导出照片 {result['exported']} 张。\n"
+                   f"照片导出异常 {result['errors']} 项；名单查询提示 {result['query_warnings']} 项。\n\n"
+                   + ("仅查询不生成累计交付名单，不影响下次新增。\n" if result['lists_only'] else
+                      f"累计名单：{result['cumulative_list']}\n") + f"结果目录：{result['output_dir']}")
+        self._append_log(message)
+        if result["errors"] or result["query_warnings"]:
+            message += "\n请检查导出异常.csv 和名单查询提示.csv。"
+        if self.messagebox.askyesno("审核结果导出完成", message + "\n\n打开结果文件夹？",
+                                   icon="warning" if result["errors"] or result["query_warnings"] else "info"):
+            try:
+                os.startfile(result["output_dir"])  # type: ignore[attr-defined]
+            except OSError as exc:
+                self.messagebox.showerror("无法打开结果目录", str(exc))
+
     def _poll_events(self) -> None:
         try:
             while True:
@@ -1637,6 +1718,11 @@ class PhotoExporterApp:
                     self._append_log(message)
                 elif event == "export_done":
                     self._show_export_done(payload)
+                elif event == "delivery_progress":
+                    self.progress_text_var.set(payload)
+                    self._append_log(payload)
+                elif event == "delivery_done":
+                    self._show_delivery_done(payload)
                 elif event == "web_reprocess":
                     self._start_selected_processing(payload)
                 elif event == "api_test_done":
@@ -1703,7 +1789,7 @@ def main() -> int:
     _startup_trace("main_enter")
     parser = build_parser()
     args = parser.parse_args()
-    if args.cli or args.inspect:
+    if args.cli or args.inspect or args.review_export:
         return _cli_main(args)
     app = PhotoExporterApp(args.xlsx)
     _startup_trace("mainloop_enter")
