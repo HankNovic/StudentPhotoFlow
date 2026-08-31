@@ -8,7 +8,7 @@ $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BuildRoot = Join-Path $ProjectRoot ".portable-build"
 $VenvRoot = Join-Path $BuildRoot "venv"
 $ReleaseRoot = Join-Path $ProjectRoot "release"
-$Version = "1.9.0"
+$Version = "1.10.0"
 # Keep earlier release builds intact; these directories contain generated files only.
 $DistRoot = Join-Path $BuildRoot "dist-v$Version"
 

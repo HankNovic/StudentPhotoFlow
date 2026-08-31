@@ -15,6 +15,10 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from delivery_state import (DELIVERY_LOCK_FILE, DeliveryStateError, ids_digest,
+                            load_delivery_locks as _load_delivery_locks, read_delivery_ids,
+                            validate_delivery_locks)
+
 ROSTER_FILE = "grade_roster.json"
 REVIEW_FILE = "review_state.json"
 
@@ -180,6 +184,70 @@ def load_roster(root: Path) -> dict:
     return value
 
 
+def load_delivery_locks(root: Path) -> dict:
+    try:
+        return _load_delivery_locks(root)
+    except DeliveryStateError as exc:
+        raise ReviewError(str(exc)) from exc
+
+
+def read_delivered_file(path: Path) -> list[str]:
+    ids = read_delivery_ids(path) if path.suffix.lower() == ".json" else read_roster_file(path)
+    return validate_roster(ids)
+
+
+def _write_delivery_change(root: Path, state: dict, ids: list[str], action: dict) -> dict:
+    """Caller holds the output lock. Back up previous JSON before atomic replacement."""
+    target = root / DELIVERY_LOCK_FILE
+    if target.exists():
+        atomic_json(root / "交付锁定历史" / f"{action['id']}_before.json", state)
+    updated = dict(schema_version=1, student_ids=ids, count=len(ids), sha256=ids_digest(ids),
+                   revision=action["id"], updated_at=action["at"], actions=state["actions"] + [action])
+    validate_delivery_locks(updated)
+    atomic_json(target, updated)
+    return updated
+
+
+def import_delivery_locks(root: Path, ids: list[str], *, confirmed_sent: bool,
+                          source: str = "手动输入") -> dict:
+    ids = validate_roster(ids)
+    if not confirmed_sent:
+        raise ReviewError("必须确认这些学生的照片已经实际交付；仅处理通过或仅导出不等于已发送")
+    if len({sid.casefold() for sid in ids}) != len(ids):
+        raise ReviewError("学号大小写冲突，请核对名单")
+    with output_write_lock(root):
+        roster = load_roster(root)
+        if not roster:
+            raise ReviewError("请先校验保存全年级名单，再导入已交付名单；无需开启审核归档开关")
+        outside = sorted(set(ids) - set(roster["student_ids"]))
+        if outside:
+            raise ReviewError("以下学号不在已保存的全年级名单内，未导入：" + "、".join(outside[:20]))
+        state = load_delivery_locks(root)
+        locked = set(state["student_ids"])
+        added = [sid for sid in ids if sid not in locked]
+        if added:
+            action = dict(id=uuid.uuid4().hex, action="import", at=timestamp(), student_ids=added,
+                          source=source, input_count=len(ids), input_sha256=ids_digest(ids), confirmed_sent=True)
+            state = _write_delivery_change(root, state, state["student_ids"] + added, action)
+        return dict(added=len(added), already_locked=len(ids) - len(added), total=state["count"], revision=state["revision"])
+
+
+def unlock_delivery_ids(root: Path, ids: list[str], *, reason: str, expected_revision: str) -> dict:
+    ids = validate_roster(ids)
+    if not reason.strip():
+        raise ReviewError("手动解除交付锁定必须填写原因")
+    with output_write_lock(root):
+        state = load_delivery_locks(root)
+        if state["revision"] != expected_revision:
+            raise ReviewError("交付锁定名单已经变化，请刷新后再解除")
+        missing = set(ids) - set(state["student_ids"])
+        if missing:
+            raise ReviewError("以下学号当前未锁定，未执行解除：" + "、".join(sorted(missing)[:20]))
+        action = dict(id=uuid.uuid4().hex, action="unlock", at=timestamp(), student_ids=ids, reason=reason.strip())
+        state = _write_delivery_change(root, state, [sid for sid in state["student_ids"] if sid not in set(ids)], action)
+        return dict(unlocked=len(ids), total=state["count"], revision=state["revision"])
+
+
 def save_roster(root: Path, ids: list[str], *, confirmed_complete: bool, source: str = "手动输入") -> dict:
     ids = validate_roster(ids)
     if not confirmed_complete:
@@ -281,6 +349,7 @@ def _export_state(root: Path) -> dict:
 
 
 def student_detail(root: Path, sid: str) -> dict:
+    delivered = sid in set(load_delivery_locks(root)["student_ids"])
     roster, reviews = archive_context(root)
     state = _export_state(root)
     record = state["records"].get(sid, {})
@@ -290,13 +359,16 @@ def student_detail(root: Path, sid: str) -> dict:
     return {
         "student_id": sid, "in_roster": sid in roster.get("student_ids", []),
         "exists": bool(record), "review_enabled": bool(roster.get("enabled")),
-        "status": review_status(root, sid, record, reviews, digest=True),
+        "status": "delivered" if delivered else review_status(root, sid, record, reviews, digest=True),
+        "delivery_locked": delivered,
+        "saved_review_status": reviews.get("reviews", {}).get(sid, {}).get("status", "pending"),
         "revision": reviews.get("reviews", {}).get(sid, {}).get("revision", ""),
         "version": version, "snapshot": snapshot,
         "result_file": snapshot["result"].get("file"), "original_file": record.get("original_file"),
-        "can_approve": bool(snapshot["original"] and snapshot["result"]),
+        "can_approve": not delivered and bool(snapshot["original"] and snapshot["result"]),
         "processing_status": process.get("status", "pending"),
-        "message": process.get("message", "尚未导出或处理"),
+        "message": ("历史已交付锁定：跳过处理、审核与照片交付；不代表当前新照片已通过。仅可在主程序手动解锁。"
+                    if delivered else process.get("message", "尚未导出或处理")),
         "quality_status": process.get("quality_status", "not_requested"),
         "steps": process.get("step_files", []),
         "last_batch_id": record.get("last_batch_id"),
@@ -308,11 +380,16 @@ def review_queue(root: Path, filter_name: str = "pending") -> dict:
     if filter_name not in {"all", "pending", "approved", "rejected", "skipped", "stale"}:
         raise ReviewError("审核筛选条件无效")
     roster, reviews = archive_context(root)
+    delivered = set(load_delivery_locks(root)["student_ids"])
     records = _export_state(root)["records"]
     counts = {"total": len(roster.get("student_ids", [])), "processed": 0, "approved": 0,
-              "rejected": 0, "skipped": 0, "pending": 0, "stale": 0, "missing": 0}
+              "rejected": 0, "skipped": 0, "pending": 0, "stale": 0, "missing": 0, "delivered": 0}
     ids, statuses = [], {}
     for sid in roster.get("student_ids", []):
+        if sid in delivered:
+            statuses[sid] = "delivered"
+            counts["delivered"] += 1
+            continue  # Even "all" is a review queue, never include delivered students.
         record = records.get(sid, {})
         process = record.get("processing", {})
         attempted = process.get("status") in {"success", "warning", "rejected", "failed"} or bool(process.get("last_processed_at"))
@@ -329,7 +406,7 @@ def review_queue(root: Path, filter_name: str = "pending") -> dict:
     undoable = [action for action in reviews["actions"] if not action.get("undone")]
     return {"enabled": bool(roster.get("enabled")), "roster_saved": bool(roster), "counts": counts,
             "student_ids": ids, "statuses": statuses,
-            "last_action_id": undoable[-1]["id"] if undoable else None}
+            "last_action_id": undoable[-1]["id"] if undoable and undoable[-1]["student_id"] not in delivered else None}
 
 
 def mark_review(root: Path, sid: str, decision: str, expected_version: str, expected_revision: str) -> dict:
@@ -337,6 +414,8 @@ def mark_review(root: Path, sid: str, decision: str, expected_version: str, expe
         raise ReviewError("审核操作无效")
     with output_write_lock(root):
         detail = student_detail(root, sid)
+        if detail["delivery_locked"]:
+            raise ReviewError("该学号已交付锁定，不能重新审核；请在主程序手动解除交付锁定")
         if not detail["review_enabled"] or not detail["in_roster"]:
             raise ReviewError("审核归档未启用，或学号不在已保存的全年级名单中")
         if detail["version"] != expected_version or detail["revision"] != expected_revision:
@@ -388,6 +467,8 @@ def undo_review(root: Path, action_id: str) -> dict:
             raise ReviewError("最近审核操作已经变化，请刷新后撤销")
         action = actions[-1]
         sid = action["student_id"]
+        if sid in set(load_delivery_locks(root)["student_ids"]):
+            raise ReviewError("该学号已交付锁定，不能撤销审核；请先在主程序手动解除交付锁定")
         if state["reviews"].get(sid, {}).get("revision") != action_id:
             raise ReviewError("该学号已有新的审核，不能撤销旧操作")
         if action["previous"] is None:

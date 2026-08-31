@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from xml.etree import ElementTree as ET
-from photo_review import archive_context, is_archived, locked_batch
+from photo_review import archive_context, is_archived, locked_batch, load_delivery_locks
 
 from photo_pipeline import (
     PIPELINE_VERSION,
@@ -51,7 +51,7 @@ NS = {
     "a": ART_NS,
 }
 
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 STATE_SCHEMA = 3
 MAX_IMAGE_BYTES = 30 * 1024 * 1024
 VOLATILE_QUERY_RE = re.compile(
@@ -1449,6 +1449,7 @@ def _write_gallery(
     change_labels = {
         "new": "新增", "updated": "更新", "repair": "修复",
         "reprocessed": "重新处理", "unchanged": "未变化", "invalid": "失败", "archived": "已审核归档（跳过处理）",
+        "delivered": "已交付锁定（跳过处理）",
     }
     visible = [item for item in results if item.change != "unchanged" or item.status == "failed"]
     for item in visible:
@@ -1516,6 +1517,7 @@ def _write_gallery(
         f"重新处理 {summary.get('reprocessed', 0)}",
         f"未变化 {summary.get('unchanged', 0)}",
         f"归档跳过 {summary.get('archived_skipped', 0)}",
+        f"已交付跳过 {summary.get('delivered_skipped', 0)}",
         f"需重传 {summary.get('quality_rejected', 0)}",
         f"失败 {summary.get('failed', 0)}",
     ])
@@ -2098,6 +2100,7 @@ def run_processing(
     if not records:
         raise ExportError("当前状态中没有已导出的学生原图")
     review_context = archive_context(options.output_dir)
+    delivered = set(load_delivery_locks(options.output_dir)["student_ids"])
 
     batch_id = now_local().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     batch_dir = options.output_dir / "批次记录" / batch_id
@@ -2132,6 +2135,14 @@ def run_processing(
         if selected_ids is not None and student_id not in selected_ids:
             continue
         row_number = int(existing.get("row", 0) or 0)
+        if student_id in delivered:
+            unchanged_results.append(JobResult(student_id=student_id, row_number=row_number,
+                change="delivered", status="success", executed=False,
+                original_file=existing.get("original_file"),
+                processed_file=existing.get("processing", {}).get("processed_file"),
+                message="历史已交付锁定，跳过处理（强制处理/改参/新原图均不解除）",
+                processing_status="delivered", processing_message="历史已交付锁定，跳过处理"))
+            continue  # Before checking missing originals, input version, resume, or force flags.
         original_path = _safe_state_file(options.output_dir, existing.get("original_file"))
         if original_path is None or not original_path.is_file():
             immediate.append(JobResult(
@@ -2268,6 +2279,7 @@ def run_processing(
     summary = {
         "total_rows": len(ordered_records) if selected_ids is None else len(selected_ids),
         "archived_skipped": counts.get("archived", 0),
+        "delivered_skipped": counts.get("delivered", 0),
         "new": 0,
         "updated": 0,
         "repair": 0,

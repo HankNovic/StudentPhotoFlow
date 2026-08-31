@@ -28,7 +28,7 @@ SHARED_SCRIPT = r"""
 <script>
 (() => {
  const parts=location.pathname.split('/'); const token=parts[1]==='reports'?parts[2]:'';
- const labels={approved:'已通过 · 已归档',rejected:'审核不通过',skipped:'已跳过',pending:'待审核',stale:'图片已变化 · 需重新审核'};
+ const labels={delivered:'历史已交付 · 已锁定',approved:'已通过 · 已归档',rejected:'审核不通过',skipped:'已跳过',pending:'待审核',stale:'图片已变化 · 需重新审核'};
  const fileUrl=(path)=>'/reports/'+token+'/output/'+String(path).split('/').map(encodeURIComponent).join('/');
  async function get(action, values={}) {
    if(!token || location.protocol!=='http:') throw new Error('请保持主程序打开，并从主程序“查看最新批次”进入网页');
@@ -56,7 +56,7 @@ SHARED_SCRIPT = r"""
  async function refreshGate() {
    try {
      const data=await get('queue',{filter:'all'});const c=data.counts;
-     document.getElementById('spf-gate').textContent=data.enabled?`全年级 ${c.total} 人｜有处理记录 ${c.processed}｜归档 ${c.approved}｜待处理 ${c.missing}`:'审核未启用：请在主程序校验保存全年级名单后开启';
+     document.getElementById('spf-gate').textContent=`全年级 ${c.total} 人｜已交付锁定 ${c.delivered||0}｜剩余待交付 ${c.total-(c.delivered||0)}｜`+(data.enabled?`归档 ${c.approved}｜待处理 ${c.missing}`:'审核未启用；已交付锁定仍有效');
      const link=document.getElementById('spf-review-link');link.href=data.enabled?'/reports/'+token+'/review.html':'#';link.dataset.enabled=String(data.enabled);
      document.querySelectorAll('article.card').forEach(card=>{
        let badge=card.querySelector('.spf-review-badge');if(!badge){badge=document.createElement('span');badge.className='spf-review-badge';(card.querySelector('.meta')||card).append(badge);}
@@ -111,18 +111,18 @@ OVERVIEW_STYLE = """
 def overview_markup() -> str:
     return """<section class="spf-overview" id="spf-overview" aria-label="全年级综合统计">
 <div class="spf-bar"><h2>全年级综合统计与学号</h2><button id="spf-overview-refresh">刷新全量统计</button><small id="spf-overview-time"></small></div>
-<p>跨全部历史批次，以已保存的全年级名单为准。全年级 = 有效已归档 + 剩余未通过；其余分类可交叉，不要相加。统计不会修改审核。</p>
+<p>跨全部历史批次，以已保存的全年级名单为准。全年级 = 已交付锁定 + 剩余待交付；剩余待交付 = 有效已归档（未锁定）+ 未通过（未锁定）。其余分类可交叉。已交付不等于当前新照片已审核通过。</p>
 <p id="spf-overview-note" role="status">正在核对全年级审核、图片版本与历史处理记录…</p>
 <details id="spf-warning-details" hidden><summary>查看统计提示</summary><ul id="spf-warning-list"></ul></details>
 <div class="spf-stats" id="spf-stats"></div>
 <div class="spf-bar"><label>学号范围 <select id="spf-roster-group" aria-label="综合名单范围"></select></label>
 <input id="spf-roster-query" aria-label="筛选综合名单" placeholder="筛选学号、分类或错误原因" autocomplete="off">
-<button id="spf-roster-txt" disabled>导出筛选学号 TXT</button><button id="spf-roster-csv" disabled>导出筛选明细 CSV</button></div>
+<button id="spf-roster-json" disabled>导出筛选 JSON</button><button id="spf-roster-txt" disabled>导出筛选学号 TXT</button><button id="spf-roster-csv" disabled>导出筛选明细 CSV</button></div>
 <p id="spf-roster-count">点击统计卡片查看相应学号；点击学号查看详细流程。</p>
 <div class="spf-table-wrap"><table><thead><tr><th>学号 / 流程</th><th>分类</th><th>人工审核</th><th>处理状态</th><th>原因 / 版本说明</th><th>处理批次</th></tr></thead><tbody id="spf-roster-body"></tbody></table></div>
-<div class="spf-bar"><button id="spf-roster-prev" disabled>上一页</button><span id="spf-roster-page">0 / 0</span><button id="spf-roster-next" disabled>下一页</button><small>每页 20 人；TXT / CSV 包含所有符合筛选的学号，不仅本页。</small></div>
+<div class="spf-bar"><button id="spf-roster-prev" disabled>上一页</button><span id="spf-roster-page">0 / 0</span><button id="spf-roster-next" disabled>下一页</button><small>每页 20 人；JSON / TXT / CSV 包含所有符合筛选的学号，不仅本页。</small></div>
 <details><summary>展开当前筛选的全部学号（可复制）</summary><textarea id="spf-roster-ids" aria-label="筛选后的全部学号" readonly></textarea></details>
-<p>需要按学号导出已归档照片、初次导入或新增交付：在主程序点击“审核结果导出…”。</p>
+<p>历史已交付名单：主程序“已交付锁定…”导入，手动解锁需填写原因。照片交付：主程序“审核结果导出…”。已锁定者在初次、新增交付中均跳过。</p>
 </section>"""
 
 
@@ -130,7 +130,7 @@ OVERVIEW_SCRIPT = r"""
 <script>
 (() => {
  const $=id=>document.getElementById(id);if(!$('spf-overview'))return;
- const processLabels={success:'成功',warning:'警告 / 异常',rejected:'机器不通过',failed:'失败',error:'失败',pending:'等待处理',not_requested:'未请求',unknown:'结果待核实'};
+ const processLabels={delivered:'已交付 · 跳过',success:'成功',warning:'警告 / 异常',rejected:'机器不通过',failed:'失败',error:'失败',pending:'等待处理',not_requested:'未请求',unknown:'结果待核实'};
  let data=null,filtered=[],page=0,loading=false;const pageSize=20;
  function render(){
    if(!data)return;const key=$('spf-roster-group').value,query=$('spf-roster-query').value.trim().toLowerCase();
@@ -151,6 +151,7 @@ OVERVIEW_SCRIPT = r"""
    $('spf-roster-page').textContent=`${pages?page+1:0} / ${pages}`;$('spf-roster-prev').disabled=page===0;$('spf-roster-next').disabled=page+1>=pages;
    $('spf-roster-ids').value=filtered.map(row=>row.student_id).join('\n');
    $('spf-roster-txt').disabled=!filtered.length;$('spf-roster-csv').disabled=!filtered.length;
+   $('spf-roster-json').disabled=!filtered.length;
    $('spf-stats').querySelectorAll('button').forEach(button=>button.setAttribute('aria-pressed',String(button.dataset.group===key)));
  }
  async function refresh(){
@@ -166,7 +167,7 @@ OVERVIEW_SCRIPT = r"""
      });
      $('spf-roster-group').value=previous in data.groups?previous:'remaining';
      $('spf-overview-time').textContent='统计时间：'+data.generated_at;
-     const notes=[data.enabled?'审核归档保护已开启。':'审核归档保护未开启：请在主程序开启，已审核照片才能跳过处理。'];
+     const notes=[data.enabled?'审核归档保护已开启。':'审核归档保护未开启：请在主程序开启，普通已审核照片才能跳过处理。',`独立已交付锁定 ${data.groups.delivered.count} 人，不受审核开关、新原图或改参影响。`];
      if(data.outside_roster.length)notes.push(`另有 ${data.outside_roster.length} 个名单外学号未计入。`);
      if(data.warnings.length)notes.push(`有 ${data.warnings.length} 项统计提示，历史记录可能不完整；下载名单前请核查。`);
      $('spf-overview-note').textContent=notes.join(' ');$('spf-overview-note').className=data.warnings.length?'warning':'';
@@ -181,6 +182,7 @@ OVERVIEW_SCRIPT = r"""
  }
  function csvCell(value){let text=String(value??'');if(/^\s*[=+@-]/.test(text))text="'"+text;return '"'+text.replaceAll('"','""')+'"';}
  $('spf-roster-txt').onclick=()=>save(filtered.map(row=>row.student_id).join('\r\n')+'\r\n','学号.txt','text/plain');
+ $('spf-roster-json').onclick=()=>save(JSON.stringify({schema_version:1,kind:'roster_query',group:$('spf-roster-group').value,generated_at:data.generated_at,student_ids:filtered.map(row=>row.student_id),rows:filtered},null,2),'名单.json','application/json');
  $('spf-roster-csv').onclick=()=>{
    const rows=[['学号','分类','人工审核状态','处理状态','处理说明','审核说明','版本说明','处理批次','记录时间','依据文件'],
      ...filtered.map(row=>[row.student_id,row.category,SPF.labels[row.review_status]||row.review_status,row.processing_status,row.message,row.review_message,row.version_note,row.batch_id,row.at,row.evidence])];
@@ -220,7 +222,7 @@ main{max-width:1100px;margin:auto;padding:0 20px 24px}.review-card{background:wh
 <script>
 (() => {
  const $=id=>document.getElementById(id);let ids=[],cursor=0,current=null,back=[],lastAction=null,busy=false,request=0,enabled=false,imageReady=false;
- function controls(){const can=enabled&&current&&current.in_roster&&current.exists&&!busy;
+ function controls(){const can=enabled&&current&&current.in_roster&&current.exists&&!current.delivery_locked&&!busy;
    $('review-yes').disabled=!can||!current.can_approve||!imageReady;$('review-no').disabled=!can;$('review-skip').disabled=!can;
    $('review-previous').disabled=busy||!back.length;$('review-undo').disabled=busy||!lastAction||!enabled;
  }
@@ -229,11 +231,11 @@ main{max-width:1100px;margin:auto;padding:0 20px 24px}.review-card{background:wh
    try{const detail=await SPF.get('student',{student_id:sid});if(nonce!==request)return;
      if(remember&&current&&current.student_id!==sid)back.push(current.student_id);current=detail;enabled=detail.review_enabled;
      $('review-id').textContent=sid;$('review-status').textContent=SPF.labels[detail.status]||detail.status;
-     const img=$('review-image'),file=detail.result_file||detail.original_file;img.hidden=!file;
+     const img=$('review-image'),file=(detail.delivery_locked?detail.archive_file:null)||detail.result_file||detail.original_file;img.hidden=!file;
      img.onload=()=>{if(nonce===request){imageReady=true;controls();}};
      img.onerror=()=>{if(nonce===request){imageReady=false;controls();$('review-error').textContent='图片加载失败，请刷新后再审核。';}};
      if(file)img.src=SPF.fileUrl(file)+'?v='+detail.version;
-     $('review-note').textContent=(detail.result_file?'最终结果':'无有效最终结果；仅显示原图，不能通过归档')+'\n'+detail.message;
+     $('review-note').textContent=(detail.delivery_locked?'已交付锁定，仅查看，不能重复标记':(detail.result_file?'最终结果':'无有效最终结果；仅显示原图，不能通过归档'))+'\n'+detail.message;
      $('review-position').textContent=`队列 ${Math.min(cursor+1,ids.length)}/${ids.length}｜${detail.in_roster?'全年级名单内':'名单外，不可审核'}`;
      SPF.detailView(detail,$('review-detail'));
    }catch(error){$('review-error').textContent=error.message;current=null;$('review-id').textContent=sid;$('review-image').hidden=true;$('review-detail').replaceChildren();}

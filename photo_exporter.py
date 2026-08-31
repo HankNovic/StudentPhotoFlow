@@ -20,6 +20,7 @@ from photo_pipeline import HIVISION_FACE_MODELS, HIVISION_MATTING_MODELS, Pipeli
 from photo_review import (
     ReviewError, load_roster, mark_review, parse_roster_text, read_roster_file,
     review_queue, save_roster, set_review_enabled, student_detail, undo_review,
+    import_delivery_locks, load_delivery_locks, read_delivered_file, unlock_delivery_ids, atomic_json,
 )
 from review_web import enhance_gallery_html, review_page
 from export_reviewed_photos import (DeliveryError, choose_mode, export_delivery, find_previous_file,
@@ -369,6 +370,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-export", choices=["initial", "incremental", "lists"], help="导出审核结果：初次 / 新增 / 仅名单；--output 为已有源目录")
     parser.add_argument("--delivery-output", help="审核照片交付或名单查询的保存父目录")
     parser.add_argument("--previous-delivery", help="新增审核交付使用的历史累计学号 TXT")
+    parser.add_argument("--import-delivered", help="导入已实际交付学号 JSON/TXT/CSV/XLSX 并锁定；必须同时 --confirm-delivered")
+    parser.add_argument("--confirm-delivered", action="store_true", help="确认导入名单的照片已经实际发送（非仅导出）")
+    parser.add_argument("--unlock-delivered", help="手动解锁名单文件；必须提供 --unlock-reason 和 --confirm-unlock")
+    parser.add_argument("--unlock-reason", default="", help="解除交付锁定的原因，写入 JSON 历史")
+    parser.add_argument("--confirm-unlock", action="store_true", help="确认手动解除指定学号的交付锁定")
     parser.add_argument("--sheet", help="工作表名称，默认第一张表")
     parser.add_argument("--header-row", type=int, default=1, help="表头行号，默认 1")
     parser.add_argument("--id-column", help="学号列：列字母、列序号或表头名称")
@@ -443,6 +449,21 @@ def _pipeline_options_from_args(args: argparse.Namespace) -> PipelineOptions:
 
 
 def _cli_main(args: argparse.Namespace) -> int:
+    if args.import_delivered or args.unlock_delivered:
+        if not args.output or (args.import_delivered and args.unlock_delivered) or args.review_export:
+            raise SystemExit("请提供 --output 数据目录；导入锁定、解除锁定、照片交付必须分开执行")
+        root = Path(args.output).resolve()
+        path = Path(args.import_delivered or args.unlock_delivered)
+        ids = read_delivered_file(path)
+        if args.import_delivered:
+            result = import_delivery_locks(root, ids, confirmed_sent=args.confirm_delivered, source=path.name)
+        else:
+            if not args.confirm_unlock:
+                raise SystemExit("解除锁定必须明确提供 --confirm-unlock")
+            result = unlock_delivery_ids(root, ids, reason=args.unlock_reason,
+                                         expected_revision=load_delivery_locks(root)["revision"])
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
     if args.review_export:
         if not args.output:
             raise SystemExit("审核交付必须提供 --output 已有导出结果目录")
@@ -844,6 +865,135 @@ class PhotoExporterApp:
         except ReviewError as exc:
             status.set(str(exc))
 
+    def manage_delivery_locks(self) -> None:
+        if self.busy:
+            self.messagebox.showwarning("任务运行中", "请先完成或中断任务，再管理已交付锁定。")
+            return
+        if not self.output_var.get().strip():
+            self.messagebox.showwarning("请选择输出目录", "已交付锁定记录保存在当前导出结果目录。")
+            return
+        root = Path(self.output_var.get()).resolve()
+        try:
+            roster = load_roster(root)
+            state = load_delivery_locks(root)
+            if not roster:
+                raise ReviewError("请先校验保存全年级学号名单；不需要重新审核，也不需要开启归档开关。")
+        except Exception as exc:
+            self.messagebox.showerror("无法管理交付锁定", str(exc))
+            return
+        tk, ttk = self.tk, self.ttk
+        window = tk.Toplevel(self.root)
+        window.title("历史已交付名单 · 独立锁定")
+        window.geometry("800x630")
+        window.minsize(700, 560)
+        window.transient(self.root)
+        window.grab_set()
+        frame = ttk.Frame(window, padding=18)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(3, weight=1)
+        ttk.Label(frame, text=f"当前数据目录：{root}", wraplength=740).grid(row=0, column=0, sticky="w")
+        ttk.Label(frame, text="导入已实际发送的学号 JSON / TXT / CSV / XLSX，或粘贴一行一个学号。\n"
+                  "锁定后跳过处理、审核队列和照片交付；强制下载、改参、关闭审核保护均不解除。\n"
+                  "这不是把当前照片改为审核通过。只导出、尚未发送的名单请勿锁定。",
+                  wraplength=740).grid(row=1, column=0, sticky="w", pady=8)
+        status = tk.StringVar()
+        ttk.Label(frame, textvariable=status, wraplength=740).grid(row=2, column=0, sticky="w", pady=6)
+        editor = tk.Text(frame, wrap="none", height=15)
+        editor.grid(row=3, column=0, sticky="nsew")
+        confirmed = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame, text="我确认输入名单的照片已经实际交付，后续不再重复处理、审核或发送", variable=confirmed).grid(row=4, column=0, sticky="w", pady=10)
+        actions = ttk.Frame(frame)
+        actions.grid(row=5, column=0, sticky="w", pady=5)
+        maintenance = ttk.Frame(frame)
+        maintenance.grid(row=6, column=0, sticky="w", pady=8)
+        source = {"name": "手动输入"}
+
+        def refresh():
+            nonlocal state
+            state = load_delivery_locks(root)
+            in_grade = len(set(state["student_ids"]) & set(load_roster(root)["student_ids"]))
+            status.set(f"全年级 {roster['count']} 人｜已交付锁定 {in_grade} 人｜剩余待交付 {roster['count'] - in_grade} 人\n"
+                       "输入区尚未保存；记录存于 delivered_state.json，变更前自动备份，解锁保留历史。")
+
+        def import_file():
+            path = self.filedialog.askopenfilename(parent=window, title="选择已经交付的学号名单",
+                filetypes=[("学号名单", "*.json *.txt *.csv *.xlsx"), ("所有文件", "*.*")])
+            if not path:
+                return
+            try:
+                ids = read_delivered_file(Path(path))
+                editor.delete("1.0", "end")
+                editor.insert("1.0", "\n".join(ids))
+                source["name"] = Path(path).name
+                confirmed.set(False)
+                status.set(f"已读取 {len(ids)} 个学号，尚未锁定。请确认已实际交付后点击“确认导入并锁定”。")
+            except Exception as exc:
+                self.messagebox.showerror("导入失败", str(exc), parent=window)
+
+        def save():
+            try:
+                ids = parse_roster_text(editor.get("1.0", "end-1c"))
+                if not confirmed.get():
+                    raise ReviewError("请勾选确认这些照片已经实际交付")
+                if not self.messagebox.askyesno("确认已交付锁定", f"即将按名单锁定 {len(ids)} 人（已有锁定不会重复添加）。\n"
+                        "这些学号将跳过处理、审核和照片交付，直到手动解锁。确认？", parent=window):
+                    return
+                result = import_delivery_locks(root, ids, confirmed_sent=True, source=source["name"])
+                refresh()
+                confirmed.set(False)
+                self._append_log(f"已交付锁定：新增 {result['added']} 人，原已锁定 {result['already_locked']} 人，总计 {result['total']} 人。")
+            except Exception as exc:
+                self.messagebox.showerror("锁定未保存", str(exc), parent=window)
+
+        def show_locked():
+            try:
+                refresh()
+                editor.delete("1.0", "end")
+                editor.insert("1.0", "\n".join(state["student_ids"]))
+                confirmed.set(False)
+                source["name"] = "当前锁定名单"
+            except Exception as exc:
+                self.messagebox.showerror("读取失败", str(exc), parent=window)
+
+        def unlock():
+            from tkinter import simpledialog
+            try:
+                ids = parse_roster_text(editor.get("1.0", "end-1c"))
+                if not self.messagebox.askyesno("手动解除交付锁定", f"将解除输入区 {len(ids)} 人的交付锁定。\n"
+                        "他们会恢复普通处理/审核规则；旧累计交付TXT仍会排除已交付者，不会被自动改写。\n确认解除？", parent=window):
+                    return
+                reason = simpledialog.askstring("解锁原因", "请输入原因（保存至 JSON 操作历史）：", parent=window)
+                if reason is None:
+                    return
+                result = unlock_delivery_ids(root, ids, reason=reason, expected_revision=state["revision"])
+                refresh()
+                confirmed.set(False)
+                self._append_log(f"手动解除交付锁定 {result['unlocked']} 人，仍锁定 {result['total']} 人。")
+            except Exception as exc:
+                self.messagebox.showerror("未解除锁定", str(exc), parent=window)
+
+        def export_json():
+            try:
+                refresh()
+                path = self.filedialog.asksaveasfilename(parent=window, title="导出锁定记录 JSON",
+                    initialfile="已交付锁定名单.json", defaultextension=".json", filetypes=[("JSON", "*.json")])
+                if path:
+                    target = Path(path).resolve()
+                    if target == root or root in target.parents:
+                        raise ReviewError("请导出到数据目录之外，避免覆盖运行记录")
+                    atomic_json(target, state)
+            except Exception as exc:
+                self.messagebox.showerror("导出失败", str(exc), parent=window)
+
+        ttk.Button(actions, text="导入名单…", command=import_file).pack(side="left")
+        ttk.Button(actions, text="确认导入并锁定", command=save).pack(side="left", padx=8)
+        ttk.Button(actions, text="查看当前锁定名单", command=show_locked).pack(side="left")
+        ttk.Button(maintenance, text="导出锁定 JSON…", command=export_json).pack(side="left")
+        ttk.Button(maintenance, text="解除输入区学号的锁定…", command=unlock).pack(side="left", padx=8)
+        ttk.Button(maintenance, text="完成", command=window.destroy).pack(side="left")
+        refresh()
+
     def _schedule_settings_save(self, *_args: Any) -> None:
         if self.settings_save_job is not None:
             try:
@@ -982,6 +1132,8 @@ class PhotoExporterApp:
         ttk.Button(config_actions, text="全年级名单 / 审核归档…", command=self.manage_grade_roster).pack(side="left", padx=(8, 0))
         self.delivery_button = ttk.Button(config_actions, text="审核结果导出…", command=self.export_review_delivery)
         self.delivery_button.pack(side="left", padx=(8, 0))
+        self.delivery_lock_button = ttk.Button(config_actions, text="已交付锁定…", command=self.manage_delivery_locks)
+        self.delivery_lock_button.pack(side="left", padx=(8, 0))
 
         content = ttk.Panedwindow(self.root, orient="vertical")
         content.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 8))
@@ -1306,6 +1458,7 @@ class PhotoExporterApp:
         self.export_button.configure(state=state)
         self.process_button.configure(state=state)
         self.delivery_button.configure(state=state)
+        self.delivery_lock_button.configure(state=state)
         can_interrupt = busy and self.current_operation in {"export", "process"}
         self.cancel_button.configure(state="normal" if can_interrupt else "disabled")
         if not busy:
@@ -1617,6 +1770,7 @@ class PhotoExporterApp:
                 f"处理批次 {result.batch_id} 完成：本次处理 {summary['reprocessed']}，"
                 f"参数未变 {summary['unchanged']}，需重传 {summary.get('quality_rejected', 0)}，"
                 f"归档跳过 {summary.get('archived_skipped', 0)}，"
+                f"已交付跳过 {summary.get('delivered_skipped', 0)}，"
                 f"警告 {summary.get('processing_warnings', 0)}，失败 {summary['failed']}。"
             )
         else:
@@ -1654,14 +1808,14 @@ class PhotoExporterApp:
             previous = None
             if choice == "incremental":
                 try:
-                    previous = find_previous_file(Path(destination))
+                    previous = find_previous_file(Path(destination), allow_missing=bool(load_delivery_locks(source)["student_ids"]))
                 except DeliveryError as exc:
                     self.messagebox.showinfo("选择历史累计学号", str(exc), parent=self.root)
                     previous = self.filedialog.askopenfilename(parent=self.root, title="选择审核通过学号 TXT",
                         filetypes=[("累计学号名单", "*.txt")])
                     if not previous:
                         return
-        except (DeliveryError, OSError) as exc:
+        except (DeliveryError, ReviewError, OSError) as exc:
             self.messagebox.showerror("无法导出审核结果", str(exc), parent=self.root)
             return
         self.current_operation = "delivery"
@@ -1684,6 +1838,7 @@ class PhotoExporterApp:
         self._set_busy(False, "审核结果导出完成")
         self.progress.configure(value=100)
         message = (f"全年级 {result['roster_total']} 人；当前有效通过 {result['approved']} 人；"
+                   f"已交付锁定 {result.get('delivered_locked', 0)} 人；"
                    f"剩余未通过 {result['not_approved']} 人。\n"
                    f"已处理但未通过 {result['processed_not_approved']} 人；本次导出照片 {result['exported']} 张。\n"
                    f"照片导出异常 {result['errors']} 项；名单查询提示 {result['query_warnings']} 项。\n\n"
@@ -1789,7 +1944,7 @@ def main() -> int:
     _startup_trace("main_enter")
     parser = build_parser()
     args = parser.parse_args()
-    if args.cli or args.inspect or args.review_export:
+    if args.cli or args.inspect or args.review_export or args.import_delivered or args.unlock_delivered:
         return _cli_main(args)
     app = PhotoExporterApp(args.xlsx)
     _startup_trace("mainloop_enter")

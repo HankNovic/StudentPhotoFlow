@@ -21,7 +21,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-STATE_FILES = ("grade_roster.json", "review_state.json", "export_state.json")
+# Support stdlib-only / isolated Python launches with the bundled shared module.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from delivery_state import (DELIVERY_LOCK_FILE, DeliveryStateError, empty_delivery_locks,
+                            load_delivery_locks, validate_delivery_locks)
+
+STATE_FILES = ("grade_roster.json", "review_state.json", "export_state.json", DELIVERY_LOCK_FILE)
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 HISTORY_NAME = re.compile(r"审核通过学号(?:[（(](\d+)[）)])?\.txt", re.IGNORECASE)
 INCREMENT_NAME = re.compile(r"新增[（(](\d+)[）)]")
@@ -87,6 +92,9 @@ def source_lock(root: Path):
 def load_states(root: Path) -> tuple[dict, dict[str, str]]:
     states, hashes = {}, {}
     for name in STATE_FILES:
+        if name == DELIVERY_LOCK_FILE and not (root / name).exists():
+            states[name], hashes[name] = empty_delivery_locks(), None
+            continue
         if name == "review_state.json" and not (root / name).exists():
             states[name] = {"schema_version": 1, "reviews": {}, "actions": []}
             hashes[name] = None  # A newly saved roster need not have any reviews yet.
@@ -100,6 +108,10 @@ def load_states(root: Path) -> tuple[dict, dict[str, str]]:
             raise DeliveryError(f"{name} 无法读取：{exc}") from exc
         states[name] = payload
         hashes[name] = hashlib.sha256(data).hexdigest()
+    try:
+        validate_delivery_locks(states[DELIVERY_LOCK_FILE])
+    except DeliveryStateError as exc:
+        raise DeliveryError(str(exc)) from exc
     return states, hashes
 
 
@@ -429,12 +441,17 @@ def write_processing_lists(delivery: Path, processed: list, no_evidence: list, w
 def collect_review_data(root: Path, states: dict, progress=None) -> dict:
     """Shared full-grade computation for the portable UI and standalone delivery."""
     ids, reviews, records = validate_states(states)
+    lock_state = validate_delivery_locks(states.get(DELIVERY_LOCK_FILE, empty_delivery_locks()))
+    locked = set(lock_state["student_ids"])
     historical, warnings, history_hashes = processing_history(root, states["export_state.json"], progress)
     approved, remaining, details, processed, no_evidence, statuses = [], [], [], [], [], {}
     for index, sid in enumerate(ids, 1):
         if progress and (index == 1 or index % 100 == 0 or index == len(ids)):
             progress(f"检查 {index}/{len(ids)}")
         review, record = reviews.get(sid, {}), records.get(sid, {})
+        if sid in locked:
+            statuses[sid] = "delivered"
+            continue  # Delivery is authoritative; do not reinterpret old review/image snapshots.
         status, reason = effective_status(root, review, record)
         statuses[sid] = status
         if status == "approved":
@@ -449,9 +466,10 @@ def collect_review_data(root: Path, states: dict, progress=None) -> dict:
         else:
             processed.append(row)
     return dict(ids=ids, reviews=reviews, records=records, statuses=statuses, approved=approved,
+                delivered=[sid for sid in ids if sid in locked], lock_state=lock_state,
                 remaining=remaining, details=details, processed=processed, no_evidence=no_evidence,
                 warnings=warnings, history_hashes=history_hashes,
-                outside=sorted((set(reviews) | set(records) | set(historical)) - set(ids)))
+                outside=sorted((set(reviews) | set(records) | set(historical) | locked) - set(ids)))
 
 
 def roster_overview(source: str | Path) -> dict:
@@ -464,7 +482,8 @@ def roster_overview(source: str | Path) -> dict:
             raise DeliveryError("统计期间审核或流程记录变化，请刷新重试。")
         verify_history(root, data["history_hashes"])
         labels = {
-            "all": "全年级学生", "approved": "有效已审核归档", "remaining": "剩余未通过",
+            "all": "全年级学生", "delivered": "已交付锁定", "outstanding": "剩余待交付",
+            "approved": "有效已归档（未锁定）", "remaining": "未通过（未锁定）",
             "processed_remaining": "已处理但未通过", "awaiting_review": "处理成功待审核",
             "rejected": "人工审核不通过", "skipped": "人工审核跳过", "stale": "审核已失效",
             "old_approved": "历史通过已失效", "machine_rejected": "机器检查不通过",
@@ -478,7 +497,16 @@ def roster_overview(source: str | Path) -> dict:
             status = data["statuses"][sid]
             record, review = data["records"].get(sid, {}), data["reviews"].get(sid, {})
             process, detail = record.get("processing", {}), processing_rows.get(sid)
-            keys = ["all", "approved" if status == "approved" else "remaining"]
+            if status == "delivered":
+                for key in ("all", "delivered"):
+                    groups[key]["count"] += 1
+                rows.append(dict(student_id=sid, groups=["all", "delivered"], review_status="delivered",
+                                 category="历史已交付 · 已锁定", processing_status="delivered",
+                                 message="按已确认交付名单跳过处理、审核及照片交付；新原图/改参不会解除锁定。",
+                                 review_message="已交付不代表当前新照片审核通过", version_note="仅可在主程序手动解除交付锁定",
+                                 batch_id=record.get("last_batch_id", ""), at="", evidence=DELIVERY_LOCK_FILE))
+                continue
+            keys = ["all", "outstanding", "approved" if status == "approved" else "remaining"]
             if status in {"rejected", "skipped", "stale"}:
                 keys.append(status)
             if status == "stale" and review.get("status") == "approved":
@@ -528,7 +556,7 @@ def history_is_complete(path: Path) -> bool:
         return False
 
 
-def find_previous_file(destination: Path) -> Path:
+def find_previous_file(destination: Path, *, allow_missing: bool = False) -> Path | None:
     candidates = []
     if destination.is_dir():
         folders = [destination] + [path for path in destination.iterdir() if path.is_dir() and (
@@ -537,6 +565,8 @@ def find_previous_file(destination: Path) -> Path:
             candidates.extend(path for path in folder.glob("*.txt")
                               if HISTORY_NAME.fullmatch(path.name) and history_is_complete(path))
     if not candidates:
+        if allow_missing:
+            return None
         raise DeliveryError("新增模式没有找到历史“审核通过学号.txt”或“审核通过学号(数字).txt”。\n"
                             "请选择上次使用的交付目录，或用 --previous 指定名单文件；第一次使用请选择“初次导入”。")
     latest_number = max(map(history_number, candidates))
@@ -602,20 +632,25 @@ def export_delivery(source: str | Path, output_parent: str | Path | None = None,
     with source_lock(root):
         states, hashes = load_states(root)
         ids, reviews, records = validate_states(states)
+        locked_ids = states[DELIVERY_LOCK_FILE]["student_ids"]
         previous, previous_ids, previous_hash = None, [], ""
         if mode == "incremental" and not lists_only:
             previous = (Path(previous_file).expanduser().resolve() if previous_file is not None
-                        else find_previous_file(destination))
-            previous_ids, previous_hash = read_previous_file(previous)
+                        else find_previous_file(destination, allow_missing=bool(locked_ids)))
+            if previous is not None:
+                previous_ids, previous_hash = read_previous_file(previous)
             if progress:
-                progress(f"新增模式：读取 {previous}，忽略历史名单中的 {len(previous_ids)} 个学号。")
+                progress(f"新增模式：读取 {previous}，忽略历史名单中的 {len(previous_ids)} 个学号。" if previous else
+                         f"新增模式：无历史累计文件，使用 {len(locked_ids)} 人已交付锁定作为起点。")
+        # Both modes exclude persistent locks, even if a history TXT is absent or older.
+        previous_ids = list(dict.fromkeys(previous_ids + locked_ids))
         previous_set = set(previous_ids)
         destination.mkdir(parents=True, exist_ok=True)
         if lists_only:
             delivery = Path(tempfile.mkdtemp(prefix=datetime.now().strftime("名单查询_%Y%m%d_%H%M%S_"), dir=destination))
             number, list_name, images = 0, None, None
         elif mode == "incremental":
-            delivery, number = reserve_incremental_directory(destination, previous)
+            delivery, number = reserve_incremental_directory(destination, previous or Path("审核通过学号.txt"))
             images = delivery
             list_name = f"审核通过学号({number}).txt"
         else:
@@ -643,6 +678,9 @@ def export_delivery(source: str | Path, output_parent: str | Path | None = None,
             processed, no_evidence = collected["processed"], collected["no_evidence"]
             summary["source_history_sha256"] = history_hashes
             summary["ignored_outside_roster"] = collected["outside"]
+            summary["delivered_locked"] = len(collected["delivered"])
+            summary["outstanding"] = len(ids) - len(collected["delivered"])
+            summary["skipped_delivery_locked"] = len(collected["delivered"])
             for index, sid in enumerate(approved_ids, 1):
                 if progress and (index == 1 or index % 100 == 0 or index == len(approved_ids)) and not lists_only:
                     progress(f"交付照片 {index}/{len(approved_ids)}")
@@ -689,9 +727,18 @@ def export_delivery(source: str | Path, output_parent: str | Path | None = None,
             exported_ids = [row[0] for row in manifest]
             cumulative_ids = previous_ids + [sid for sid in exported_ids if sid not in previous_set]
             (delivery / "未审核通过学号.txt").write_text("".join(sid + "\n" for sid in remaining), encoding="utf-8-sig")
+            (delivery / "已交付锁定学号.txt").write_text("".join(sid + "\n" for sid in collected["delivered"]), encoding="utf-8-sig")
+            (delivery / "剩余待交付学号.txt").write_text("".join(sid + "\n" for sid in ids if sid not in set(collected["delivered"])), encoding="utf-8-sig")
             # The cumulative list tracks delivered photos, not failed attempts; failures can retry next run.
             if not lists_only:
                 (delivery / list_name).write_text("".join(sid + "\n" for sid in cumulative_ids), encoding="utf-8-sig")
+                write_json(delivery / "累计交付学号.json", dict(schema_version=1, kind="cumulative_export",
+                    student_ids=cumulative_ids, confirmed_sent=False, created_at=summary["created_at"],
+                    note="累计导出不等于已实际发送。整批实际交付后，可在主程序导入本 JSON 并明确确认锁定。"))
+            write_json(delivery / "综合名单.json", dict(schema_version=1, generated_at=summary["created_at"],
+                delivered_locked=collected["delivered"], approved_unlocked=approved_ids,
+                not_approved_unlocked=remaining, exported_this_run=exported_ids,
+                outstanding=[sid for sid in ids if sid not in set(collected["delivered"])]))
             (delivery / "当前有效审核通过学号.txt").write_text("".join(sid + "\n" for sid in approved_ids), encoding="utf-8-sig")
             (delivery / "本次导出学号.txt").write_text("".join(sid + "\n" for sid in exported_ids), encoding="utf-8-sig")
             write_csv(delivery / "未审核通过明细.csv", ["学号", "审核状态", "原因", "处理状态"], details)
@@ -703,7 +750,7 @@ def export_delivery(source: str | Path, output_parent: str | Path | None = None,
                            cumulative_exported=None if lists_only else len(cumulative_ids), processed_not_approved=len(processed),
                            no_processing_evidence=len(no_evidence), processed_categories=categories,
                            query_warnings=len(query_warnings), history_scan_complete=not query_warnings)
-            assert summary["approved"] + summary["not_approved"] == summary["roster_total"]
+            assert summary["approved"] + summary["not_approved"] + summary["delivered_locked"] == summary["roster_total"]
             assert len(processed) + len(no_evidence) == len(remaining)
             write_json(delivery / "导出摘要.json", summary)
             return summary
@@ -765,7 +812,8 @@ def main(argv: list[str] | None = None) -> int:
             root = resolve_source(args.source)
             destination = Path(args.output) if args.output else root.parent / "审核交付导出"
             try:
-                args.previous = str(find_previous_file(destination))
+                history = find_previous_file(destination, allow_missing=bool(load_delivery_locks(root)["student_ids"]))
+                args.previous = str(history) if history else None
             except DeliveryError as exc:
                 if gui_root is not None:
                     messagebox.showinfo("请选择历史学号名单", str(exc), parent=gui_root)
@@ -784,6 +832,7 @@ def main(argv: list[str] | None = None) -> int:
                             f"累计已导出 {result['cumulative_exported']} 人。\n")
         message = (f"操作：{mode_label}\n"
                    f"全年级 {result['roster_total']} 人；当前有效通过 {result['approved']} 人；"
+                   f"已交付锁定 {result['delivered_locked']} 人；"
                    f"其余未审核通过 {result['not_approved']} 人。\n" + delivery_message +
                    f"其中已处理但未通过 {result['processed_not_approved']} 人；未发现处理记录 {result['no_processing_evidence']} 人。\n"
                    f"导出异常 {result['errors']} 项；名单外记录 {len(result['ignored_outside_roster'])} 项已忽略。\n"

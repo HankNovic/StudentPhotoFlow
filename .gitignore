@@ -20,6 +20,8 @@ release/
 StudentPhotoFlow.settings.json
 grade_roster.json
 review_state.json
+delivered_state.json
+交付锁定历史/
 .studentphotoflow.lock
 审核归档/
 .env

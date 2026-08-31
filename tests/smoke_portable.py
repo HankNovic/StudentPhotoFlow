@@ -7,12 +7,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from test_photo_review import fixture
-from photo_review import mark_review, student_detail, atomic_json
+from photo_review import mark_review, student_detail, atomic_json, load_delivery_locks
 
 
 def main():
     exe = Path(sys.argv[1]).resolve()
-    with tempfile.TemporaryDirectory(prefix="spf-v19-portable-smoke-") as directory:
+    with tempfile.TemporaryDirectory(prefix="spf-v110-portable-smoke-") as directory:
         root = Path(directory) / "source"
         fixture(root)
         detail = student_detail(root, "2600000001")
@@ -34,10 +34,33 @@ def main():
                                  "--quality-check", "--force-process"], timeout=45, capture_output=True)
         assert result.returncode == 0, (result.returncode, result.stderr)
         state = json.loads((root / "export_state.json").read_text(encoding="utf-8"))
-        assert state["app_version"] == "1.9.0"
+        assert state["app_version"] == "1.10.0"
         assert state["batches"][-1]["summary"]["archived_skipped"] == 1
         assert student_detail(root, "2600000001")["status"] == "approved"
-        print("Portable EXE smoke passed: initial / incremental / lists-only; approved force-processing skip; version 1.9.0.")
+        ids = Path(directory) / "delivered.json"
+        atomic_json(ids, ["2600000001"])
+        result = subprocess.run([str(exe), "--import-delivered", str(ids), "--confirm-delivered", "--output", str(root)],
+                                timeout=45, capture_output=True)
+        assert result.returncode == 0, result.stderr
+        assert load_delivery_locks(root)["count"] == 1
+        # Real executable must skip even when the current original is missing.
+        (root / "原始图片/2600000001.jpg").unlink()
+        result = subprocess.run([str(exe), "--cli", "--operation", "process", "--output", str(root),
+                                 "--quality-check", "--force-process"], timeout=45, capture_output=True)
+        assert result.returncode == 0, result.stderr
+        state = json.loads((root / "export_state.json").read_text(encoding="utf-8"))
+        assert state["batches"][-1]["summary"]["delivered_skipped"] == 1
+        fresh = Path(directory) / "locked-delivery"
+        result = subprocess.run([str(exe), "--review-export", "incremental", "--output", str(root),
+                                 "--delivery-output", str(fresh)], timeout=45, capture_output=True)
+        assert result.returncode == 0, result.stderr
+        assert not list(fresh.rglob("*.jpg"))
+        assert (fresh / "新增(1)/审核通过学号(1).txt").read_text(encoding="utf-8-sig").splitlines() == ["2600000001"]
+        result = subprocess.run([str(exe), "--unlock-delivered", str(ids), "--confirm-unlock", "--unlock-reason", "smoke test",
+                                 "--output", str(root)], timeout=45, capture_output=True)
+        assert result.returncode == 0, result.stderr
+        assert load_delivery_locks(root)["count"] == 0
+        print("Portable EXE smoke passed: delivery modes; archived skip; JSON import/unlock; delivered skip with missing photo; incremental lock baseline; version 1.10.0.")
 
 
 if __name__ == "__main__":
