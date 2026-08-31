@@ -2,7 +2,7 @@
 """Standalone StudentPhotoFlow 1.8 review exporter; Python 3.10+, standard library only.
 
 Usage: python export_reviewed_photos.py "D:\\StudentPhotoFlow\\导出结果" --output "D:\\交付"
-No arguments: select source and destination folders (console fallback without Tk).
+No arguments: choose initial/incremental mode, source and destination folders.
 Never edits review state or archives. Each run creates a new delivery directory.
 """
 from __future__ import annotations
@@ -22,6 +22,8 @@ from typing import Callable
 
 STATE_FILES = ("grade_roster.json", "review_state.json", "export_state.json")
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+HISTORY_NAME = re.compile(r"审核通过学号(?:[（(](\d+)[）)])?\.txt", re.IGNORECASE)
+INCREMENT_NAME = re.compile(r"新增[（(](\d+)[）)]")
 
 
 class DeliveryError(ValueError):
@@ -195,8 +197,86 @@ def write_csv(path: Path, headers: list[str], rows: list[list[str]]) -> None:
         writer.writerows([[safe_cell(cell) for cell in row] for row in rows])
 
 
+def history_number(path: Path) -> int:
+    match = HISTORY_NAME.fullmatch(path.name)
+    return int(match[1] or 0) if match else 0
+
+
+def history_is_complete(path: Path) -> bool:
+    summary_path = path.parent / "导出摘要.json"
+    if not summary_path.is_file():
+        return True  # Allows a user to carry just the TXT file to a new destination.
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8-sig"))
+        return isinstance(summary, dict) and summary.get("status") in {"completed", "completed_with_errors"}
+    except (OSError, ValueError):
+        return False
+
+
+def find_previous_file(destination: Path) -> Path:
+    candidates = []
+    if destination.is_dir():
+        folders = [destination] + [path for path in destination.iterdir() if path.is_dir() and (
+            path.name.startswith(("审核交付_", "初次导入_")) or INCREMENT_NAME.fullmatch(path.name))]
+        for folder in folders:
+            candidates.extend(path for path in folder.glob("*.txt")
+                              if HISTORY_NAME.fullmatch(path.name) and history_is_complete(path))
+    if not candidates:
+        raise DeliveryError("新增模式没有找到历史“审核通过学号.txt”或“审核通过学号(数字).txt”。\n"
+                            "请选择上次使用的交付目录，或用 --previous 指定名单文件；第一次使用请选择“初次导入”。")
+    latest_number = max(map(history_number, candidates))
+    choices = [path for path in candidates if history_number(path) == latest_number]
+    if latest_number and len({hashlib.sha256(path.read_bytes()).hexdigest() for path in choices}) > 1:
+        raise DeliveryError(f"找到内容不同的同号名单 ({latest_number})，请用 --previous 明确选择历史文件。")
+    return max(choices, key=lambda path: path.stat().st_mtime_ns)
+
+
+def read_previous_file(path: Path) -> tuple[list[str], str]:
+    if not history_is_complete(path):
+        raise DeliveryError("该历史名单所在批次未完成或已失败，不能作为新增导出的跳过依据。")
+    try:
+        data = path.read_bytes()
+        content = data.decode("utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        raise DeliveryError(f"无法读取历史名单：{path}\n{exc}") from exc
+    ids, seen = [], set()
+    for number, value in enumerate(content.splitlines(), 1):
+        sid = value.strip()
+        if not sid:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", sid):
+            raise DeliveryError(f"历史名单第 {number} 行不是有效学号：{sid[:40]}")
+        if sid.casefold() in seen:
+            raise DeliveryError(f"历史名单含重复学号：{sid}；请核对文件。")
+        seen.add(sid.casefold())
+        ids.append(sid)
+    return ids, hashlib.sha256(data).hexdigest()
+
+
+def reserve_incremental_directory(destination: Path, previous: Path) -> tuple[Path, int]:
+    largest = history_number(previous)
+    for child in destination.iterdir():
+        match = INCREMENT_NAME.fullmatch(child.name)
+        if match:
+            largest = max(largest, int(match[1]))
+        largest = max(largest, history_number(child))
+    number = largest + 1
+    while True:
+        folder = destination / f"新增({number})"
+        try:
+            folder.mkdir()  # Exclusive reservation also prevents clobbering a concurrent run.
+            return folder, number
+        except FileExistsError:
+            number += 1
+
+
 def export_delivery(source: str | Path, output_parent: str | Path | None = None,
-                    progress: Callable[[str], None] | None = None) -> dict:
+                    progress: Callable[[str], None] | None = None, *, mode: str = "initial",
+                    previous_file: str | Path | None = None) -> dict:
+    if mode not in {"initial", "incremental"}:
+        raise DeliveryError("模式只能是 initial（初次导入）或 incremental（新增）。")
+    if previous_file is not None and mode != "incremental":
+        raise DeliveryError("--previous 仅用于新增模式；初次导入不会跳过历史学号。")
     root = resolve_source(source)
     destination = Path(output_parent).expanduser().resolve() if output_parent else root.parent / "审核交付导出"
     archive_root = root / "审核归档"
@@ -205,11 +285,30 @@ def export_delivery(source: str | Path, output_parent: str | Path | None = None,
     with source_lock(root):
         states, hashes = load_states(root)
         ids, reviews, records = validate_states(states)
+        previous, previous_ids, previous_hash = None, [], ""
+        if mode == "incremental":
+            previous = (Path(previous_file).expanduser().resolve() if previous_file is not None
+                        else find_previous_file(destination))
+            previous_ids, previous_hash = read_previous_file(previous)
+            if progress:
+                progress(f"新增模式：读取 {previous}，忽略历史名单中的 {len(previous_ids)} 个学号。")
+        previous_set = set(previous_ids)
         destination.mkdir(parents=True, exist_ok=True)
-        delivery = Path(tempfile.mkdtemp(prefix=datetime.now().strftime("审核交付_%Y%m%d_%H%M%S_"), dir=destination))
-        images = delivery / "审核通过照片"
-        images.mkdir()
-        summary = {"schema_version": 1, "source": str(root), "output_dir": str(delivery),
+        if mode == "incremental":
+            delivery, number = reserve_incremental_directory(destination, previous)
+            images = delivery
+            list_name = f"审核通过学号({number}).txt"
+        else:
+            delivery = Path(tempfile.mkdtemp(prefix=datetime.now().strftime("初次导入_%Y%m%d_%H%M%S_"), dir=destination))
+            number, list_name = 0, "审核通过学号.txt"
+            images = delivery / "审核通过照片"
+            images.mkdir()
+        summary = {"schema_version": 2, "mode": mode, "number": number,
+                   "source": str(root), "output_dir": str(delivery), "photos_dir": str(images),
+                   "history_file": str(previous) if previous else None, "history_sha256": previous_hash,
+                   "history_count": len(previous_ids), "skipped_previous": 0,
+                   "cumulative_list": list_name, "cumulative_exported": len(previous_ids),
+                   "history_outside_roster": [sid for sid in previous_ids if sid not in set(ids)],
                    "created_at": datetime.now().astimezone().isoformat(timespec="seconds"), "status": "running",
                    "roster_total": len(ids), "approved": 0, "exported": 0, "not_approved": 0, "errors": 0,
                    "ignored_outside_roster": sorted((set(reviews) | set(records)) - set(ids)),
@@ -227,6 +326,9 @@ def export_delivery(source: str | Path, output_parent: str | Path | None = None,
                     details.append([sid, status, reason, record.get("processing", {}).get("status", "pending")])
                     continue
                 approved_ids.append(sid)
+                if sid in previous_set:
+                    summary["skipped_previous"] += 1
+                    continue
                 try:
                     archived = contained_file(root, review.get("archive_file"))
                     if archived is None:
@@ -258,13 +360,21 @@ def export_delivery(source: str | Path, output_parent: str | Path | None = None,
             _, current_hashes = load_states(root)
             if current_hashes != hashes:
                 raise DeliveryError("导出期间名单 / 审核 / 流程状态发生变化。本次结果不可交付，请关闭主程序后重试。")
+            if previous and hashlib.sha256(previous.read_bytes()).hexdigest() != previous_hash:
+                raise DeliveryError("导出期间历史学号文件发生变化。本次结果不可交付，请保持名单不变后重试。")
+            exported_ids = [row[0] for row in manifest]
+            cumulative_ids = previous_ids + [sid for sid in exported_ids if sid not in previous_set]
             (delivery / "未审核通过学号.txt").write_text("".join(sid + "\n" for sid in remaining), encoding="utf-8-sig")
-            (delivery / "审核通过学号.txt").write_text("".join(sid + "\n" for sid in approved_ids), encoding="utf-8-sig")
+            # The cumulative list tracks delivered photos, not failed attempts; failures can retry next run.
+            (delivery / list_name).write_text("".join(sid + "\n" for sid in cumulative_ids), encoding="utf-8-sig")
+            (delivery / "当前有效审核通过学号.txt").write_text("".join(sid + "\n" for sid in approved_ids), encoding="utf-8-sig")
+            (delivery / "本次导出学号.txt").write_text("".join(sid + "\n" for sid in exported_ids), encoding="utf-8-sig")
             write_csv(delivery / "未审核通过明细.csv", ["学号", "审核状态", "原因", "处理状态"], details)
             write_csv(delivery / "已导出照片明细.csv", ["学号", "图片文件名", "审核时间", "SHA256"], manifest)
             write_csv(delivery / "导出异常.csv", ["学号", "异常说明"], failures)
             summary.update(status="completed_with_errors" if failures else "completed", approved=len(approved_ids),
-                           exported=len(manifest), not_approved=len(remaining), errors=len(failures))
+                           exported=len(manifest), not_approved=len(remaining), errors=len(failures),
+                           cumulative_exported=len(cumulative_ids))
             assert summary["approved"] + summary["not_approved"] == summary["roster_total"]
             write_json(delivery / "导出摘要.json", summary)
             return summary
@@ -278,6 +388,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="独立导出 v1.8 已审核照片（按学号命名）与全年级未通过学号；无需第三方依赖。")
     parser.add_argument("source", nargs="?", help="导出结果 / 审核归档 / 便携版目录")
     parser.add_argument("--output", "-o", help="交付结果的父目录；每次自动创建新子目录，不覆盖上次结果")
+    parser.add_argument("--mode", choices=["initial", "incremental"], help="initial=初次导入；incremental=新增；传源路径时默认初次导入")
+    parser.add_argument("--previous", help="新增模式的历史学号 TXT；不指定时自动识别交付目录内最新的累计名单")
     parser.add_argument("--no-gui", action="store_true", help="不用文件夹选择窗口，缺少路径时改为控制台输入")
     args = parser.parse_args(argv)
     gui_root = None
@@ -292,21 +404,51 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 print("无法打开目录选择窗口，改用控制台输入。")
             else:
+                if args.mode is None:
+                    args.mode = choose_mode(gui_root)
+                    if args.mode is None:
+                        return 0
                 args.source = filedialog.askdirectory(parent=gui_root, title="选择源目录：导出结果（或审核归档 / 便携版目录）")
                 if not args.source:
                     return 0
                 if not args.output:
-                    args.output = filedialog.askdirectory(parent=gui_root, title="选择交付文件夹：将在其中新建一份导出结果")
+                    args.output = filedialog.askdirectory(parent=gui_root, title="选择交付文件夹：新增时选择上次的交付父目录")
                     if not args.output:
                         return 0
+        if args.mode is None:
+            if interactive:
+                value = input("选择模式：1=初次导入，2=新增（默认 1）：").strip() or "1"
+                if value not in {"1", "2"}:
+                    raise DeliveryError("模式请输入 1 或 2。")
+                args.mode = "initial" if value == "1" else "incremental"
+            else:
+                args.mode = "initial"
         if not args.source:
             args.source = input("请输入“导出结果”目录路径：").strip().strip('"')
             if not args.source:
                 return 0
-        result = export_delivery(args.source, args.output, progress=print)
-        message = (f"全年级 {result['roster_total']} 人；当前有效通过 {result['approved']} 人；"
-                   f"已导出照片 {result['exported']} 张；其余学号 {result['not_approved']} 人。\n"
+        if args.mode == "incremental" and not args.previous and interactive:
+            root = resolve_source(args.source)
+            destination = Path(args.output) if args.output else root.parent / "审核交付导出"
+            try:
+                args.previous = str(find_previous_file(destination))
+            except DeliveryError as exc:
+                if gui_root is not None:
+                    messagebox.showinfo("请选择历史学号名单", str(exc), parent=gui_root)
+                    args.previous = filedialog.askopenfilename(parent=gui_root, title="选择上次生成的审核通过学号 TXT",
+                        filetypes=[("学号名单", "*.txt")])
+                else:
+                    print(str(exc))
+                    args.previous = input("请输入历史审核通过学号 TXT 路径（空白取消）：").strip().strip('"')
+                if not args.previous:
+                    return 0
+        result = export_delivery(args.source, args.output, progress=print, mode=args.mode, previous_file=args.previous)
+        message = (f"模式：{'新增' if result['mode'] == 'incremental' else '初次导入'}\n"
+                   f"全年级 {result['roster_total']} 人；当前有效通过 {result['approved']} 人；"
+                   f"本次导出照片 {result['exported']} 张；忽略已导出 {result['skipped_previous']} 人。\n"
+                   f"累计已导出 {result['cumulative_exported']} 人；其余未审核通过 {result['not_approved']} 人。\n"
                    f"导出异常 {result['errors']} 项；名单外记录 {len(result['ignored_outside_roster'])} 项已忽略。\n"
+                   f"下次使用的累计名单：{result['cumulative_list']}\n"
                    f"结果目录：{result['output_dir']}")
         print(message)
         if gui_root is not None:
@@ -325,6 +467,34 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if gui_root is not None:
             gui_root.destroy()
+
+
+def choose_mode(parent) -> str | None:
+    """Two clearly named choices for double-click users; no external GUI dependencies."""
+    import tkinter as tk
+    from tkinter import ttk
+    choice = {"value": None}
+    window = tk.Toplevel(parent)
+    window.title("审核照片导出 · 选择模式")
+    window.resizable(False, False)
+    frame = ttk.Frame(window, padding=24)
+    frame.pack(fill="both", expand=True)
+    ttk.Label(frame, text="初次导入：导出全部当前有效通过的照片。\n"
+              "新增：读取已有名单，只导出尚未交付的学生照片。", justify="left").pack(pady=(0, 18))
+    buttons = ttk.Frame(frame)
+    buttons.pack()
+
+    def select(value):
+        choice["value"] = value
+        window.destroy()
+
+    ttk.Button(buttons, text="初次导入", command=lambda: select("initial")).pack(side="left", padx=6)
+    ttk.Button(buttons, text="新增", command=lambda: select("incremental")).pack(side="left", padx=6)
+    ttk.Button(buttons, text="取消", command=lambda: select(None)).pack(side="left", padx=6)
+    window.protocol("WM_DELETE_WINDOW", lambda: select(None))
+    window.grab_set()
+    parent.wait_window(window)
+    return choice["value"]
 
 
 if __name__ == "__main__":
