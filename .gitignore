@@ -11,6 +11,8 @@ dist/
 _internal/
 *.spec
 !StudentPhotoFlow.spec
+!StudentPhotoFlowV2.spec
+V2工作区/
 *.exe
 *.zip
 release/
