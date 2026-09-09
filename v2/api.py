@@ -228,7 +228,7 @@ def create_app(root, token=None):
 
     @app.post('/api/v1/imports/xlsx', tags=['导入与迁移'], summary='检查 Excel 或创建原图接收任务', description='multipart/form-data：file 为 .xlsx（最大 50MB）；sheet 留空取首张；header_row 表头行从 1 开始；id_column 学号列默认 A；image_column 图片列默认 B。inspect_only=true 只返回 summary、headers、sheet；false 校验学号后创建后台导入任务。照片链接须仍有效。')
     def import_xlsx(file: UploadFile = File(...), sheet: str = Form(''), header_row: int = Form(1), id_column: str = Form('A'), image_column: str = Form('B'), inspect_only: bool = Form(True)):
-        from xlsx_photo_core import WorkbookReader, inspect_selection, column_index, _fetch_source
+        from xlsx_photo_core import WorkbookReader, inspect_selection, column_index, column_label, suggest_columns, _fetch_source
         raw = file.file.read(50*1024*1024+1)
         if len(raw)>50*1024*1024:
             raise ValueError('表格超过50MB')
@@ -245,12 +245,19 @@ def create_app(root, token=None):
             with WorkbookReader(path) as reader:
                 sheets=reader.sheets
                 name=sheet or sheets[0].name
-            report=inspect_selection(path,name,header_row,column_index(id_column),column_index(image_column))
+                headers = reader.headers(name, header_row)
+            detected_id, detected_image = suggest_columns(headers)
+            # A check always tries the header names first; A/B remain the fallback.
+            id_col = detected_id if id_column.strip().upper() in {'', 'A'} else column_index(id_column)
+            image_col = detected_image if image_column.strip().upper() in {'', 'B'} else column_index(image_column)
+            report=inspect_selection(path,name,header_row,id_col,image_col)
             if inspect_only:
-                return dict(summary=report.summary,headers=report.headers,sheet=name)
+                return dict(summary=report.summary,headers=report.headers,sheet=name,
+                            id_column=column_label(id_col),image_column=column_label(image_col),
+                            detected_id_column=column_label(detected_id),detected_image_column=column_label(detected_image))
             if report.summary['duplicate_count'] or report.summary['empty_ids']:
                 raise ValueError('请先修正空学号或重复学号')
-            return service.start_import(raw,name,header_row,column_index(id_column),column_index(image_column),report.rows)
+            return service.start_import(raw,name,header_row,id_col,image_col,report.rows)
 
     @app.post('/api/v1/migrations/legacy', tags=['导入与迁移'], summary='检查或迁移旧版工作区', description='提交 {"path":"D:\\\\旧版\\\\导出结果","apply":false} 先检查；apply=true 才复制迁移，目标须符合空工作区要求。path 是运行服务的电脑路径。返回迁移报告；不覆盖旧数据。')
     def migrate(body: dict):
