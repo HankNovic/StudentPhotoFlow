@@ -78,3 +78,6 @@ on('exitApp',async()=>{await api('shutdown',{});notice('程序正在退出，可
 $('detailNote').insertAdjacentHTML('afterend','<details id="detailSettings"><summary>调整处理参数，再次预览</summary><div id="previewFields" class="fields"></div><button id="savePreviewConfig">保存这些参数供批量处理</button></details>');
 $('detailSettings').ontoggle=()=>{if(!$('detailSettings').open)return;$('previewFields').replaceChildren(...[...$('configFields').children].map(x=>x.cloneNode(true)));$('previewFields').querySelectorAll('[data-config]').forEach(e=>{const target=$('configFields').querySelector(`[data-config="${e.dataset.config}"]`);e.value=target.value;e.checked=target.checked;e.oninput=()=>{target.value=e.value;target.checked=e.checked;};});bindEngineTools($('previewFields'));};
 on('savePreviewConfig',async()=>{config=await api('config',readConfig(),'PUT');notice('预览参数已保存为批量运行配置');});
+
+async function importZip(inspect){const f=$('photoZip').files[0];if(!f)throw Error('请选择照片压缩包');const body=new FormData();body.append('file',f);body.append('inspect_only',inspect);notice('正在上传并检查压缩包');const result=await api('imports/zip',body);$('zipResult').textContent=inspect?`发现 ${result.count} 张照片，可按学号导入。`: '已创建原图接收任务';if(!inspect){show('jobs');await refresh();}notice(inspect?'压缩包检查完成':'压缩包接收任务已创建');}
+on('inspectZip',()=>importZip(true));on('importZip',()=>importZip(false));

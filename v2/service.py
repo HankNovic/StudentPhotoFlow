@@ -83,9 +83,86 @@ class Service:
 
     def _launch(self, job_id):
         job=self.store.snapshot()['jobs'][job_id]
-        target=self._run_import if job.get('kind')=='import' else self._run
+        target=(self._run_zip if job.get('format')=='zip' else self._run_import) if job.get('kind')=='import' else self._run
         self.thread = threading.Thread(target=target, args=(job_id,), daemon=True)
         self.thread.start()
+
+    @staticmethod
+    def inspect_zip(path):
+        import re
+        from .store import valid_id
+        rows=[]
+        seen=set()
+        with zipfile.ZipFile(path) as archive:
+            entries=archive.infolist()
+            if len(entries)>10000 or sum(e.file_size for e in entries)>2*1024**3:
+                raise ValueError('压缩包超过10000项或解压大小超过2GB')
+            for entry in entries:
+                name=entry.filename
+                parts=name.replace('\\','/').split('/')
+                if name.startswith(('/', '\\')) or '..' in parts or ':' in name:
+                    raise ValueError('压缩包包含不安全路径')
+                if entry.is_dir():
+                    continue
+                if entry.flag_bits & 1:
+                    raise ValueError('不支持加密压缩包')
+                if entry.file_size>30*1024**2:
+                    raise ValueError('单张图片超过30MB')
+                match=re.fullmatch(r'([0-9]+)-(.+)\.(png|jpe?g|webp|bmp|gif|tiff?)',parts[-1],re.IGNORECASE)
+                if not match:
+                    raise ValueError('图片文件名须为 学号-姓名.图片扩展名')
+                sid=valid_id(match[1])
+                if sid in seen:
+                    raise ValueError('压缩包中存在重复学号：'+sid)
+                seen.add(sid)
+                rows.append(dict(student_id=sid,entry=name,execute=True,reason=None))
+        if not rows:
+            raise ValueError('压缩包内没有照片')
+        return rows
+
+    def start_zip(self, path, rows):
+        with self.gate, self.store.lock:
+            if self.thread and self.thread.is_alive():
+                raise ValueError('已有任务运行中，请先中断或等待完成')
+            jid=uuid.uuid4().hex
+            relative='inputs/'+jid+'.zip'
+            destination=self.store.root/relative
+            destination.parent.mkdir(parents=True,exist_ok=True)
+            import shutil
+            shutil.copyfile(path,destination)
+            job=dict(id=jid,kind='import',format='zip',status='running',created_at=now(),completed=[],errors={},current=None,input_file=relative,plan={'items':rows})
+            def update(d):
+                Store.add_roster(d,[row['student_id'] for row in rows])
+                d['jobs'][jid]=job
+            self.store.change('创建压缩包原图接收任务',update)
+            self._launch(jid)
+            return job
+
+    def _run_zip(self,jid):
+        try:
+            job=self.store.snapshot()['jobs'][jid]
+            with zipfile.ZipFile(self.store.file(job['input_file'])) as archive:
+                for row in job['plan']['items']:
+                    sid=row['student_id']
+                    if sid in job['completed']:
+                        continue
+                    if not self._await_running(jid):
+                        return
+                    self.store.change('接收原图 '+sid,lambda d:d['jobs'][jid].update(current=sid))
+                    error=None
+                    try:
+                        with archive.open(row['entry']) as image:
+                            self.store.upload(sid,image.read(30*1024**2+1))
+                    except Exception as exc:
+                        error=str(exc)
+                    def checkpoint(d):
+                        d['jobs'][jid]['completed'].append(sid)
+                        if error:
+                            d['jobs'][jid]['errors'][sid]=error
+                    self.store.change('压缩包接收检查点',checkpoint)
+            self.store.change('接收任务结束',lambda d:d['jobs'][jid].update(status='completed',current=None))
+        except Exception as exc:
+            self.store.change('接收任务异常',lambda d:d['jobs'][jid].update(status='interrupted',message=str(exc)))
 
     def start_import(self, raw, sheet, header_row, id_col, image_col, rows):
         with self.gate, self.store.lock:

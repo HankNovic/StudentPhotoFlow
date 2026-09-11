@@ -207,6 +207,33 @@ class V2Test(unittest.TestCase):
             self.assertEqual(result.status_code,200,result.text)
             self.assertEqual(start.call_args.args[3:5],(0,1))
 
+    def test_zip_import_checks_names_preserves_original_and_is_repeatable(self):
+        import zipfile
+        def archive(names):
+            stream=io.BytesIO()
+            with zipfile.ZipFile(stream,'w') as z:
+                for name in names:
+                    z.writestr(name,photo())
+            return stream.getvalue()
+        route='/api/v1/imports/zip'
+        raw=archive(['照片/00003-测试.png'])
+        checked=self.client.post(route,files={'file':('custom.zip',raw)})
+        self.assertEqual(checked.json()['count'],1)
+        self.assertNotIn('00003',self.store.snapshot()['students'])
+        for _ in range(2):
+            response=self.client.post(route,data={'inspect_only':'false'},files={'file':('other.zip',raw)})
+            self.assertEqual(response.status_code,200,response.text)
+            self.service.thread.join(10)
+            self.assertFalse(self.service.thread.is_alive())
+            self.assertFalse(self.store.snapshot()['jobs'][response.json()['id']]['errors'])
+        sources=self.store.snapshot()['students']['00003']['sources']
+        self.assertEqual(len(sources),1)
+        self.assertEqual(self.store.file(sources[0]['file']).read_bytes(),photo())
+        for names in [['../00004-测试.png'],['00004-甲.png','00004-乙.jpg'],['invalid.png']]:
+            response=self.client.post(route,files={'file':('bad.zip',archive(names))})
+            self.assertEqual(response.status_code,409,response.text)
+        self.assertNotIn('00004',self.store.snapshot()['students'])
+
 
 if __name__=='__main__':
     unittest.main()

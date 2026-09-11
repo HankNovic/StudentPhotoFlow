@@ -48,7 +48,7 @@ API_DESCRIPTION = '学生照片工作台的本地接口。所有学号使用字�
 def create_app(root, token=None):
     store = Store(root)
     service = Service(store)
-    app = FastAPI(title='StudentPhotoFlow V2', version='2.0.2', description=API_DESCRIPTION)
+    app = FastAPI(title='StudentPhotoFlow V2', version='2.0.3', description=API_DESCRIPTION)
     app.state.store, app.state.service = store, service
     token = token or secrets.token_urlsafe(32)
     app.state.token = token
@@ -89,7 +89,7 @@ def create_app(root, token=None):
 
     @app.get('/api/v1/health', tags=['访问与服务'], summary='查看版本和工作区', description='返回 version（程序版本）及 workspace（当前工作区绝对路径）。')
     def health():
-        return {'version':'2.0.2','workspace':str(store.root)}
+        return {'version':'2.0.3','workspace':str(store.root)}
 
     @app.post('/api/v1/shutdown', tags=['访问与服务'], summary='安全退出程序', description='返回 ok；仍有运行任务时返回 409，应先中断任务并等待停止。')
     def shutdown():
@@ -251,6 +251,26 @@ def create_app(root, token=None):
                     revision = current
                 await asyncio.sleep(1)
         return StreamingResponse(stream(),media_type='text/event-stream')
+
+    @app.post('/api/v1/imports/zip', tags=['导入与迁移'], summary='检查或导入采集系统照片压缩包', description='multipart/form-data：file 为 ZIP，压缩包名称不限，内部图片为 学号-姓名.扩展名；inspect_only 默认 true 只检查，false 创建可暂停和恢复的后台任务。自动补入学号，重复照片不增加版本。最多500MB，解压总大小2GB，单张30MB；重复学号或不合法文件名拒绝导入。')
+    def import_zip(file: UploadFile = File(...), inspect_only: bool = Form(True)):
+        import zipfile
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'input.zip'
+            with path.open('wb') as output:
+                size=0
+                while chunk := file.file.read(1024*1024):
+                    size+=len(chunk)
+                    if size>500*1024**2:
+                        raise ValueError('压缩包超过500MB')
+                    output.write(chunk)
+            try:
+                rows=service.inspect_zip(path)
+            except zipfile.BadZipFile:
+                raise ValueError('不是有效的ZIP压缩包')
+            if inspect_only:
+                return dict(count=len(rows),student_ids=[r['student_id'] for r in rows])
+            return service.start_zip(path,rows)
 
     @app.post('/api/v1/imports/xlsx', tags=['导入与迁移'], summary='检查 Excel 或创建原图接收任务', description='multipart/form-data：file 为 .xlsx（最大 50MB）；sheet 留空取首张；header_row 表头行从 1 开始；id_column 学号列默认 A；image_column 图片列默认 B。inspect_only=true 每次按表头识别列，未识别的列默认 A/B，返回 summary、headers、sheet、id_column、image_column；false 严格使用所选列并创建后台导入任务。照片链接须仍有效。')
     def import_xlsx(file: UploadFile = File(...), sheet: str = Form(''), header_row: int = Form(1), id_column: str = Form('A'), image_column: str = Form('B'), inspect_only: bool = Form(True)):
