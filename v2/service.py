@@ -206,7 +206,9 @@ class Service:
     def historical_delivery(self, ids, reason):
         if not reason.strip():
             raise ValueError('请注明历史交付依据')
+        ids = list(dict.fromkeys(x.strip() for x in ids))
         def update(d):
+            Store.add_roster(d, ids)
             batch_id='legacy-'+uuid.uuid4().hex
             entries=[]
             for sid in dict.fromkeys(ids):

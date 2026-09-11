@@ -99,18 +99,20 @@ class Store:
             atomic(self.root / relative, data)
         return dict(id=sha, file=relative, width=width, height=height, bytes=len(data))
 
-    def roster(self, ids):
+    @staticmethod
+    def add_roster(d, ids):
         ids = [valid_id(x.strip()) for x in ids]
         if not ids or len({x.casefold() for x in ids}) != len(ids):
             raise ValueError('名单为空或包含重复学号')
-        def update(d):
-            existing = {x.casefold(): x for x in d['students']}
-            for sid in ids:
-                if sid.casefold() in existing and existing[sid.casefold()] != sid:
-                    raise ValueError('学号大小写冲突')
-                d['students'].setdefault(sid, dict(id=sid, sources=[], results=[], approved=None, delivered=None, replacement=False, history=[]))
-            return {'count': len(d['students'])}
-        return self.change('更新名单', update)
+        existing = {x.casefold(): x for x in d['students']}
+        for sid in ids:
+            if sid.casefold() in existing and existing[sid.casefold()] != sid:
+                raise ValueError('学号大小写冲突')
+            d['students'].setdefault(sid, dict(id=sid, sources=[], results=[], approved=None, delivered=None, replacement=False, history=[]))
+        return {'count': len(d['students'])}
+
+    def roster(self, ids):
+        return self.change('更新名单', lambda d: self.add_roster(d, ids))
 
     def upload(self, sid, data):
         valid_id(sid)

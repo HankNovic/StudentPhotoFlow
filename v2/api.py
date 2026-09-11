@@ -48,7 +48,7 @@ API_DESCRIPTION = '学生照片工作台的本地接口。所有学号使用字�
 def create_app(root, token=None):
     store = Store(root)
     service = Service(store)
-    app = FastAPI(title='StudentPhotoFlow V2', version='2.0.1', description=API_DESCRIPTION)
+    app = FastAPI(title='StudentPhotoFlow V2', version='2.0.2', description=API_DESCRIPTION)
     app.state.store, app.state.service = store, service
     token = token or secrets.token_urlsafe(32)
     app.state.token = token
@@ -89,7 +89,7 @@ def create_app(root, token=None):
 
     @app.get('/api/v1/health', tags=['访问与服务'], summary='查看版本和工作区', description='返回 version（程序版本）及 workspace（当前工作区绝对路径）。')
     def health():
-        return {'version':'2.0.1','workspace':str(store.root)}
+        return {'version':'2.0.2','workspace':str(store.root)}
 
     @app.post('/api/v1/shutdown', tags=['访问与服务'], summary='安全退出程序', description='返回 ok；仍有运行任务时返回 409，应先中断任务并等待停止。')
     def shutdown():
@@ -135,6 +135,32 @@ def create_app(root, token=None):
         store.change('保存配置',lambda d:d.update(config=config))
         return config
 
+    @app.get('/api/v1/engines/hivision/urls', tags=['处理配置'], summary='读取历史 Hivision 地址')
+    def engine_urls():
+        return store.snapshot().get('hivision_urls', [])
+
+    @app.post('/api/v1/engines/hivision/urls', tags=['处理配置'], summary='添加历史 Hivision 地址', description='提交 url 字符串。保存在当前工作区，重复地址只保留一条；不测试连接、不修改处理配置。')
+    def save_engine_url(body: dict):
+        from urllib.parse import urlsplit
+        url = body.get('url')
+        if not isinstance(url, str):
+            raise ValueError('请填写 HTTP 或 HTTPS API 地址')
+        url = url.strip().rstrip('/')
+        try:
+            parts = urlsplit(url)
+            valid = parts.scheme in {'http', 'https'} and parts.hostname and not parts.username and not parts.password and not parts.query and not parts.fragment
+            parts.port
+        except ValueError:
+            valid = False
+        if not valid or any(c.isspace() for c in url):
+            raise ValueError('请输入有效的 HTTP 或 HTTPS 地址，不含账号密码、查询参数或片段')
+        def update(d):
+            urls = d.setdefault('hivision_urls', [])
+            if url not in urls:
+                urls.append(url)
+            return urls
+        return store.change('保存 Hivision 地址', update)
+
     @app.post('/api/v1/engines/hivision/test', tags=['处理配置'], summary='测试 Hivision 服务', description='提交 {"url":"http://127.0.0.1:8080"}。只检查接口能力，不上传照片；返回服务检测结果。')
     def test_api(body: dict):
         return test_hivision_api(str(body['url']),15)
@@ -177,7 +203,7 @@ def create_app(root, token=None):
     def deliver(body: Ids):
         return service.delivery(body.student_ids)
 
-    @app.post('/api/v1/historical-deliveries', tags=['审核与交付'], summary='登记历史已交付名单', description='提交学号名单、交付依据 reason，并设置 confirmed_sent=true。只记录历史交付事实，不把当前成片标为审核通过。返回历史批次；名单中的学号须已登记。')
+    @app.post('/api/v1/historical-deliveries', tags=['审核与交付'], summary='登记历史已交付名单', description='提交学号名单、交付依据 reason，并设置 confirmed_sent=true。只记录历史交付事实，不把当前成片标为审核通过。返回历史批次；缺少的学号自动加入名单；校验失败时整批不保存。')
     def historical(body: Historical):
         if not body.confirmed_sent:
             raise ValueError('必须确认名单对应实际已发送的照片')
@@ -226,7 +252,7 @@ def create_app(root, token=None):
                 await asyncio.sleep(1)
         return StreamingResponse(stream(),media_type='text/event-stream')
 
-    @app.post('/api/v1/imports/xlsx', tags=['导入与迁移'], summary='检查 Excel 或创建原图接收任务', description='multipart/form-data：file 为 .xlsx（最大 50MB）；sheet 留空取首张；header_row 表头行从 1 开始；id_column 学号列默认 A；image_column 图片列默认 B。inspect_only=true 只返回 summary、headers、sheet；false 校验学号后创建后台导入任务。照片链接须仍有效。')
+    @app.post('/api/v1/imports/xlsx', tags=['导入与迁移'], summary='检查 Excel 或创建原图接收任务', description='multipart/form-data：file 为 .xlsx（最大 50MB）；sheet 留空取首张；header_row 表头行从 1 开始；id_column 学号列默认 A；image_column 图片列默认 B。inspect_only=true 每次按表头识别列，未识别的列默认 A/B，返回 summary、headers、sheet、id_column、image_column；false 严格使用所选列并创建后台导入任务。照片链接须仍有效。')
     def import_xlsx(file: UploadFile = File(...), sheet: str = Form(''), header_row: int = Form(1), id_column: str = Form('A'), image_column: str = Form('B'), inspect_only: bool = Form(True)):
         from xlsx_photo_core import WorkbookReader, inspect_selection, column_index, column_label, suggest_columns, _fetch_source
         raw = file.file.read(50*1024*1024+1)
@@ -246,15 +272,16 @@ def create_app(root, token=None):
                 sheets=reader.sheets
                 name=sheet or sheets[0].name
                 headers = reader.headers(name, header_row)
-            detected_id, detected_image = suggest_columns(headers)
-            # A check always tries the header names first; A/B remain the fallback.
-            id_col = detected_id if id_column.strip().upper() in {'', 'A'} else column_index(id_column)
-            image_col = detected_image if image_column.strip().upper() in {'', 'B'} else column_index(image_column)
+            if inspect_only:
+                id_col, image_col = suggest_columns(headers + [''] * max(0, 2-len(headers)))
+            else:
+                id_col, image_col = column_index(id_column or 'A'), column_index(image_column or 'B')
+            if id_col == image_col:
+                raise ValueError('学号列和图片列不能是同一列，请手动选择后接收原始图片')
             report=inspect_selection(path,name,header_row,id_col,image_col)
             if inspect_only:
                 return dict(summary=report.summary,headers=report.headers,sheet=name,
-                            id_column=column_label(id_col),image_column=column_label(image_col),
-                            detected_id_column=column_label(detected_id),detected_image_column=column_label(detected_image))
+                            id_column=column_label(id_col),image_column=column_label(image_col))
             if report.summary['duplicate_count'] or report.summary['empty_ids']:
                 raise ValueError('请先修正空学号或重复学号')
             return service.start_import(raw,name,header_row,id_col,image_col,report.rows)

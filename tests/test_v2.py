@@ -156,6 +156,57 @@ class V2Test(unittest.TestCase):
         response=self.client.post('/api/v1/imports/xlsx',files={'file':('bad.xlsx',b'not a zip')})
         self.assertEqual(response.status_code,409)
 
+    def test_history_addresses_persist_and_validate(self):
+        route='/api/v1/engines/hivision/urls'
+        self.assertEqual(self.client.get(route).json(), [])
+        for url in ['http://127.0.0.1:8080/', 'http://127.0.0.1:8080']:
+            self.assertEqual(self.client.post(route,json={'url':url}).status_code,200)
+        self.assertEqual(Store(self.temp.name).snapshot()['hivision_urls'],['http://127.0.0.1:8080'])
+        for url in ['', 'file:///tmp', 'https://user:password@example.com', 'http://host:wrong']:
+            self.assertEqual(self.client.post(route,json={'url':url}).status_code,409)
+
+    def test_history_can_register_unknown_ids_atomically(self):
+        route='/api/v1/historical-deliveries'
+        body={'student_ids':['00003'],'reason':'已发送','confirmed_sent':False}
+        self.assertEqual(self.client.post(route,json=body).status_code,409)
+        self.assertNotIn('00003',self.store.snapshot()['students'])
+        body['confirmed_sent']=True
+        self.assertEqual(self.client.post(route,json=body).status_code,200)
+        student=self.store.snapshot()['students']['00003']
+        self.assertEqual(Store.status(student),'delivered')
+        self.assertIsNone(student['approved'])
+        before=self.store.snapshot()
+        body['student_ids']=['00004','bad/id']
+        self.assertEqual(self.client.post(route,json=body).status_code,409)
+        self.assertEqual(before,self.store.snapshot())
+        self.store.roster(['ABC'])
+        body['student_ids']=['00004','abc']
+        self.assertEqual(self.client.post(route,json=body).status_code,409)
+        self.assertNotIn('00004',self.store.snapshot()['students'])
+
+    def test_excel_check_redetects_but_import_honors_selected_columns(self):
+        import zipfile
+        from xml.sax.saxutils import escape
+        from xlsx_photo_core import column_label
+        def workbook(headers):
+            stream=io.BytesIO()
+            with zipfile.ZipFile(stream,'w') as z:
+                z.writestr('_rels/.rels','<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="xl/workbook.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"/></Relationships>')
+                z.writestr('xl/workbook.xml','<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>')
+                z.writestr('xl/_rels/workbook.xml.rels','<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/></Relationships>')
+                rows=''.join('<row r="'+str(n)+'">'+''.join('<c r="'+column_label(i)+str(n)+'" t="inlineStr"><is><t>'+escape(v)+'</t></is></c>' for i,v in enumerate(values))+'</row>' for n,values in [(1,headers),(2,['0001']*len(headers))])
+                z.writestr('xl/worksheets/sheet1.xml','<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'+rows+'</sheetData></worksheet>')
+            return stream.getvalue()
+        route='/api/v1/imports/xlsx'
+        for headers,expected in [(['姓名','学号','照片'],('B','C')),(['学号','照片'],('A','B')),(['其他','未知'],('A','B'))]:
+            result=self.client.post(route,data={'id_column':'Z','image_column':'Y','inspect_only':'true'},files={'file':('sample.xlsx',workbook(headers))})
+            self.assertEqual(result.status_code,200,result.text)
+            self.assertEqual((result.json()['id_column'],result.json()['image_column']),expected)
+        with patch.object(self.service,'start_import',return_value={'ok':True}) as start:
+            result=self.client.post(route,data={'id_column':'A','image_column':'B','inspect_only':'false'},files={'file':('sample.xlsx',workbook(['姓名','学号','照片']))})
+            self.assertEqual(result.status_code,200,result.text)
+            self.assertEqual(start.call_args.args[3:5],(0,1))
+
 
 if __name__=='__main__':
     unittest.main()

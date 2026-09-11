@@ -11,6 +11,6 @@ if (-not $SkipInstall) {
 if ($LASTEXITCODE -ne 0) { throw 'V2 build failed.' }
 $PortableRoot=Join-Path $ProjectRoot '.portable-build\dist-v2\StudentPhotoFlowV2'
 Get-ChildItem -LiteralPath $ProjectRoot -Filter 'V2*.md' | Copy-Item -Destination $PortableRoot
-$ZipPath=Join-Path $ProjectRoot ('release\StudentPhotoFlow_Windows_x64_v2.0.1_'+(Get-Date -Format 'yyyyMMdd_HHmmss')+'.zip')
+$ZipPath=Join-Path $ProjectRoot ('release\StudentPhotoFlow_Windows_x64_v2.0.2_'+(Get-Date -Format 'yyyyMMdd_HHmmss')+'.zip')
 Compress-Archive -LiteralPath $PortableRoot -DestinationPath $ZipPath -CompressionLevel Optimal
 Write-Output $ZipPath
