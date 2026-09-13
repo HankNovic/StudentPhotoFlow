@@ -32,11 +32,24 @@ def main():
         if lock.read(1)==b'':
             lock.write(b'0');lock.flush()
         lock.seek(0)
-        msvcrt.locking(lock.fileno(),msvcrt.LK_NBLCK,1)
+        try:
+            msvcrt.locking(lock.fileno(),msvcrt.LK_NBLCK,1)
+        except OSError:
+            runtime=root/'.v2-runtime.json'
+            if runtime.exists():
+                try:
+                    info=__import__('json').loads(runtime.read_text(encoding='utf-8'))
+                    webbrowser.open(f"http://127.0.0.1:{int(info['port'])}/#token={info['token']}")
+                    return
+                except Exception:
+                    pass
+            raise RuntimeError('程序已在运行，但找不到可复用的工作台信息')
     app=create_app(root,token)
     sock=socket.socket()
     sock.bind((args.host,args.port))
     port=sock.getsockname()[1]
+    runtime=root/'.v2-runtime.json'
+    runtime.write_text(__import__('json').dumps({'port':port,'token':token},ensure_ascii=False),encoding='utf-8')
     if not args.no_browser:
         def open_browser():
             time.sleep(1)
@@ -44,7 +57,10 @@ def main():
         threading.Thread(target=open_browser,daemon=True).start()
     server=uvicorn.Server(uvicorn.Config(app,host=args.host,port=port,log_config=None,access_log=False,timeout_graceful_shutdown=3))
     app.state.shutdown=lambda:setattr(server,'should_exit',True)
-    server.run(sockets=[sock])
+    try:
+        server.run(sockets=[sock])
+    finally:
+        runtime.unlink(missing_ok=True)
 
 
 if __name__=='__main__':

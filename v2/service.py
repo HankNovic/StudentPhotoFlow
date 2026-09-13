@@ -151,6 +151,8 @@ class Service:
                     self.store.change('接收原图 '+sid,lambda d:d['jobs'][jid].update(current=sid))
                     error=None
                     try:
+                        if self.store.snapshot()['students'][sid].get('delivered'):
+                            raise ValueError('已交付学生已跳过，不重新导入')
                         with archive.open(row['entry']) as image:
                             self.store.upload(sid,image.read(30*1024**2+1))
                     except Exception as exc:
@@ -168,7 +170,7 @@ class Service:
         with self.gate, self.store.lock:
             if self.thread and self.thread.is_alive():
                 raise ValueError('已有任务运行中，请先中断或等待完成')
-            self.store.roster([r.student_id for r in rows])
+            self.store.roster([r.student_id for r in rows], self.store.snapshot().get('active_cohort'))
             relative='inputs/'+hashlib.sha256(raw).hexdigest()+'.xlsx'
             atomic(self.store.root/relative,raw)
             jid=uuid.uuid4().hex
@@ -205,6 +207,9 @@ class Service:
                 self.store.change('接收原图 '+sid,lambda d:d['jobs'][jid].update(current=sid))
                 error=None
                 try:
+                    student = self.store.snapshot()['students'][sid]
+                    if student.get('delivered'):
+                        raise ValueError('已交付学生已跳过，不重新导入')
                     if row.source.kind=='file':
                         raise ValueError('本地路径请使用图片上传入口')
                     self.store.upload(sid,_fetch_source(row.source,25))
@@ -280,12 +285,12 @@ class Service:
         stages = [dict(code=s.code, label=s.label, status=s.status, detail=s.detail, metrics=s.metrics, artifact=self.store.artifact(s.image_bytes)) for s in result.stages]
         return dict(status=result.status, stages=stages, reasons=result.reasons, artifact=self.store.artifact(result.output_bytes) if result.output_bytes else None)
 
-    def historical_delivery(self, ids, reason):
+    def historical_delivery(self, ids, reason, cohort=None):
         if not reason.strip():
             raise ValueError('请注明历史交付依据')
         ids = list(dict.fromkeys(x.strip() for x in ids))
         def update(d):
-            Store.add_roster(d, ids)
+            Store.add_roster(d, ids, cohort)
             batch_id='legacy-'+uuid.uuid4().hex
             entries=[]
             for sid in dict.fromkeys(ids):

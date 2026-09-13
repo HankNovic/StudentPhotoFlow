@@ -52,12 +52,14 @@ class Store:
         self.path = self.root / 'workspace.json'
         if self.path.exists():
             self.data = json.loads(self.path.read_text(encoding='utf-8'))
+            self.data.setdefault('active_cohort', str(datetime.now().year)+'级')
+            for student in self.data.get('students', {}).values(): student.setdefault('cohort', self.data['active_cohort'])
             if self.data.get('schema_version') != 2:
                 raise ValueError('工作区版本不支持，请使用V2工作区目录')
         else:
             if (self.root / 'export_state.json').exists():
                 raise ValueError('请选择新的V2目录，然后从迁移入口导入旧数据')
-            self.data = dict(schema_version=2, revision=0, students={}, deliveries={}, jobs={}, config={}, events=[])
+            self.data = dict(schema_version=2, revision=0, active_cohort=str(datetime.now().year)+'级', students={}, deliveries={}, jobs={}, config={}, events=[])
             atomic(self.path, self.data)
 
     def snapshot(self):
@@ -100,19 +102,25 @@ class Store:
         return dict(id=sha, file=relative, width=width, height=height, bytes=len(data))
 
     @staticmethod
-    def add_roster(d, ids):
+    def add_roster(d, ids, cohort=None):
         ids = [valid_id(x.strip()) for x in ids]
         if not ids or len({x.casefold() for x in ids}) != len(ids):
             raise ValueError('名单为空或包含重复学号')
+        cohort = cohort or d.get('active_cohort') or str(datetime.now().year)+'级'
         existing = {x.casefold(): x for x in d['students']}
         for sid in ids:
             if sid.casefold() in existing and existing[sid.casefold()] != sid:
                 raise ValueError('学号大小写冲突')
-            d['students'].setdefault(sid, dict(id=sid, sources=[], results=[], approved=None, delivered=None, replacement=False, history=[]))
+            d['students'].setdefault(sid, dict(id=sid, cohort=cohort, sources=[], results=[], approved=None, delivered=None, replacement=False, history=[]))
         return {'count': len(d['students'])}
 
-    def roster(self, ids):
-        return self.change('更新名单', lambda d: self.add_roster(d, ids))
+    def roster(self, ids, cohort=None):
+        return self.change('更新名单', lambda d: self.add_roster(d, ids, cohort))
+
+    def set_cohort(self, cohort):
+        if not isinstance(cohort, str) or not re.fullmatch(r'\d{4}级', cohort):
+            raise ValueError('届次格式应为YYYY级')
+        return self.change('切换当前届次', lambda d: d.update(active_cohort=cohort) or {'active_cohort': cohort})
 
     def upload(self, sid, data):
         valid_id(sid)
