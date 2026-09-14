@@ -41,3 +41,6 @@ delivered_state.json
 .DS_Store
 Thumbs.db
 desktop.ini
+
+v2/web-vue/node_modules/
+v2/web-vue-dist/
