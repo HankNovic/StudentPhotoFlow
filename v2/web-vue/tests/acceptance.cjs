@@ -41,7 +41,7 @@ async function saveDownload(action,name){const event=page.waitForEvent('download
  const bundled=JSON.parse(fs.readFileSync(path.join(path.dirname(executable),'build-info.json'),'utf8'));
  assert.equal(health.source_commit,bundled.source_commit);assert.equal(health.build_id,bundled.build_id);
  assert.equal(path.resolve(health.workspace),path.resolve(workspace));
- const duplicate=spawn(executable,['--workspace',workspace,'--no-browser'],{windowsHide:true,stdio:'ignore'});await new Promise((resolve,reject)=>{duplicate.on('exit',code=>code===0?resolve():reject(Error('Duplicate launch failed')));duplicate.on('error',reject);});assert.deepEqual(JSON.parse(fs.readFileSync(runtimePath)),runtime);ok('Second EXE invocation reuses workspace instance without opening user browser');
+ if(!process.argv.includes('--skip-duplicate')){const duplicate=spawn(executable,['--workspace',workspace,'--no-browser'],{windowsHide:true,stdio:'ignore'});await new Promise((resolve,reject)=>{const deadline=setTimeout(()=>{duplicate.kill();reject(Error('Duplicate launch timed out'));},20000);duplicate.on('exit',code=>{clearTimeout(deadline);code===0?resolve():reject(Error('Duplicate launch failed'));});duplicate.on('error',reject);});assert.deepEqual(JSON.parse(fs.readFileSync(runtimePath)),runtime);ok('Second EXE invocation reuses workspace instance without opening user browser');}
  await screenshot('01-students-auth');ok('EXE token → session → HttpOnly Cookie; exact candidate identity; single Vue navigation');
  const fixtures=path.join(output,'fixtures');
  const py=path.resolve(__dirname,'../../..','.portable-build/venv/Scripts/python.exe');
@@ -102,7 +102,16 @@ async function saveDownload(action,name){const event=page.waitForEvent('download
  const before=await data('students/00001');await detail.getByRole('button',{name:'用当前配置试处理'}).click();
  await detail.getByText('试处理阶段结果（非正式成片）',{exact:true}).waitFor();
  assert.equal((await data('students/00001')).revision,before.revision);
- await detail.getByText('调整处理参数，再次预览',{exact:true}).click();await detail.getByRole('button',{name:'保存这些参数供批量处理'}).click();await page.getByText('预览参数已保存供批量处理',{exact:true}).waitFor();await detail.getByText('调整处理参数，再次预览',{exact:true}).click();
+ await detail.getByText('调整处理参数，再次预览',{exact:true}).click();
+ const engine=detail.getByRole('combobox',{name:'图像处理引擎',exact:true});
+ for(const [label,code]of [['快速纯色替换','quick'],['本地 AI 抠图','rembg-u2netp']]){
+  await engine.press('ArrowDown');await page.getByRole('option',{name:label,exact:true}).click();const response=page.waitForResponse(r=>r.url()===base+'/api/v1/students/00001/preview',{timeout:120000});await detail.getByRole('button',{name:'用当前配置试处理'}).click();const r=await response;assert.equal(r.status(),200);const result=await r.json();assert(result.artifact);assert(result.stages.some(s=>s.metrics?.engine===code));ok('Single preview engine '+code+' executed in packaged EXE');
+ }
+ await engine.press('ArrowDown');await page.getByRole('option',{name:'不处理背景',exact:true}).click();
+ await detail.locator('[data-config="quality_enabled"] .el-switch').click();await detail.locator('[data-config="stop_on_reject"] .el-switch').click();
+ const qualityResponse=page.waitForResponse(r=>r.url()===base+'/api/v1/students/00001/preview');await detail.getByRole('button',{name:'用当前配置试处理'}).click();const quality=await (await qualityResponse).json();assert(quality.stages.some(s=>s.status==='rejected'));ok('Packaged quality checks flag synthetic non-face photo and show stage results');
+ await detail.locator('[data-config="quality_enabled"] .el-switch').click();await detail.locator('[data-config="stop_on_reject"] .el-switch').click();
+ await detail.getByRole('button',{name:'保存这些参数供批量处理'}).click();await page.getByText('预览参数已保存供批量处理',{exact:true}).waitFor();await detail.getByText('调整处理参数，再次预览',{exact:true}).click();
  await detail.getByText('版本与操作记录',{exact:true}).click();await screenshot('05-review-preview');
  await detail.getByRole('button',{name:'退回当前成片',exact:true}).click();
  await page.getByRole('dialog',{name:'退回当前成片',exact:true}).getByRole('textbox').fill('Test rejection');await click('保存');

@@ -29,7 +29,7 @@ def main():
     lock.seek(0)
     if os.name=='nt':
         import msvcrt
-        if lock.read(1)==b'':
+        if os.fstat(lock.fileno()).st_size==0:
             lock.write(b'0');lock.flush()
         lock.seek(0)
         try:
