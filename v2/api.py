@@ -224,6 +224,13 @@ def create_app(root, token=None):
             if url not in urls:
                 urls.append(url)
             return urls
+
+    @app.delete('/api/v1/engines/hivision/urls', tags=['处理配置'], summary='删除历史 Hivision 地址')
+    def delete_engine_url(url: str):
+        d=store.snapshot(); urls=d.setdefault('hivision_urls', [])
+        if url in urls:
+            urls.remove(url); store.save(d)
+        return urls
         return store.change('保存 Hivision 地址', update)
 
     @app.post('/api/v1/engines/hivision/test', tags=['处理配置'], summary='测试 Hivision 服务', description='提交 {"url":"http://127.0.0.1:8080"}。只检查接口能力，不上传照片；返回服务检测结果。')
