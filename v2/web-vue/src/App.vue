@@ -15,7 +15,7 @@ function navigate(value){page.value=value;sessionStorage.setItem('spf-page',valu
 async function switchCohort(value){await changeCohort(value);ElMessage.success('已切换到 '+value);}
 async function update(){
  checking.value=true;try{const d=await api('update');
- const version=v=>v.split('.').map(Number),a=version(d.version||'0'),b=version(state.health.version),newer=a.some((x,i)=>x>(b[i]||0)&&a.slice(0,i).every((y,k)=>y===(b[k]||0)));
+ const newer=d.version&&d.version!==state.health.version;
  if(newer){await ElMessageBox.confirm('发现版本 '+d.version+'，打开发布页下载？','检查更新',{confirmButtonText:'打开发布页',cancelButtonText:'取消'});if(d.url?.startsWith('https://github.com/HankNovic/StudentPhotoFlow/'))window.open(d.url,'_blank','noopener');}
  else ElMessage.success('当前已是最新版本');}finally{checking.value=false;}
 }
