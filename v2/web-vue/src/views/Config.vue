@@ -1,1 +1,13 @@
-<template><el-card><h3>处理配置</h3><el-form label-position="top"><el-form-item label="Hivision API地址"><el-input v-model="form.hivision_url"/></el-form-item><el-form-item label="历史 API 地址"><el-select v-model="form.hivision_url" filterable allow-create><el-option v-for="x in urls" :key="x" :value="x"/><template #footer><el-button link @click="add">保存当前地址</el-button><el-button link type="danger" @click="remove">删除选中地址</el-button></template></el-select></el-form-item><el-button type="primary" @click="save">保存配置</el-button></el-form></el-card></template><script setup>import{ref,onMounted}from'vue';const props=defineProps({config:Object});const emit=defineEmits(['message']);const form=ref({...props.config.saved});const urls=ref([]);async function api(p,o){const r=await fetch('/api/v1/'+p,o);return r.json()}async function load(){urls.value=await api('engines/hivision/urls')}async function remove(){if(!form.value.hivision_url)return;urls.value=await api('engines/hivision/urls?url='+encodeURIComponent(form.value.hivision_url),{method:'DELETE'});emit('message','地址已删除')}async function add(){urls.value=await api('engines/hivision/urls',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:form.value.hivision_url})});emit('message','地址已保存')}async function save(){await api('config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(form.value)});emit('message','配置已保存')}onMounted(load)</script>
+<script setup>
+import { ElMessage } from 'element-plus';
+import { state } from '../workspace';
+import { api,download } from '../api';
+import ConfigFields from '../components/ConfigFields.vue';
+async function save(){state.config=await api('config',state.config,'PUT');ElMessage.success('运行配置已保存');}
+async function importConfig(file){state.config=await api('config',JSON.parse(await file.raw.text()),'PUT');ElMessage.success('配置已导入并保存');}
+</script>
+<template>
+ <div class="toolbar sticky-tools"><el-button type="primary" @click="save">保存配置</el-button><el-button @click="download('StudentPhotoFlow配置.json',state.config)">导出配置 JSON</el-button><el-upload :auto-upload="false" :show-file-list="false" accept=".json" :on-change="importConfig"><el-button>导入配置 JSON</el-button></el-upload></div>
+ <p class="muted">当前参数供单张试处理与处理计划共用。保存参数不会自动重新处理照片。</p>
+ <ConfigFields v-model="state.config"/>
+</template>

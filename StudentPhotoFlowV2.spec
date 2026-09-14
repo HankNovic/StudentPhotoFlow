@@ -2,9 +2,14 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 root = Path(SPECPATH)
-web = Path(__import__('os').environ.get('SPF_WEB_ROOT', root/'v2'/'web'))
-if not (web/'index.html').exists() or not list(web.glob('assets/*')):
-    raise SystemExit(f'Vue static build missing: {web}')
+import os
+import sys
+sys.path.insert(0, str(root))
+from build_candidate import validate_web
+if not os.environ.get('SPF_WEB_ROOT'):
+    raise SystemExit('SPF_WEB_ROOT is required; build the Vue frontend first.')
+web = Path(os.environ['SPF_WEB_ROOT']).resolve()
+validate_web(web)
 datas = [(str(root/'models'),'models'), (str(web),'v2/web')]
 binaries = []
 hiddenimports = []

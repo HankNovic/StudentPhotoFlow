@@ -1,2 +1,3 @@
-param([string]$Output='candidate')
-$ErrorActionPreference='Stop';$root=$PSScriptRoot;$stage=Join-Path $root '.portable-build\staging-vue';if(Test-Path $stage){Remove-Item $stage -Recurse -Force};if (!(Test-Path (Join-Path $root 'v2\web-vue-dist\index.html'))) { throw 'Vue build output missing; run npm build first.' }; $env:SPF_WEB_ROOT=Join-Path $root 'v2\web-vue-dist';$py=Join-Path $root '.portable-build\venv\Scripts\python.exe';& $py -m PyInstaller --noconfirm --distpath (Join-Path $root '.portable-build\dist-vue') --workpath (Join-Path $root '.portable-build\work-vue') (Join-Path $root 'StudentPhotoFlowV2.spec');$zip=Join-Path $root "release\StudentPhotoFlow_Vue3_candidate_$((Get-Date).ToString('yyyyMMdd_HHmmss')).zip";Compress-Archive -LiteralPath (Join-Path $root '.portable-build\dist-vue\StudentPhotoFlowV2') -DestinationPath $zip;Write-Output $zip
+param([string]$Output)
+$ErrorActionPreference='Stop'
+& (Join-Path $PSScriptRoot 'build_v2.ps1') -SkipInstall -Output $Output

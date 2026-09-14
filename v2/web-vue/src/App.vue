@@ -1,5 +1,41 @@
-<template><el-container class="app"><el-aside width="230px"><h2>StudentPhotoFlow</h2><p>学生照片工作台</p><el-menu :default-active="page" @select="page=$event"><el-menu-item v-for="x in pages" :key="x.id" :index="x.id">{{x.label}}</el-menu-item></el-menu><el-button link @click="update">检查更新</el-button><label>当前届次<el-select v-model="cohort" @change="changeCohort"><el-option v-for="x in cohorts" :key="x" :value="x"/></el-select></label></el-aside><el-main><el-page-header :content="title"/><el-alert v-if="message" :title="message" type="info" show-icon closable @close="message=''"/><Students v-if="page==='students'" :students="students" @refresh="load" @message="message=$event"/><Import v-else-if="page==='import'" @message="message=$event"/><Config v-else-if="page==='config'" :config="config" @message="message=$event"/><Jobs v-else-if="page==='jobs'"/><Deliveries v-else @message="message=$event"/></el-main></el-container></template>
 <script setup>
-import {ref,computed,onMounted} from 'vue';import Students from './views/Students.vue';import Import from './views/Import.vue';import Config from './views/Config.vue';import Jobs from './views/Jobs.vue';import Deliveries from './views/Deliveries.vue';
-const pages=[{id:'students',label:'学生与审核'},{id:'import',label:'数据接入'},{id:'config',label:'处理配置'},{id:'jobs',label:'任务进度'},{id:'deliveries',label:'照片交付'}];const page=ref('students'),cohort=ref(''),cohorts=ref([]),students=ref([]),config=ref({}),message=ref('');const title=computed(()=>pages.find(x=>x.id===page.value)?.label);const api=async(path,opt)=>{const r=await fetch('/api/v1/'+path,opt);const d=await r.json();if(!r.ok)throw Error(d.message||JSON.stringify(d));return d};async function load(){students.value=await api('students')}async function changeCohort(){await api('cohort',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({cohort:cohort.value})});await load()}async function update(){const x=await api('update');message.value=x.version?'最新版本 '+x.version:'当前已是最新版本'}onMounted(async()=>{const token=new URLSearchParams(location.hash.slice(1)).get('token');if(token){await fetch('/session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token})});history.replaceState(null,'',location.pathname)}const c=await api('cohorts');cohorts.value=c.cohorts;cohort.value=c.active_cohort;config.value=await api('config');await load()})
-</script><style>html,body,#app{margin:0;min-height:100%;font-family:Arial,"Microsoft YaHei"}.app{min-height:100vh;background:#f5f7fa}.el-aside{background:#123f46;color:#d9eeee;padding:22px 14px}.el-aside h2{margin:0 0 8px}.el-aside p{color:#b8d3d3}.el-menu{border:0;background:transparent}.el-menu-item{color:#d9eeee}.el-menu-item.is-active{color:#123f46;background:#e4f3ef;border-radius:6px}.el-aside label{display:block;margin-top:24px}.el-aside .el-select{width:100%;margin-top:8px}.el-main{padding:28px}.el-alert{margin:18px 0}.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}.photo{width:90px;height:120px;object-fit:contain}</style>
+import { ref,onMounted,onUnmounted } from 'vue';
+import { ElMessage,ElMessageBox } from 'element-plus';
+import { api,report,run } from './api';
+import { state,initialize,refresh,changeCohort } from './workspace';
+import Students from './views/Students.vue';
+import Import from './views/Import.vue';
+import Config from './views/Config.vue';
+import Jobs from './views/Jobs.vue';
+import Deliveries from './views/Deliveries.vue';
+const pages={students:'学生与审核',import:'数据接入',config:'处理配置',jobs:'任务进度',deliveries:'照片交付'};
+const remembered=sessionStorage.getItem('spf-page'),page=ref(pages[remembered]?remembered:'students'),failure=ref(''),checking=ref(false);
+let events,timer;
+function navigate(value){page.value=value;sessionStorage.setItem('spf-page',value);}
+async function switchCohort(value){await changeCohort(value);ElMessage.success('已切换到 '+value);}
+async function update(){
+ checking.value=true;try{const d=await api('update');
+ const version=v=>v.split('.').map(Number),a=version(d.version||'0'),b=version(state.health.version),newer=a.some((x,i)=>x>(b[i]||0)&&a.slice(0,i).every((y,k)=>y===(b[k]||0)));
+ if(newer){await ElMessageBox.confirm('发现版本 '+d.version+'，打开发布页下载？','检查更新',{confirmButtonText:'打开发布页',cancelButtonText:'取消'});if(d.url?.startsWith('https://github.com/HankNovic/StudentPhotoFlow/'))window.open(d.url,'_blank','noopener');}
+ else ElMessage.success('当前已是最新版本');}finally{checking.value=false;}
+}
+async function exit(){await api('shutdown',{});events?.close();ElMessage.success('程序已退出，可以关闭网页');}
+onMounted(async()=>{try{await initialize();events=new EventSource('/api/v1/events');events.onmessage=()=>{clearTimeout(timer);timer=setTimeout(()=>run(refresh),200);};}catch(e){failure.value=e.message;report(e);}});
+onUnmounted(()=>{events?.close();clearTimeout(timer);});
+</script>
+<template>
+ <div class="app">
+  <aside class="sidebar"><div class="brand">StudentPhotoFlow</div><p class="subtitle">学生照片工作台</p>
+   <el-menu :default-active="page" @select="navigate"><el-menu-item v-for="(title,key) in pages" :key="key" :index="key">{{title}}</el-menu-item></el-menu>
+   <div class="sidebar-bottom"><p class="sidebar-label">当前届次</p><el-select :model-value="state.cohort" @update:model-value="switchCohort" aria-label="当前届次" :disabled="!state.ready"><el-option v-for="c in state.cohorts" :key="c" :value="c"/></el-select>
+   <p class="workspace">{{state.health.workspace}}</p><p class="sidebar-label">版本 {{state.health.version||'—'}}</p>
+   <el-button @click="update" :loading="checking" :disabled="!state.ready">检查更新</el-button>
+   <el-link href="/docs" target="_blank">API 接口文档 ↗</el-link><el-button @click="exit" :disabled="!state.ready">退出程序</el-button></div>
+  </aside>
+  <main><header><div><p class="eyebrow">STUDENT PHOTO WORKSPACE</p><h1>{{pages[page]}}</h1></div><el-button @click="refresh" :disabled="!state.ready">刷新</el-button></header>
+   <el-alert v-if="failure" :title="failure" type="error" :closable="false"/>
+   <el-skeleton v-if="!state.ready&&!failure" :rows="6" animated/>
+   <template v-if="state.ready"><Students v-show="page==='students'" @navigate="navigate"/><Import v-show="page==='import'" @navigate="navigate"/><Config v-show="page==='config'"/><Jobs v-show="page==='jobs'"/><Deliveries v-show="page==='deliveries'"/></template>
+  </main>
+ </div>
+</template>

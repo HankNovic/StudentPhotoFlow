@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from photo_pipeline import PipelineOptions, test_hivision_api
 from .store import Store
 from .service import Service
+from .version import VERSION
 
 
 class Ids(BaseModel):
@@ -77,7 +78,7 @@ def detect_cohort(reader, sheet, header_row, headers):
 def create_app(root, token=None):
     store = Store(root)
     service = Service(store)
-    app = FastAPI(title='StudentPhotoFlow V2', version='2.1.0', description=API_DESCRIPTION)
+    app = FastAPI(title='StudentPhotoFlow V2', version=VERSION, description=API_DESCRIPTION)
     app.state.store, app.state.service = store, service
     token = token or secrets.token_urlsafe(32)
     app.state.token = token
@@ -118,7 +119,9 @@ def create_app(root, token=None):
 
     @app.get('/api/v1/health', tags=['访问与服务'], summary='查看版本和工作区', description='返回 version（程序版本）及 workspace（当前工作区绝对路径）。')
     def health():
-        return {'version':'2.1.0','workspace':str(store.root),'active_cohort':store.snapshot().get('active_cohort')}
+        info=Path(__file__).parent/'web'/'build-info.json'
+        build=json.loads(info.read_text(encoding='utf-8')) if info.exists() else {}
+        return {'version':VERSION,'workspace':str(store.root),'active_cohort':store.snapshot().get('active_cohort'),'source_commit':build.get('source_commit'),'build_id':build.get('build_id')}
 
     @app.get('/api/v1/update', tags=['访问与服务'], summary='检查在线更新')
     async def update():
