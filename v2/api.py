@@ -128,7 +128,10 @@ def create_app(root, token=None):
         url='https://api.github.com/repos/HankNovic/StudentPhotoFlow/releases/latest'
         try:
             req=urllib.request.Request(url,headers={'User-Agent':'StudentPhotoFlow'})
-            data=json.loads((await asyncio.to_thread(urllib.request.urlopen,req,5)).read())
+            def read_release():
+                with urllib.request.urlopen(req,timeout=5) as response:
+                    return json.load(response)
+            data=await asyncio.to_thread(read_release)
             return {'version':data.get('tag_name','').lstrip('v'),'url':data.get('html_url'),'assets':[{'name':a['name'],'url':a['browser_download_url']} for a in data.get('assets',[])]}
         except Exception as e:
             return JSONResponse({'message':f'检查更新失败：{e}'},status_code=503)

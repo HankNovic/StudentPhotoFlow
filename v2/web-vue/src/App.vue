@@ -35,7 +35,7 @@ onUnmounted(()=>{events?.close();clearTimeout(timer);});
   <main><header><div><p class="eyebrow">STUDENT PHOTO WORKSPACE</p><h1>{{pages[page]}}</h1></div><el-button @click="refresh" :disabled="!state.ready">刷新</el-button></header>
    <el-alert v-if="failure" :title="failure" type="error" :closable="false"/>
    <el-skeleton v-if="!state.ready&&!failure" :rows="6" animated/>
-   <template v-if="state.ready"><Students v-show="page==='students'" @navigate="navigate"/><Import v-show="page==='import'" @navigate="navigate"/><Config v-show="page==='config'"/><Jobs v-show="page==='jobs'"/><Deliveries v-show="page==='deliveries'"/></template>
+   <template v-if="state.ready"><section v-show="page==='students'"><Students @navigate="navigate"/></section><section v-show="page==='import'"><Import @navigate="navigate"/></section><section v-show="page==='config'"><Config/></section><section v-show="page==='jobs'"><Jobs/></section><section v-show="page==='deliveries'"><Deliveries/></section></template>
   </main>
  </div>
 </template>
