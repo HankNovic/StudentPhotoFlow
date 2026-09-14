@@ -52,14 +52,14 @@ class Store:
         self.path = self.root / 'workspace.json'
         if self.path.exists():
             self.data = json.loads(self.path.read_text(encoding='utf-8'))
-            self.data.setdefault('active_cohort', str(datetime.now().year)+'级')
+            self.data.setdefault('active_cohort', str(datetime.now().year)+'级'); self.data.setdefault('hivision_urls', [])
             for student in self.data.get('students', {}).values(): student.setdefault('cohort', self.data['active_cohort'])
             if self.data.get('schema_version') != 2:
                 raise ValueError('工作区版本不支持，请使用V2工作区目录')
         else:
             if (self.root / 'export_state.json').exists():
                 raise ValueError('请选择新的V2目录，然后从迁移入口导入旧数据')
-            self.data = dict(schema_version=2, revision=0, active_cohort=str(datetime.now().year)+'级', students={}, deliveries={}, jobs={}, config={}, events=[])
+            self.data = dict(schema_version=2, revision=0, active_cohort=str(datetime.now().year)+'级', students={}, deliveries={}, jobs={}, config={}, hivision_urls=[], events=[])
             atomic(self.path, self.data)
 
     def snapshot(self):
