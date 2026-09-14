@@ -2,7 +2,10 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
 
 root = Path(SPECPATH)
-datas = [(str(root/'models'),'models'), (str(root/'v2'/'web'),'v2/web')]
+web = Path(__import__('os').environ.get('SPF_WEB_ROOT', root/'v2'/'web'))
+if not (web/'index.html').exists() or not list(web.glob('assets/*')):
+    raise SystemExit(f'Vue static build missing: {web}')
+datas = [(str(root/'models'),'models'), (str(web),'v2/web')]
 binaries = []
 hiddenimports = []
 for package in ('rembg','onnxruntime','cv2','pymatting','uvicorn'):
