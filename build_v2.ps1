@@ -1,4 +1,4 @@
-﻿param([switch]$SkipInstall)
+param([switch]$SkipInstall)
 $ErrorActionPreference='Stop'
 $ProjectRoot=$PSScriptRoot
 $BuildPython=Join-Path $ProjectRoot '.portable-build\venv\Scripts\python.exe'
