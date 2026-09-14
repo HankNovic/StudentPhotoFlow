@@ -39,7 +39,8 @@ def main():
             if runtime.exists():
                 try:
                     info=__import__('json').loads(runtime.read_text(encoding='utf-8'))
-                    webbrowser.open(f"http://127.0.0.1:{int(info['port'])}/#token={info['token']}")
+                    if not args.no_browser:
+                        webbrowser.open(f"http://127.0.0.1:{int(info['port'])}/#token={info['token']}")
                     return
                 except Exception:
                     pass

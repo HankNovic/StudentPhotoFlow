@@ -1,4 +1,6 @@
 """Synthetic photos and workbooks only; no student data."""
+import hashlib
+import shutil
 import io
 import json
 import sys
@@ -15,11 +17,16 @@ with zipfile.ZipFile(root/'photos.zip','w') as z:
     for sid in ('00001','00002'):z.write(root/(sid+'.png'),'photos/'+sid+'-Test.png')
 (root/'roster.txt').write_text('00003\n',encoding='utf-8')
 (root/'legacy').mkdir(exist_ok=True)
-(root/'legacy/export_state.json').write_text(json.dumps({'records':{'00999':{}}}),encoding='utf-8')
+shutil.copy2(root/'00001.png',root/'legacy/original.png')
+shutil.copy2(root/'00002.png',root/'legacy/result.png')
+shutil.copy2(root/'00002.png',root/'legacy/archive.png')
+(root/'legacy/export_state.json').write_text(json.dumps({'records':{'00999':{'original_file':'original.png','processing':{'processed_file':'result.png','status':'success','step_files':[{'file':'result.png','label':'Legacy result'}]}}}}),encoding='utf-8')
+(root/'legacy/review_state.json').write_text(json.dumps({'reviews':{'00999':{'status':'approved','archive_file':'archive.png','snapshot':{'original':{'sha256':hashlib.sha256((root/'00001.png').read_bytes()).hexdigest()},'result':{'sha256':hashlib.sha256((root/'00002.png').read_bytes()).hexdigest()}}}}}),encoding='utf-8')
+(root/'legacy/delivered_state.json').write_text(json.dumps({'schema_version':1,'student_ids':['00999'],'count':1,'sha256':hashlib.sha256(b'00999').hexdigest(),'revision':'test-only','actions':[]}),encoding='utf-8')
 (root/'legacy/grade_roster.json').write_text(json.dumps({'student_ids':['00999']}),encoding='utf-8')
 def workbook(name,year_values):
     rows=[['姓名','学号','个人免冠照片','入学年份']]
-    for i,year in enumerate(year_values):rows.append(['Synthetic',str(100+i).zfill(5),'',year])
+    for i,year in enumerate(year_values):rows.append(['Synthetic',str(100+i).zfill(5),(sys.argv[2]+'/photo/'+str(i) if len(sys.argv)>2 else ''),year])
     with zipfile.ZipFile(root/name,'w') as z:
         z.writestr('_rels/.rels','<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="xl/workbook.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"/></Relationships>')
         z.writestr('xl/workbook.xml','<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>')
@@ -29,3 +36,5 @@ def workbook(name,year_values):
 workbook('single-year.xlsx',['2026级'])
 workbook('multi-year.xlsx',['2026级','2025级'])
 workbook('no-year.xlsx',[''])
+
+workbook('slow.xlsx',['2026级']*5)

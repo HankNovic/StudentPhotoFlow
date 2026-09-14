@@ -36,7 +36,7 @@ async function deliver(){
  <el-card shadow="never">
   <div class="toolbar">
    <el-input v-model="q" placeholder="搜索学号" aria-label="搜索学号" clearable class="search"/>
-   <el-select v-model="status" aria-label="状态筛选" class="filter"><el-option label="全部状态" value=""/><el-option v-for="(label,key) in labels" :key="key" :label="label" :value="key"/></el-select>
+   <el-select v-model="status" :empty-values="[null,undefined]" aria-label="状态筛选" class="filter"><el-option label="全部状态" value=""/><el-option v-for="(label,key) in labels" :key="key" :label="label" :value="key"/></el-select>
    <el-checkbox :model-value="all" @update:model-value="toggleAll">全选筛选结果</el-checkbox><span data-testid="selection-count">已选 {{selected.length}} 人</span>
   </div>
   <div class="toolbar">
