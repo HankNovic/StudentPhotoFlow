@@ -27,10 +27,12 @@
 |旧结构保护/保留旧目录/部署文件版本一致|完成|旧目录拒绝测试通过|实际rc.3目录运行rc.4被拒绝，旧文件哈希不变；不宣称可原地升级|
 |代码隐私检查/功能分支推送|完成|源码文件及PAT模式检查通过|已推送；未合并main|
 |GHCR候选镜像/匿名拉取/远程产物复核|完成|不适用|已上传同一镜像，空凭据目录匿名pull通过；独立实例登录/数据/下载通过|
-|GitHub预发布及附件|进行中|不适用|镜像已验证，正在创建Release|
+|GitHub预发布及附件|完成|不适用|v2.4.0-rc.4已创建，7份附件SHA-256与下载部署ZIP核对通过|
 
 确切外部阻塞：无。
 未通过项：最终复查无未修复的已发现功能失败。已修复失败业务审计导致设置版本误冲突；新增回归测试通过。
 未验证/边界：本次未调用真实Hivision，不声明真实抠图或人工视觉质量合格；未进行ARM64、长时压力、真实断电验证；Windows新包不在本次范围；GitHub在线检查更新未在本轮重新验收。schema3明确不兼容旧根工作区，不提供迁移或原地升级。
 
 测试入口：tests/test_system.py（9项）、tests/test_v2.py（15项）、tests/container_lifecycle.py；v2/web-vue/tests/cohort-acceptance.cjs、cohort-extended.cjs、cohort-final.cjs。Chromium使用合成图、00001等测试学号，正式学生附件和令牌均不入Git/镜像/Release。
+
+发布完成：https://github.com/HankNovic/StudentPhotoFlow/releases/tag/v2.4.0-rc.4 。GitHub规范化单独附件名，另附docker-deploy-2.4.0-rc.4.zip保留compose.yaml、.env.example及中文说明原名。标签通过GitHub API写入与本地完全相同的annotated tag对象（69bae108ccaa80c863b2e91634f43c89fdedadbb）；未覆盖旧标签。
