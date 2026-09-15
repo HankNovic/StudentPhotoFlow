@@ -25,7 +25,8 @@ onUnmounted(()=>{events?.close();clearTimeout(timer);});
 </script>
 <template>
  <div class="app">
-  <aside class="sidebar"><div class="brand">StudentPhotoFlow</div><p class="subtitle">学生照片工作台</p>
+  <div v-if="needsLogin" class="login-page"><div class="login-panel"><div class="brand">StudentPhotoFlow</div><p class="subtitle">学生照片工作台</p><h1>管理员登录</h1><p class="muted">请输入管理员访问令牌以继续</p><el-input v-model="loginToken" type="password" show-password placeholder="访问令牌" @keyup.enter="login"/><el-button type="primary" @click="login">登录</el-button><el-alert v-if="failure && failure!=='请先输入管理员令牌'" :title="failure" type="error" :closable="false"/></div></div>
+  <template v-else><aside class="sidebar"><div class="brand">StudentPhotoFlow</div><p class="subtitle">学生照片工作台</p>
    <el-menu :default-active="page" @select="navigate"><el-menu-item v-for="(title,key) in pages" :key="key" :index="key">{{title}}</el-menu-item></el-menu>
    <div class="sidebar-bottom"><p class="sidebar-label">当前届次</p><el-select :model-value="state.cohort" @update:model-value="switchCohort" aria-label="当前届次" :disabled="!state.ready"><el-option v-for="c in state.cohorts" :key="c" :value="c"/></el-select>
    <p class="workspace">{{state.health.workspace}}</p><p class="sidebar-label">版本 {{state.health.version||'—'}}</p>
@@ -33,11 +34,10 @@ onUnmounted(()=>{events?.close();clearTimeout(timer);});
    <el-link href="/docs" target="_blank">API 接口文档 ↗</el-link></div>
   </aside>
   <main><header><div><p class="eyebrow">STUDENT PHOTO WORKSPACE</p><h1>{{pages[page]}}</h1></div><el-button @click="refresh" :disabled="!state.ready">刷新</el-button></header>
-   <el-card v-if="needsLogin" class="login-card"><h2>管理员登录</h2><el-input v-model="loginToken" type="password" show-password placeholder="请输入访问令牌" @keyup.enter="login"/><el-button type="primary" @click="login">登录</el-button></el-card>
    <el-alert v-if="failure" :title="failure" type="error" :closable="false"/>
    <el-skeleton v-if="!state.ready&&!failure" :rows="6" animated/>
    <template v-if="state.ready"><section v-show="page==='students'"><Students @navigate="navigate"/></section><section v-show="page==='import'"><Import @navigate="navigate"/></section><section v-show="page==='config'"><Config/></section><section v-show="page==='jobs'"><Jobs/></section><section v-show="page==='deliveries'"><Deliveries/></section></template>
-  </main>
+  </main></template>
  </div>
 </template>
 
