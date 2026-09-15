@@ -1,0 +1,21 @@
+services:
+  studentphotoflow:
+    image: ${SPF_IMAGE:-ghcr.io/hanknovic/studentphotoflow:stable}
+    env_file: .env
+    environment:
+      SPF_DOCKER_MODE: "1"
+      SPF_HOST: "0.0.0.0"
+      SPF_PORT: ${SPF_PORT:-8769}
+      SPF_WORKSPACE: /data/workspace
+    ports:
+      - "${SPF_PORT:-8769}:8769"
+    volumes:
+      - ${SPF_DATA_DIR:-./data}:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD","python","-c","import urllib.request; urllib.request.urlopen('http://127.0.0.1:8769/healthz',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+

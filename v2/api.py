@@ -2,11 +2,12 @@ import asyncio
 import json
 import secrets
 import tempfile
+import time
 import urllib.request
 from dataclasses import asdict
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -117,14 +118,23 @@ def create_app(root, token=None):
         response.set_cookie('spf_session',token,httponly=True,samesite='strict')
         return response
 
+    @app.post('/logout', tags=['访问与服务'], summary='退出当前会话')
+    def logout():
+        response = JSONResponse({'ok':True})
+        response.delete_cookie('spf_session')
+        return response
+
     @app.get('/api/v1/health', tags=['访问与服务'], summary='查看版本和工作区', description='返回 version（程序版本）及 workspace（当前工作区绝对路径）。')
     def health():
         info=Path(__file__).parent/'web'/'build-info.json'
         build=json.loads(info.read_text(encoding='utf-8')) if info.exists() else {}
-        return {'version':VERSION,'workspace':str(store.root),'active_cohort':store.snapshot().get('active_cohort'),'source_commit':build.get('source_commit'),'build_id':build.get('build_id')}
+        return {'version':VERSION,'workspace':str(store.root),'active_cohort':store.snapshot().get('active_cohort'),'source_commit':build.get('source_commit'),'build_id':build.get('build_id'),'docker_mode':bool(getattr(app.state,'docker_mode',False))}
 
     @app.get('/api/v1/update', tags=['访问与服务'], summary='检查在线更新')
     async def update():
+        now=time.monotonic(); cache=getattr(app.state,'update_cache',None)
+        if cache and now-cache['time'] < cache['ttl']:
+            return cache['value']
         url='https://api.github.com/repos/HankNovic/StudentPhotoFlow/releases/latest'
         try:
             req=urllib.request.Request(url,headers={'User-Agent':'StudentPhotoFlow'})
@@ -132,12 +142,16 @@ def create_app(root, token=None):
                 with urllib.request.urlopen(req,timeout=5) as response:
                     return json.load(response)
             data=await asyncio.to_thread(read_release)
-            return {'version':data.get('tag_name','').lstrip('v'),'url':data.get('html_url'),'assets':[{'name':a['name'],'url':a['browser_download_url']} for a in data.get('assets',[])]}
+            value={'ok':True,'version':data.get('tag_name','').lstrip('v'),'url':data.get('html_url'),'notes':data.get('body',''),'channel':'stable','assets':[{'name':a['name'],'url':a['browser_download_url']} for a in data.get('assets',[])]}
+            app.state.update_cache={'time':now,'ttl':300,'value':value}; return value
         except Exception as e:
-            return JSONResponse({'message':f'检查更新失败：{e}'},status_code=503)
+            value={'ok':False,'message':'暂时无法检查更新，请稍后重试'}
+            app.state.update_cache={'time':now,'ttl':60,'value':value}; return JSONResponse(value,status_code=200)
 
     @app.post('/api/v1/shutdown', tags=['访问与服务'], summary='安全退出程序', description='返回 ok；仍有运行任务时返回 409，应先中断任务并等待停止。')
     def shutdown():
+        if getattr(app.state,'docker_mode',False):
+            raise HTTPException(status_code=404, detail='Docker 模式由运维管理服务')
         if service.thread and service.thread.is_alive():
             raise ValueError('请先安全中断当前任务，等待停止后退出')
         callback=getattr(app.state,'shutdown',None)

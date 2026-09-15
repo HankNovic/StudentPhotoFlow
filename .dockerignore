@@ -1,0 +1,16 @@
+.git
+.portable-build
+node_modules
+v2/web-vue/node_modules
+v2/web-vue/tests
+tests
+release
+*.zip
+*.exe
+*.xlsx
+*.xls
+*.log
+.env
+V2工作区
+v2/web-legacy-public
+v2/web-vue-dist
