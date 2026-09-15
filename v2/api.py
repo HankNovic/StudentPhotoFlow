@@ -26,10 +26,6 @@ class Ids(BaseModel):
 class Cohort(BaseModel):
     cohort: str = Field(..., pattern=r'^\d{4}级$', description='届次，例如 2026级')
 
-class CohortSettings(BaseModel):
-    cohorts: list[str]
-
-
 class BatchReview(BaseModel):
     student_ids: list[str] = Field(min_length=1, max_length=10000)
     decision: str = Field(..., description='approved=通过，rejected=退回')
@@ -40,6 +36,7 @@ class Processing(Ids):
     config: dict = Field(default_factory=dict, description='处理配置对象；省略的字段使用系统默认值。')
     dry_run: bool = Field(True, description='true 只预览执行计划；false 正式创建任务。')
     new_version: bool = Field(False, description='是否明确生成新处理版本，仍遵守交付保护。')
+    request_id: str | None = Field(None, max_length=100)
     expected_revision: int | None = Field(None, description='并发校验修订号：处理用计划 revision，审核用学生 revision。')
 
 
@@ -171,46 +168,6 @@ def create_app(root, token=None):
         values.update(s.get('cohort',d.get('active_cohort')) for s in d['students'].values())
         values.add(d.get('active_cohort')); return {'active_cohort':d.get('active_cohort'),'cohorts':sorted(x for x in values if x), 'records':records}
 
-    @app.put('/api/v1/cohort-settings', tags=['系统设置'])
-    def cohort_settings(body: CohortSettings):
-        if len(set(body.cohorts)) != len(body.cohorts): raise ValueError('届次不能重复')
-        for x in body.cohorts:
-            if not re.fullmatch(r'\d{4}级', x.strip()): raise ValueError('届次必须为四位年份')
-        d=store.snapshot(); records=d.get('cohort_records',{}); names=set(body.cohorts)
-        for old in set(records)-names:
-            if any(s.get('cohort')==old for s in d['students'].values()): raise ValueError(old+' 含有学生数据，不能删除')
-        return store.manage_cohorts({x:records.get(x,{'name':x,'archived':False}) for x in body.cohorts})
-
-    @app.post('/api/v1/recycle-bin', tags=['系统设置'])
-    def recycle(body: Ids):
-        def update(d):
-            for sid in body.student_ids:
-                if sid in d['students']:
-                    s=d['students'].pop(sid); d.setdefault('recycle_bin',[]).append({'id':uuid.uuid4().hex,'student':s,'deleted_at':now()})
-            return {'count':len(body.student_ids)}
-        return store.change('移入回收站',update)
-
-    @app.get('/api/v1/recycle-bin', tags=['系统设置'])
-    def recycle_list(): return store.snapshot().get('recycle_bin',[])
-
-    @app.post('/api/v1/recycle-bin/{item_id}/restore', tags=['系统设置'])
-    def recycle_restore(item_id: str):
-        def update(d):
-            item=next((x for x in d.get('recycle_bin',[]) if x['id']==item_id),None)
-            if not item: raise ValueError('回收站记录不存在')
-            sid=item['student']['id']
-            if sid in d['students']: raise ValueError('同届同学号已重新导入，不能静默覆盖')
-            d['students'][sid]=item['student']; d['recycle_bin']=[x for x in d['recycle_bin'] if x['id']!=item_id]; return {'ok':True}
-        return store.change('恢复回收站数据',update)
-
-    @app.delete('/api/v1/recycle-bin/{item_id}', tags=['系统设置'])
-    def recycle_delete(item_id: str):
-        def update(d):
-            before=len(d.get('recycle_bin',[])); d['recycle_bin']=[x for x in d.get('recycle_bin',[]) if x['id']!=item_id]
-            if len(d['recycle_bin'])==before: raise ValueError('回收站记录不存在')
-            return {'ok':True}
-        return store.change('永久删除回收站数据',update)
-
     @app.put('/api/v1/cohort', tags=['学生与原图'], summary='切换当前届次')
     def cohort(body: Cohort):
         return store.set_cohort(body.cohort)
@@ -252,6 +209,7 @@ def create_app(root, token=None):
 
     @app.post('/api/v1/students/{sid}/photos', tags=['学生与原图'], summary='上传学生原始照片', description='sid 必须已登记。使用 multipart/form-data，文件字段必须名为 photo，最大 30MB。同一原图重复上传不会清除审核记录；新原图保留旧版本。返回原图信息。')
     def upload(sid: str, photo: UploadFile = File(...)):
+        if service.thread and service.thread.is_alive(): raise ValueError('有活动接收或处理任务，请等待完成或安全中断后上传')
         return store.upload(sid,photo.file.read(30*1024*1024+1))
 
     @app.get('/api/v1/config', tags=['处理配置'], summary='读取默认和已保存配置', description='返回 defaults 和 saved 两个对象。配置项中文含义见下方参数对照。')
@@ -298,14 +256,17 @@ def create_app(root, token=None):
     def process(body: Processing):
         if body.dry_run:
             return service.plan(body.student_ids,body.config,body.new_version)
-        return service.start(body.student_ids,body.config,body.new_version,body.expected_revision)
+        return service.start(body.student_ids,body.config,body.new_version,body.expected_revision,body.request_id)
 
     @app.post('/api/v1/students/{sid}/preview', tags=['任务与预览'], summary='试处理单张照片', description='sid 为学号；请求体为配置对象（同 PUT /config）。返回 status、stages、reasons、artifact。试处理写入预览图片，但不成为正式成片，不改变审核状态。没有原图返回 409。')
     def preview(sid: str, body: dict):
-        source,_ = Store.current(store.snapshot()['students'][sid])
-        if not source:
-            raise ValueError('没有原图')
-        return service.execute(source,body)
+        with store.lock:
+            source,_ = Store.current(store.snapshot()['students'][sid])
+            if not source: raise ValueError('没有原图')
+            if service.thread and service.thread.is_alive(): raise ValueError('请等待活动任务完成后试处理')
+            result=service.execute(source,body)
+            store.change('保存试处理文件引用 '+sid,lambda d:d['students'][sid].setdefault('previews',[]).append(result))
+            return result
 
     @app.get('/api/v1/jobs', tags=['任务与预览'], summary='查看任务进度', description='返回任务数组，最新在前；id 为任务标识，status 为状态，completed 为已完成学号，errors 为失败明细，current 为当前学号。completed 状态表示任务结束，不代表每张均成功。')
     def jobs():

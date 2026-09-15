@@ -50,9 +50,11 @@ class V2Test(unittest.TestCase):
             self.service.delivery(['001'])
         self.service.confirm_delivery(batch['id'])
         self.assertFalse(self.service.plan(['001'],{},True)['items'][0]['execute'])
-        self.store.upload('001',photo('red'))
-        self.assertEqual(Store.status(self.store.snapshot()['students']['001']),'delivered_updated')
+        with self.assertRaises(ValueError):
+            self.store.upload('001',photo('red'))
         self.service.replacement('001','更换照片')
+        self.store.upload('001',photo('red'))
+        self.assertIsNotNone(self.store.snapshot()['students']['001']['delivered'])
         self.assertTrue(self.service.plan(['001'],{})['items'][0]['execute'])
 
     def test_duplicate_keeps_review_and_stale_review_rejected(self):

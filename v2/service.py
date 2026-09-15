@@ -68,15 +68,23 @@ class Service:
             rows.append(dict(student_id=sid, execute=reason is None, reason=reason, source_id=source['id'] if source else None))
         return dict(items=rows, config=asdict(options), config_id=fingerprint, revision=d['revision'])
 
-    def start(self, ids, config, new_version=False, expected_revision=None):
+    def start(self, ids, config, new_version=False, expected_revision=None, request_id=None):
         with self.gate, self.store.lock:
+            if request_id:
+                old=next((j for j in self.store.data['jobs'].values() if j.get('request_id')==request_id),None)
+                if old:
+                    if set(ids)!={x['student_id'] for x in old['plan']['items']} or asdict(self.options(config))!=old['plan']['config']:
+                        raise ValueError('请求编号已用于不同参数或学生')
+                    return old
             if self.thread and self.thread.is_alive():
                 raise ValueError('已有任务运行中，请暂停或中断后操作')
             plan = self.plan(ids, config, new_version)
+            if not any(i['execute'] for i in plan['items']):
+                return dict(status='skipped',plan=plan)
             if expected_revision is not None and plan['revision'] != expected_revision:
                 raise ValueError('执行计划已变化，请重新预览')
             job_id = uuid.uuid4().hex
-            job = dict(id=job_id, status='running', created_at=now(), plan=plan, completed=[], errors={}, current=None)
+            job = dict(id=job_id, status='running', created_at=now(), plan=plan, completed=[], errors={}, current=None,request_id=request_id)
             self.store.change('创建处理任务', lambda d: d['jobs'].update({job_id: job}))
             self._launch(job_id)
             return job

@@ -1,0 +1,26 @@
+const {chromium}=require('playwright');
+const fs=require('fs'),assert=require('assert');
+(async()=>{
+const out=process.argv[3],token=fs.readFileSync(process.argv[2],'utf8').match(/SPF_API_TOKEN=(.*)/)[1].trim(),base=process.env.SPF_TEST_URL||'http://localhost:18971';
+const browser=await chromium.launch({headless:true}),page=await browser.newPage({viewport:{width:1440,height:1000}}),checks=[];
+const ok=s=>{checks.push(s);fs.writeFileSync(out+'/browser-checks.json',JSON.stringify(checks,null,2));console.log('PASS '+s);};
+const click=n=>page.getByRole('button',{name:n,exact:true}).click();
+const menu=n=>page.getByRole('menuitem',{name:n,exact:true}).click();
+const shot=n=>page.screenshot({path:out+'/'+n+'.png',fullPage:true});
+const poll=async fn=>{for(let i=0;i<60;i++){if(await fn())return;await page.waitForTimeout(250);}throw Error('poll timed out');};
+try{
+await page.goto(base);await page.getByPlaceholder('访问令牌',{exact:true}).fill(token);await click('登录');await menu('系统设置');
+if(!await page.locator('.tag-name').filter({hasText:'2027级'}).count()){await page.getByLabel('新增届次年份').fill('2027');await click('添加');await click('保存系统设置');}
+await poll(async()=>await page.getByLabel('当前届次').count()>0);await shot('01-settings');
+await page.getByLabel('新增届次年份').fill('2027');await click('添加');await poll(async()=>await page.getByText('届次已存在（包含归档届次）',{exact:true}).count()>0);
+await page.getByLabel('新增届次年份').fill('20x7');await click('添加');await poll(async()=>await page.getByText('请输入 1000–9999 的四位年份',{exact:true}).count()>0);ok('cohort add, duplicate and invalid year validation');
+await menu('数据接入');await page.getByRole('textbox',{name:'学号名单',exact:true}).fill('00001\n00002\n00003');await click('校验并添加名单');await menu('学生与审核');await page.getByPlaceholder('搜索学号').fill('00001');await page.getByRole('button',{name:'补交照片',exact:true}).click();
+const dialog=page.getByRole('dialog',{name:'学生 00001 · 流程与审核',exact:true});await dialog.locator('input[type=file]').setInputFiles(out+'/synthetic.png');await poll(async()=>await dialog.getByRole('button',{name:'预览单人处理计划'}).isEnabled());await dialog.getByRole('button',{name:'预览单人处理计划'}).click();await dialog.getByRole('button',{name:'开始单人处理'}).click();
+await page.keyboard.press('Escape');await page.getByRole('button',{name:'查看流程 / 审核',exact:true}).click();await poll(async()=>await dialog.getByRole('button',{name:'审核通过当前成片'}).isEnabled());await shot('02-single-result');ok('single upload, formal processing, close/reopen, stages and result (synthetic; no Hivision)');
+await dialog.getByRole('button',{name:'退回当前成片'}).click();await page.getByRole('dialog',{name:'退回当前成片',exact:true}).getByRole('textbox').fill('synthetic rejection test');await click('保存');await poll(async()=>(await dialog.innerText()).includes('人工退回'));await dialog.getByRole('button',{name:'审核通过当前成片'}).click();await poll(async()=>await dialog.getByRole('button',{name:'生成单人交付包'}).isEnabled());await dialog.getByRole('button',{name:'生成单人交付包'}).click();
+await poll(async()=>await dialog.getByRole('link',{name:'下载交付包'}).count()>0);const [download]=await Promise.all([page.waitForEvent('download'),dialog.getByRole('link',{name:'下载交付包'}).click()]);await download.saveAs(out+'/single-delivery.zip');await dialog.getByRole('button',{name:'确认已交付',exact:true}).click();await page.getByRole('dialog',{name:'确认已交付',exact:true}).getByRole('button',{name:'确定',exact:true}).click();await poll(async()=>(await dialog.innerText()).includes('delivered'));await shot('03-single-delivered');ok('review reject/approve, single delivery download and explicit confirmation');
+await dialog.getByRole('button',{name:'启动替换流程'}).click();await page.getByRole('dialog',{name:'启动照片替换',exact:true}).getByRole('textbox').fill('synthetic replacement');await click('启动替换');await dialog.locator('input[type=file]').setInputFiles(out+'/replacement.png');await poll(async()=>await dialog.getByRole('button',{name:'预览单人处理计划'}).isEnabled());await dialog.locator('label.el-checkbox').filter({hasText:'明确生成新处理版本'}).click();await dialog.getByRole('button',{name:'预览单人处理计划'}).click();await dialog.getByRole('button',{name:'开始单人处理'}).click();await poll(async()=>await dialog.getByRole('button',{name:'审核通过当前成片'}).isEnabled());await shot('04-replacement');ok('delivered replacement uses existing task service and retains delivery history');await page.keyboard.press('Escape');
+await page.getByPlaceholder('搜索学号').fill('00003');await page.getByRole('button',{name:'移入回收站',exact:true}).click();await page.getByRole('dialog',{name:'确认移入回收站'}).getByRole('button',{name:'确认移入完整范围'}).click();await menu('系统设置');await poll(async()=>await page.getByRole('button',{name:'恢复',exact:true}).count()>0);await shot('05-recycle');await click('恢复');ok('single recycle and restore via browser');
+await menu('照片交付');await shot('06-deliveries');await click('退出登录');await page.getByRole('heading',{name:'管理员登录'}).waitFor();ok('logout invalidates browser session');
+}catch(e){await shot('failure');console.error(e);process.exitCode=1;}finally{await browser.close();}
+})();

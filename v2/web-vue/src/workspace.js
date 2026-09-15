@@ -1,15 +1,22 @@
 import { reactive } from 'vue';
-import { api } from './api';
-export const state=reactive({ready:false,cohort:'',cohorts:[],students:[],jobs:[],deliveries:[],config:{},urls:[],health:{}});
+import { api,scope } from './api';
+export const state=reactive({ready:false,cohort:'',cohortName:'',archived:false,cohorts:[],allCohorts:[],students:[],jobs:[],deliveries:[],config:{},urls:[],health:{}});
 export async function refresh(){
-  const [students,jobs,deliveries]=await Promise.all([api('students'),api('jobs'),api('deliveries')]);
-  Object.assign(state,{students,jobs,deliveries});
+  const cid=state.cohort;if(!cid){Object.assign(state,{students:[],jobs:[],deliveries:[]});return;}
+  const [students,jobs,deliveries]=await Promise.all([api('students',undefined,undefined,cid),api('jobs',undefined,undefined,cid),api('deliveries',undefined,undefined,cid)]);
+  if(cid===state.cohort)Object.assign(state,{students,jobs,deliveries});
 }
 export async function loadCohorts(){
-  const data=await api('cohorts');state.cohort=data.active_cohort;
-  state.cohorts=[...new Set(data.cohorts)].sort().reverse();
+  const data=await api('cohorts');state.allCohorts=data.cohorts;state.cohorts=data.cohorts.filter(c=>!c.archived);
+  const remembered=state.cohort||sessionStorage.getItem('spf-cohort');
+  const c=data.cohorts.find(c=>c.id===remembered&&!c.archived)||state.cohorts[0];
+  Object.assign(state,{cohort:c?.id||'',cohortName:c?.name||'',archived:c?.archived||false});scope.id=state.cohort;
 }
-export async function changeCohort(value){await api('cohort',{cohort:value},'PUT');await loadCohorts();await refresh();}
+export async function changeCohort(value){
+  const c=state.allCohorts.find(c=>c.id===value||c.name===value);
+  if(!c)throw Error('届次未登记，请先到系统设置添加');
+  Object.assign(state,{cohort:c.id,cohortName:c.name,archived:c.archived});scope.id=c.id;sessionStorage.setItem('spf-cohort',c.id);await refresh();
+}
 export async function initialize(){
   const token=new URLSearchParams(location.hash.slice(1)).get('token');
   if(token){

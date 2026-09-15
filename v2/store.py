@@ -8,8 +8,11 @@ import re
 import tempfile
 import threading
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
+
+actor = ContextVar('audit_actor', default='service')
 
 
 def now():
@@ -66,12 +69,12 @@ class Store:
         with self.lock:
             return copy.deepcopy(self.data)
 
-    def change(self, action, callback):
+    def change(self, action, callback, result_status='success'):
         with self.lock:
             candidate = copy.deepcopy(self.data)
             result = callback(candidate)
             candidate['revision'] += 1
-            candidate['events'].append(dict(id=uuid.uuid4().hex, at=now(), action=action))
+            candidate['events'].append(dict(id=uuid.uuid4().hex, at=now(), action=action, actor=actor.get(), result=result_status))
             atomic(self.path, candidate)
             self.data = candidate
             return result
@@ -118,23 +121,25 @@ class Store:
         return self.change('更新名单', lambda d: self.add_roster(d, ids, cohort))
 
     def set_cohort(self, cohort):
+        if getattr(self, 'fixed_cohort', None):
+            if cohort not in {self.fixed_cohort, self.cohort_name()}:
+                raise ValueError('导入届次与当前锁定届次不一致，请切换后重新检查')
+            return {'active_cohort':self.fixed_cohort}
         if not isinstance(cohort, str) or not re.fullmatch(r'\d{4}级', cohort):
             raise ValueError('届次格式应为YYYY级')
         return self.change('切换当前届次', lambda d: d.update(active_cohort=cohort) or {'active_cohort': cohort})
-
-    def manage_cohorts(self, records):
-        def update(d):
-            old=d.get('cohort_records',{}); out={}
-            for name, rec in records.items():
-                out[name]=dict(rec, id=rec.get('id') or old.get(name,{}).get('id') or uuid.uuid4().hex)
-            d['cohort_records']=out; return list(out.values())
-        return self.change('管理届次', update)
 
     def upload(self, sid, data):
         valid_id(sid)
         with self.lock:
             if sid not in self.data['students']:
                 raise ValueError('请先导入该学号到名单')
+            if self.processing(self.data, sid):
+                raise ValueError('该学生有活动任务，请先安全停止任务')
+            if self.data['students'][sid]['delivered'] and not self.data['students'][sid]['replacement']:
+                raise ValueError('已交付照片需要先启动替换流程')
+            if any(b['status']=='prepared' and any(x['student_id']==sid for x in b['items']) for b in self.data['deliveries'].values()):
+                raise ValueError('请先取消待交付包再上传照片')
             artifact = self.artifact(data)
             def update(d):
                 s = d['students'][sid]

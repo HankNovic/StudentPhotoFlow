@@ -1,17 +1,13 @@
 name: container
 on:
   push:
-    branches: [main]
+    branches: [main, 'feature/**', 'repair/**']
   pull_request:
   workflow_dispatch:
     inputs:
       version:
-        description: Version (for example 2.4.0)
+        description: Unused candidate version matching v2/version.py (for example 2.4.0-rc.4)
         required: true
-      channel:
-        description: stable or candidate
-        required: true
-        default: stable
 permissions:
   contents: read
 jobs:
@@ -26,6 +22,7 @@ jobs:
           context: .
           file: Dockerfile
           push: false
+          build-args: SOURCE_COMMIT=${{ github.sha }}
   release:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
@@ -34,19 +31,40 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      - name: Validate candidate source version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          python - <<'PY'
+          import os, re, runpy
+          version = os.environ['VERSION']
+          assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+', version), 'Candidate versions only'
+          assert runpy.run_path('v2/version.py')['VERSION'] == version, 'Source version mismatch'
+          PY
+      - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse existing image tag
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if docker buildx imagetools inspect "ghcr.io/hanknovic/studentphotoflow:$VERSION" > /tmp/inspect.log 2>&1; then
+            echo 'Image tag already exists; never overwrite'; exit 1
+          fi
+          cat /tmp/inspect.log
+          grep -qi 'not found\|manifest unknown' /tmp/inspect.log
       - uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           push: true
-          tags: |
-            ghcr.io/hanknovic/studentphotoflow:${{ inputs.version }}
-            ghcr.io/hanknovic/studentphotoflow:${{ inputs.channel == 'stable' && 'stable' || format('rc-{0}', inputs.version) }}
+          tags: ghcr.io/hanknovic/studentphotoflow:${{ inputs.version }}
+          build-args: |
+            SOURCE_COMMIT=${{ github.sha }}
+            APP_VERSION=${{ inputs.version }}
           labels: |
             org.opencontainers.image.version=${{ inputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}

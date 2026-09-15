@@ -1,14 +1,18 @@
 import { ElMessage } from 'element-plus';
-export async function api(path,body,method) {
+export const scope={id:''};
+const globalPath=p=>/^(health|config|update|engines|settings|cohorts|recycle-bin)(\/|$|\?)/.test(p);
+export const url=(path,cid=scope.id)=>globalPath(path)?'/api/v1/'+path:'/cohorts/'+encodeURIComponent(cid)+'/api/v1/'+path;
+export async function api(path,body,method,cid=scope.id) {
   const options={method:method||(body===undefined?'GET':'POST')};
   if(body!==undefined){options.body=body instanceof FormData?body:JSON.stringify(body);if(!(body instanceof FormData))options.headers={'Content-Type':'application/json'};}
-  const response=await fetch('/api/v1/'+path,options),data=await response.json();
-  if(!response.ok)throw Error(data.message||JSON.stringify(data.detail||data));
+  const response=await fetch(url(path,cid),options),data=await response.json();
+  if(!response.ok){if(response.status===403)window.dispatchEvent(new Event('spf-session-expired'));throw Error(data.message||JSON.stringify(data.detail||data));}
+  function annotate(v){if(!v||typeof v!=='object')return;if(v.file&&v.id)v.cohort_id=cid;Object.values(v).forEach(x=>{if(typeof x==='object')annotate(x);});}annotate(data);
   return data;
 }
 export function report(error){if(error!=='cancel'&&error!=='close')ElMessage.error(error.message||String(error));}
 export async function run(fn){try{return await fn();}catch(e){report(e);}}
-export const art=a=>a?'/api/v1/artifacts/'+a.id:'';
+export const art=a=>a?url('artifacts/'+a.id,a.cohort_id||scope.id):'';
 export const ids=text=>text.split(/[\s,，]+/).filter(Boolean);
 export function download(name,data,type='application/json'){
   const url=URL.createObjectURL(new Blob([typeof data==='string'?data:JSON.stringify(data,null,2)],{type}));

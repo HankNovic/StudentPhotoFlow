@@ -1,17 +1,20 @@
 <script setup>
 import { ref,computed,watch } from 'vue';
-import { ElMessage } from 'element-plus';
+import { ElMessage,ElMessageBox } from 'element-plus';
 import { state,refresh } from '../workspace';
 import { api,labels,download } from '../api';
 import Photo from '../components/Photo.vue';
+import RecycleDialog from '../components/RecycleDialog.vue';
 import StudentDetail from '../components/StudentDetail.vue';
 const emit=defineEmits(['navigate']);
+const recycle=ref();
+async function single(){if(!state.cohort)throw Error('请先选择届次');const cid=state.cohort;const {value}=await ElMessageBox.prompt('在 '+state.cohortName+' 中精确查找已有学号，不会新建学生','单人补录',{inputPlaceholder:'完整学号'});const sid=value.trim();await api('students/'+encodeURIComponent(sid),undefined,undefined,cid);if(cid!==state.cohort)throw Error('届次已切换，请重新确认学生');detailId.value=sid;}
 const q=ref(''),status=ref(''),selected=ref([]),detailId=ref(''),batchDecision=ref(''),reason=ref('');
 const planOpen=ref(false),planData=ref(null),newVersion=ref(false),planIds=ref([]),busy=ref(false);
 const filtered=computed(()=>state.students.filter(s=>(!status.value||s.status===status.value)&&s.id.includes(q.value.trim())));
 const visibleIds=computed(()=>filtered.value.map(s=>s.id));
 const all=computed(()=>filtered.value.length>0&&filtered.value.every(s=>selected.value.includes(s.id)));
-watch([q,status,()=>state.cohort],()=>{selected.value=[];planOpen.value=false;detailId.value='';});
+watch([q,status,()=>state.cohort],()=>{selected.value=[];planOpen.value=false;});
 watch(()=>state.students,()=>{selected.value=selected.value.filter(id=>visibleIds.value.includes(id));});
 watch(()=>[newVersion.value,JSON.stringify(state.config)],()=>{planData.value=null;});
 function toggle(id,value){selected.value=value?[...new Set([...selected.value,id])]:selected.value.filter(x=>x!==id);}
@@ -32,6 +35,7 @@ async function deliver(){
 }
 </script>
 <template>
+ <div class="toolbar"><el-button type="primary" @click="single" :disabled="!state.cohort||state.archived">单人补录</el-button><el-button type="danger" :disabled="!selected.length||state.archived" @click="recycle.show(state.cohort,selected)">选中学生移入回收站</el-button></div>
  <div class="counts"><el-button v-for="(label,key) in labels" :key="key" @click="status=key" :class="{chosen:status===key}"><span>{{label}}</span><b>{{state.students.filter(s=>s.status===key).length}}</b></el-button></div>
  <el-card shadow="never">
   <div class="toolbar">
@@ -49,9 +53,10 @@ async function deliver(){
    <el-table-column prop="id" label="学号" min-width="140"/>
    <el-table-column label="照片" width="150"><template #default="{row}"><Photo :artifact="row.result?.artifact||row.source" :label="row.id"/></template></el-table-column>
    <el-table-column label="状态" min-width="150"><template #default="{row}"><el-tag>{{labels[row.status]||row.status}}</el-tag></template></el-table-column>
-   <el-table-column label="操作" min-width="180"><template #default="{row}"><el-button link type="primary" @click="detailId=row.id">查看流程 / 审核</el-button></template></el-table-column>
+   <el-table-column label="操作" min-width="180"><template #default="{row}"><el-button link type="primary" @click="detailId=row.id">查看流程 / 审核</el-button><el-button v-if="row.status==='missing'" link :disabled="state.archived" @click="detailId=row.id">补交照片</el-button><el-button link type="danger" :disabled="state.archived" @click="recycle.show(state.cohort,[row.id])">移入回收站</el-button></template></el-table-column>
   </el-table>
  </el-card>
+ <RecycleDialog ref="recycle"/>
  <StudentDetail v-model:id="detailId" :visible-ids="visibleIds"/>
  <el-dialog :model-value="!!batchDecision" @update:model-value="batchDecision=''" :title="batchDecision==='approved'?'批量审核通过':'批量退回'" width="440px">
   <p>仅处理当前选中的待人工审核学生。</p><el-input v-model="reason" type="textarea" placeholder="备注（可留空）"/>

@@ -1,7 +1,7 @@
 <script setup>
 import { ref,reactive,watch } from 'vue';
 import { ElMessage } from 'element-plus';
-import { api,ids,run } from '../api';
+import { api,ids,run,url } from '../api';
 import { state,refresh,changeCohort,loadCohorts } from '../workspace';
 const emit=defineEmits(['navigate']);
 const roster=ref(''),excel=ref(null),zip=ref(null),photos=ref([]),report=ref(null),zipReport=ref(null),migration=ref(null),legacy=ref(''),historyIds=ref(''),historyReason=ref(''),confirmed=ref(false),busy=ref(false);
@@ -16,13 +16,13 @@ async function inspect(){if(!excel.value)throw Error('请选择 Excel');await op
  if(report.value.cohort){await changeCohort(report.value.cohort);checked.value=true;ElMessage.success('表格检查完成，已识别 '+report.value.cohort);}
  else{chosen.value=state.cohort;cohortDialog.value=true;}
 });}
-async function choose(){if(!/^\d{4}级$/.test(chosen.value))throw Error('届次格式为 YYYY级');await changeCohort(chosen.value);checked.value=true;cohortDialog.value=false;ElMessage.success('表格检查完成，已选择 '+chosen.value);}
+async function choose(){await changeCohort(chosen.value);checked.value=true;cohortDialog.value=false;ElMessage.success('表格检查完成，已选择 '+chosen.value);}
 async function importExcel(){if(!checked.value)throw Error('请先检查表格并确定届次');await operation(async()=>{
- const body=new FormData();body.append('file',excel.value);for(const [k,v] of Object.entries(fields))body.append(k,v);body.append('cohort',state.cohort);body.append('inspect_only',false);
+ const body=new FormData();body.append('file',excel.value);for(const [k,v] of Object.entries(fields))body.append(k,v);body.append('cohort',state.cohortName);body.append('inspect_only',false);
  await api('imports/xlsx',body);await refresh();emit('navigate','jobs');ElMessage.success('Excel 接收任务已创建');
 });}
 async function zipAction(inspectOnly){if(!zip.value)throw Error('请选择照片压缩包');await operation(async()=>{
- const body=new FormData();body.append('file',zip.value);body.append('cohort',state.cohort);body.append('inspect_only',inspectOnly);
+ const body=new FormData();body.append('file',zip.value);body.append('cohort',state.cohortName);body.append('inspect_only',inspectOnly);
  zipReport.value=await api('imports/zip',body);if(!inspectOnly){await refresh();emit('navigate','jobs');}ElMessage.success(inspectOnly?'压缩包检查完成':'压缩包接收任务已创建');
 });}
 async function uploadPhotos(){if(!photos.value.length)throw Error('请选择照片');await operation(async()=>{
@@ -34,7 +34,7 @@ async function migrate(apply){migration.value=await api('migrations/legacy',{pat
 function photoList(file,list){photos.value=list;}
 </script>
 <template>
- <el-card shadow="never"><template #header><h3>导入学号名单</h3></template><p class="muted">一行一个学号，追加到当前 {{state.cohort}}；保留前导零。</p><el-input v-model="roster" type="textarea" :rows="5" aria-label="学号名单"/><div class="toolbar"><el-button type="primary" @click="addRoster">校验并添加名单</el-button><el-upload :auto-upload="false" :show-file-list="false" accept=".txt" :on-change="file=>run(async()=>{roster=await file.raw.text();})"><el-button>读取学号 TXT</el-button></el-upload><el-button tag="a" href="/api/v1/exports/students.txt">导出当前届全部学号 TXT</el-button><el-button tag="a" href="/api/v1/exports/delivered.txt">导出当前届已交付 TXT</el-button></div></el-card>
+ <el-card shadow="never"><template #header><h3>导入学号名单</h3></template><p class="muted">一行一个学号，追加到当前 {{state.cohortName}}；保留前导零。</p><el-input v-model="roster" type="textarea" :rows="5" aria-label="学号名单"/><div class="toolbar"><el-button type="primary" @click="addRoster">校验并添加名单</el-button><el-upload :auto-upload="false" :show-file-list="false" accept=".txt" :on-change="file=>run(async()=>{roster=await file.raw.text();})"><el-button>读取学号 TXT</el-button></el-upload><el-button tag="a" :href="url('exports/students.txt')">导出当前届全部学号 TXT</el-button><el-button tag="a" :href="url('exports/delivered.txt')">导出当前届已交付 TXT</el-button></div></el-card>
  <el-card shadow="never" data-testid="excel-import"><template #header><h3>导入 Excel 照片</h3></template><p class="muted">检查后自动识别列与学年，可手动调整学号列和照片列。多学年表格会拒绝导入。</p>
   <el-upload :auto-upload="false" :show-file-list="false" accept=".xlsx" :on-change="file=>{excel=file.raw;}"><el-button>选择 Excel</el-button></el-upload><p>{{excel?.name}}</p>
   <el-form label-position="top" class="config-grid"><el-form-item label="工作表"><el-input v-model="fields.sheet" placeholder="留空使用第一张"/></el-form-item><el-form-item label="表头行"><el-input-number v-model="fields.header_row" :min="1"/></el-form-item><el-form-item label="学号列"><el-input v-model="fields.id_column" aria-label="学号列"/></el-form-item><el-form-item label="图片列"><el-input v-model="fields.image_column" aria-label="图片列"/></el-form-item></el-form>
@@ -43,6 +43,6 @@ function photoList(file,list){photos.value=list;}
  <el-card shadow="never" data-testid="zip-import"><template #header><h3>导入照片压缩包</h3></template><p class="muted">压缩包名称不限，图片文件名为“学号-姓名.png”等。重复照片不增加版本，已交付记录跳过。</p><el-upload :auto-upload="false" :show-file-list="false" accept=".zip" :on-change="file=>{zip=file.raw;}"><el-button>选择照片 ZIP</el-button></el-upload><p>{{zip?.name}}</p><div class="toolbar"><el-button @click="zipAction(true)" :loading="busy">检查压缩包</el-button><el-button type="primary" @click="zipAction(false)" :loading="busy">接收压缩包原图</el-button></div><pre v-if="zipReport" data-testid="zip-report">{{JSON.stringify(zipReport,null,2)}}</pre></el-card>
  <el-card shadow="never" data-testid="photo-upload"><template #header><h3>批量上传图片</h3></template><p class="muted">文件名为学号；学号须已在名单中。</p><el-upload :auto-upload="false" multiple accept="image/*" :on-change="photoList" :on-remove="photoList"><el-button>选择原图</el-button></el-upload><el-button @click="uploadPhotos" :loading="busy">上传所选原图</el-button></el-card>
  <el-card shadow="never" data-testid="historical"><template #header><h3>登记历史已交付名单</h3></template><p class="muted">未登记学号会自动加入当前届名单。只登记交付事实，不将当前成片标为已审核。</p><el-input v-model="historyIds" type="textarea" :rows="4" aria-label="历史已交付学号"/><el-input v-model="historyReason" placeholder="交付依据，例如已发送办卡第一批" class="spaced"/><el-checkbox v-model="confirmed">确认这些照片已经实际发送</el-checkbox><div><el-button @click="historical">登记已交付名单</el-button></div></el-card>
- <el-card shadow="never"><template #header><h3>迁移旧版数据</h3></template><p class="muted">输入旧“导出结果”目录的完整路径。仅向空 V2 工作区复制，不覆盖旧目录。</p><el-input v-model="legacy" placeholder="旧导出结果完整路径" aria-label="旧数据路径"/><div class="toolbar"><el-button @click="migrate(false)">检查旧数据</el-button><el-button @click="migrate(true)">复制迁移到当前空工作区</el-button></div><pre v-if="migration" data-testid="migration-report">{{JSON.stringify(migration,null,2)}}</pre></el-card>
- <el-dialog v-model="cohortDialog" title="选择学生届次" width="440px" :close-on-click-modal="false"><p>未识别到学年，请选择本次导入所属届次；支持输入 YYYY级。</p><el-select v-model="chosen" filterable allow-create default-first-option aria-label="导入届次"><el-option v-for="c in state.cohorts" :key="c" :value="c"/></el-select><template #footer><el-button @click="cohortDialog=false">取消</el-button><el-button type="primary" @click="choose">确定届次</el-button></template></el-dialog>
+ <el-alert title="本版本使用全新届次结构，不支持旧工作区迁移。请保留旧目录，并在新目录录入。" type="info" :closable="false"/>
+ <el-dialog v-model="cohortDialog" title="选择学生届次" width="440px" :close-on-click-modal="false"><p>未识别到学年，请选择本次导入所属届次；未登记届次请先到系统设置添加。</p><el-select v-model="chosen" filterable aria-label="导入届次"><el-option v-for="c in state.cohorts" :key="c.id" :value="c.id" :label="c.name"/></el-select><template #footer><el-button @click="cohortDialog=false">取消</el-button><el-button type="primary" @click="choose">确定届次</el-button></template></el-dialog>
 </template>

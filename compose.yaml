@@ -1,17 +1,24 @@
 services:
   studentphotoflow:
-    image: ${SPF_IMAGE:-ghcr.io/hanknovic/studentphotoflow:stable}
+    image: ${SPF_IMAGE:-ghcr.io/hanknovic/studentphotoflow:2.4.0-rc.4}
     env_file: .env
     environment:
       SPF_DOCKER_MODE: "1"
       SPF_HOST: "0.0.0.0"
-      SPF_PORT: ${SPF_PORT:-8769}
+      SPF_PORT: "8769"
       SPF_WORKSPACE: /data/workspace
     ports:
       - "${SPF_PORT:-8769}:8769"
     volumes:
-      - ${SPF_DATA_DIR:-./data}:/data
+      - ${SPF_DATA_DIR:-./data-rc4}:/data
+    init: true
+    stop_grace_period: 150s
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test: ["CMD","python","-c","import urllib.request; urllib.request.urlopen('http://127.0.0.1:8769/healthz',timeout=3)"]
       interval: 30s
