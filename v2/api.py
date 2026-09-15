@@ -193,6 +193,24 @@ def create_app(root, token=None):
     @app.get('/api/v1/recycle-bin', tags=['系统设置'])
     def recycle_list(): return store.snapshot().get('recycle_bin',[])
 
+    @app.post('/api/v1/recycle-bin/{item_id}/restore', tags=['系统设置'])
+    def recycle_restore(item_id: str):
+        def update(d):
+            item=next((x for x in d.get('recycle_bin',[]) if x['id']==item_id),None)
+            if not item: raise ValueError('回收站记录不存在')
+            sid=item['student']['id']
+            if sid in d['students']: raise ValueError('同届同学号已重新导入，不能静默覆盖')
+            d['students'][sid]=item['student']; d['recycle_bin']=[x for x in d['recycle_bin'] if x['id']!=item_id]; return {'ok':True}
+        return store.change('恢复回收站数据',update)
+
+    @app.delete('/api/v1/recycle-bin/{item_id}', tags=['系统设置'])
+    def recycle_delete(item_id: str):
+        def update(d):
+            before=len(d.get('recycle_bin',[])); d['recycle_bin']=[x for x in d.get('recycle_bin',[]) if x['id']!=item_id]
+            if len(d['recycle_bin'])==before: raise ValueError('回收站记录不存在')
+            return {'ok':True}
+        return store.change('永久删除回收站数据',update)
+
     @app.put('/api/v1/cohort', tags=['学生与原图'], summary='切换当前届次')
     def cohort(body: Cohort):
         return store.set_cohort(body.cohort)
