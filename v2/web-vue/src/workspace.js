@@ -7,7 +7,7 @@ export async function refresh(){
 }
 export async function loadCohorts(){
   const data=await api('cohorts');state.cohort=data.active_cohort;
-  state.cohorts=[...new Set([...data.cohorts,...Array.from({length:6},(_,i)=>(new Date().getFullYear()-i)+'级')])].sort().reverse();
+  state.cohorts=[...new Set(data.cohorts)].sort().reverse();
 }
 export async function changeCohort(value){await api('cohort',{cohort:value},'PUT');await loadCohorts();await refresh();}
 export async function initialize(){

@@ -52,14 +52,14 @@ class Store:
         self.path = self.root / 'workspace.json'
         if self.path.exists():
             self.data = json.loads(self.path.read_text(encoding='utf-8'))
-            self.data.setdefault('active_cohort', str(datetime.now().year)+'级'); self.data.setdefault('hivision_urls', [])
+            self.data.setdefault('active_cohort', str(datetime.now().year)+'级'); self.data.setdefault('hivision_urls', []); self.data.setdefault('cohort_records', {}); self.data.setdefault('recycle_bin', [])
             for student in self.data.get('students', {}).values(): student.setdefault('cohort', self.data['active_cohort'])
             if self.data.get('schema_version') != 2:
                 raise ValueError('工作区版本不支持，请使用V2工作区目录')
         else:
             if (self.root / 'export_state.json').exists():
                 raise ValueError('请选择新的V2目录，然后从迁移入口导入旧数据')
-            self.data = dict(schema_version=2, revision=0, active_cohort=str(datetime.now().year)+'级', students={}, deliveries={}, jobs={}, config={}, hivision_urls=[], events=[])
+            default=str(datetime.now().year)+'级'; self.data = dict(schema_version=2, revision=0, active_cohort=default, students={}, deliveries={}, jobs={}, config={}, hivision_urls=[], events=[], cohort_records={default:{'id':uuid.uuid4().hex,'name':default,'archived':False}}, recycle_bin=[])
             atomic(self.path, self.data)
 
     def snapshot(self):
@@ -121,6 +121,14 @@ class Store:
         if not isinstance(cohort, str) or not re.fullmatch(r'\d{4}级', cohort):
             raise ValueError('届次格式应为YYYY级')
         return self.change('切换当前届次', lambda d: d.update(active_cohort=cohort) or {'active_cohort': cohort})
+
+    def manage_cohorts(self, records):
+        def update(d):
+            old=d.get('cohort_records',{}); out={}
+            for name, rec in records.items():
+                out[name]=dict(rec, id=rec.get('id') or old.get(name,{}).get('id') or uuid.uuid4().hex)
+            d['cohort_records']=out; return list(out.values())
+        return self.change('管理届次', update)
 
     def upload(self, sid, data):
         valid_id(sid)

@@ -3,6 +3,7 @@ import json
 import secrets
 import tempfile
 import time
+import uuid
 import urllib.request
 from dataclasses import asdict
 from pathlib import Path
@@ -13,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from photo_pipeline import PipelineOptions, test_hivision_api
-from .store import Store
+from .store import Store, now
 from .service import Service
 from .version import VERSION
 
@@ -24,6 +25,9 @@ class Ids(BaseModel):
 
 class Cohort(BaseModel):
     cohort: str = Field(..., pattern=r'^\d{4}级$', description='届次，例如 2026级')
+
+class CohortSettings(BaseModel):
+    cohorts: list[str]
 
 
 class BatchReview(BaseModel):
@@ -163,9 +167,31 @@ def create_app(root, token=None):
     @app.get('/api/v1/cohorts', tags=['学生与原图'], summary='读取届次列表')
     def cohorts():
         d=store.snapshot()
-        values={s.get('cohort',d.get('active_cohort')) for s in d['students'].values()}
-        values.add(d.get('active_cohort'))
-        return {'active_cohort':d.get('active_cohort'),'cohorts':sorted(x for x in values if x)}
+        records=d.get('cohort_records',{}); values={x for x,r in records.items() if not r.get('archived')}
+        values.update(s.get('cohort',d.get('active_cohort')) for s in d['students'].values())
+        values.add(d.get('active_cohort')); return {'active_cohort':d.get('active_cohort'),'cohorts':sorted(x for x in values if x), 'records':records}
+
+    @app.put('/api/v1/cohort-settings', tags=['系统设置'])
+    def cohort_settings(body: CohortSettings):
+        if len(set(body.cohorts)) != len(body.cohorts): raise ValueError('届次不能重复')
+        for x in body.cohorts:
+            if not re.fullmatch(r'\d{4}级', x.strip()): raise ValueError('届次必须为四位年份')
+        d=store.snapshot(); records=d.get('cohort_records',{}); names=set(body.cohorts)
+        for old in set(records)-names:
+            if any(s.get('cohort')==old for s in d['students'].values()): raise ValueError(old+' 含有学生数据，不能删除')
+        return store.manage_cohorts({x:records.get(x,{'name':x,'archived':False}) for x in body.cohorts})
+
+    @app.post('/api/v1/recycle-bin', tags=['系统设置'])
+    def recycle(body: Ids):
+        def update(d):
+            for sid in body.student_ids:
+                if sid in d['students']:
+                    s=d['students'].pop(sid); d.setdefault('recycle_bin',[]).append({'id':uuid.uuid4().hex,'student':s,'deleted_at':now()})
+            return {'count':len(body.student_ids)}
+        return store.change('移入回收站',update)
+
+    @app.get('/api/v1/recycle-bin', tags=['系统设置'])
+    def recycle_list(): return store.snapshot().get('recycle_bin',[])
 
     @app.put('/api/v1/cohort', tags=['学生与原图'], summary='切换当前届次')
     def cohort(body: Cohort):
