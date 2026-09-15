@@ -135,6 +135,7 @@ class SystemTest(unittest.TestCase):
         expiry=self.store.data['trash'][tid]['expires_at']
         d=self.client.get('/api/v1/settings').json();d['retention_days']=1
         self.assertEqual(self.client.put('/api/v1/settings',json=d).status_code,200)
+
         self.assertEqual(expiry,self.store.data['trash'][tid]['expires_at'])
         d=self.client.get('/api/v1/settings').json();d['cohorts']=[c for c in d['cohorts'] if c['id']!=self.cid];d['confirmed_deletions']=[self.cid]
         r=self.client.put('/api/v1/settings',json=d);self.assertEqual(r.status_code,409);self.assertIn('trash',r.text)
@@ -157,4 +158,12 @@ class SystemTest(unittest.TestCase):
         self.assertTrue(self.store.file(kept).exists())
         self.assertFalse((self.store.root/preview_file).exists())
 
+    def test_failed_business_audit_does_not_invalidate_settings(self):
+        d=self.client.get('/api/v1/settings').json()
+        response=self.client.post(self.base+'processing-jobs',json={'student_ids':['unknown'],'config':{}})
+        self.assertEqual(response.status_code,409)
+        self.assertEqual(self.system.data['revision'],d['revision'])
+        self.assertEqual(self.system.data['audit'][-1]['result'],'failed')
+        d['retention_days']=None
+        self.assertEqual(self.client.put('/api/v1/settings',json=d).status_code,200)
 if __name__=='__main__':unittest.main(verbosity=2)

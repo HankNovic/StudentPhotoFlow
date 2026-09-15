@@ -39,7 +39,7 @@ class System:
     def save(self, action, mutate, result_status='success'):
         candidate=copy.deepcopy(self.data)
         result=mutate(candidate)
-        candidate['revision']+=1
+        if result_status=='success': candidate['revision']+=1
         candidate['audit'].append(dict(at=now(),actor=actor.get(),action=action,result=result_status))
         atomic(self.path,candidate); self.data=candidate
         return result
