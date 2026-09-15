@@ -9,4 +9,6 @@ if not token: raise SystemExit('SPF_API_TOKEN is required; set it in .env')
 app=create_app(root,token);app.state.docker_mode=True;app.state.shutdown=None
 @app.get('/healthz',include_in_schema=False)
 def healthz(): return {'status':'ok','version':VERSION}
+# StaticFiles is mounted at ``/`` by the app; keep the probe ahead of it.
+app.router.routes.insert(0, app.router.routes.pop())
 if __name__=='__main__': uvicorn.run(app,host=os.getenv('SPF_HOST','0.0.0.0'),port=int(os.getenv('SPF_PORT','8769')),log_level=os.getenv('SPF_LOG_LEVEL','info'))

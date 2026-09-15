@@ -4,16 +4,16 @@ WORKDIR /src
 COPY v2/web-vue/package*.json ./
 RUN npm ci --no-audit --no-fund
 COPY v2/web-vue/ ./
-RUN npm run build
+RUN SPF_VUE_OUT=/src/dist npm run build
 FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 SPF_DOCKER_MODE=1 SPF_HOST=0.0.0.0
 WORKDIR /app
-COPY requirements-v2.txt requirements-ai.txt ./
+COPY requirements.txt requirements-v2.txt requirements-ai.txt ./
 RUN pip install --no-cache-dir -r requirements-v2.txt
 RUN pip install --no-cache-dir -r requirements-ai.txt
-COPY --from=frontend /src/dist /app/v2/web
 COPY photo_pipeline.py photo_exporter.py photo_review.py photo_workbench.py delivery_state.py export_reviewed_photos.py xlsx_photo_core.py launch_docker.py ./
 COPY v2 /app/v2
+COPY --from=frontend /src/dist /app/v2/web
 RUN test -f /app/v2/web/index.html && find /app/v2/web/assets -name '*.js' | grep -q .
 VOLUME ["/data"]
 EXPOSE 8769
