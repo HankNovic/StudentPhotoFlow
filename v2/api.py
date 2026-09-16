@@ -271,7 +271,8 @@ def create_app(root, token=None, requests=None):
 
     @app.get('/api/v1/jobs', tags=['任务与预览'], summary='查看任务进度', description='返回任务数组，最新在前；id 为任务标识，status 为状态，completed 为已完成学号，errors 为失败明细，current 为当前学号。completed 状态表示任务结束，不代表每张均成功。')
     def jobs():
-        return [service.job_view(j) for j in list(store.snapshot()['jobs'].values())[::-1]]
+        with store.lock:
+            return [service.job_view(j) for j in list(store.snapshot()['jobs'].values())[::-1]]
 
     @app.post('/api/v1/jobs/{job_id}/reconcile/{sid}')
     def reconcile(job_id:str,sid:str,body:dict):

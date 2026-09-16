@@ -113,8 +113,9 @@ class Service:
         job['counts']=dict(total=total,success=len(set(job['completed'])-failed-skipped),failed=len(failed),
                            skipped=len(skipped),remaining=max(0,total-len(set(job['completed']))),uncertain=len(job.get('uncertain',{})))
         t=job.get('timing');job['server_now']=now()
-        if t and t.get('running') and job['id'] in self._ticks:
-            t['run_seconds']+=max(0,time.monotonic()-self._ticks[job['id']])
+        tick=self._ticks.get(job['id'])
+        if t and t.get('running') and tick is not None:
+            t['run_seconds']+=max(0,time.monotonic()-tick)
             t['observed_at']=job['server_now']
         return job
 
