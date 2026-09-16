@@ -6,7 +6,10 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Unused candidate version matching v2/version.py (for example 2.4.0-rc.6)
+        description: Unused version matching the selected source (for example 2.4.0)
+        required: true
+      source_ref:
+        description: Exact source commit or immutable release tag to build
         required: true
 permissions:
   contents: read
@@ -31,14 +34,19 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-      - name: Validate candidate source version
+        with:
+          ref: ${{ inputs.source_ref }}
+      - name: Record actual build source
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Validate release source version
         env:
           VERSION: ${{ inputs.version }}
         run: |
           python - <<'PY'
           import os, re, runpy
           version = os.environ['VERSION']
-          assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+', version), 'Candidate versions only'
+          assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:-rc\.[0-9]+)?', version), 'Invalid version'
           assert runpy.run_path('v2/version.py')['VERSION'] == version, 'Source version mismatch'
           PY
       - uses: docker/setup-buildx-action@v3
@@ -63,9 +71,9 @@ jobs:
           push: true
           tags: ghcr.io/hanknovic/studentphotoflow:${{ inputs.version }}
           build-args: |
-            SOURCE_COMMIT=${{ github.sha }}
+            SOURCE_COMMIT=${{ steps.source.outputs.sha }}
             APP_VERSION=${{ inputs.version }}
           labels: |
             org.opencontainers.image.version=${{ inputs.version }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
             org.opencontainers.image.source=https://github.com/HankNovic/StudentPhotoFlow
