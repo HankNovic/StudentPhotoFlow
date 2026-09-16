@@ -10,8 +10,8 @@ RUN test "$SOURCE_COMMIT" != unknown && SPF_APP_VERSION=$APP_VERSION SPF_BUILD_I
 FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 SPF_DOCKER_MODE=1 SPF_HOST=0.0.0.0
 WORKDIR /app
-COPY requirements.txt requirements-v2.txt requirements-ai.txt ./
-RUN pip install --no-cache-dir -r requirements-v2.txt
+COPY requirements.txt requirements-v2.txt requirements-ai.txt requirements-release.lock ./
+RUN pip install --no-cache-dir -c requirements-release.lock -r requirements-v2.txt
 COPY photo_pipeline.py photo_exporter.py photo_review.py photo_workbench.py delivery_state.py export_reviewed_photos.py xlsx_photo_core.py launch_docker.py ./
 COPY v2/*.py /app/v2/
 COPY --from=frontend /src/dist /app/v2/web
