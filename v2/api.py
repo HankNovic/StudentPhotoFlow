@@ -378,6 +378,7 @@ def create_app(root, token=None):
                     if size>500*1024**2:
                         raise ValueError('压缩包超过500MB')
                     output.write(chunk)
+            raw=path.read_bytes()
             try:
                 rows=service.inspect_zip(path)
             except zipfile.BadZipFile:
