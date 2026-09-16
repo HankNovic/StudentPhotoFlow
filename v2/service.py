@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 import zipfile
+from datetime import datetime
 from dataclasses import asdict
 from pathlib import Path
 
@@ -19,6 +20,8 @@ class Service:
         self.store = store
         self.thread = None
         self.gate = threading.Lock()
+        self.hivision_condition = threading.Condition()
+        self.hivision_active = 0
         # Additive task semantics upgrade; preserve a pre-upgrade index, never reset data.
         if store.data.get('task_semantics',1)<2:
             backup=store.root/'backups'/'before-task-semantics-2.json'
@@ -47,6 +50,18 @@ class Service:
         text='\n'.join(line for line in text.splitlines() if not line.lstrip().startswith(('Traceback','File "','at ')))
         return text[:6000]
 
+    @staticmethod
+    def _seconds(a,b):
+        try: return max(0.0,(datetime.fromisoformat(b)-datetime.fromisoformat(a)).total_seconds())
+        except (TypeError,ValueError): return None
+    def _timing(self,job,status=None,end=False):
+        t=now(); old=job.get('status'); target=status or old
+        if target in {'running','pausing'} and not job.get('start_at'): job['start_at']=t
+        if old=='running' and target!='running' and job.get('active_started_at'):
+            job['active_seconds']=round(job.get('active_seconds',0)+(self._seconds(job['active_started_at'],t) or 0),3); job.pop('active_started_at',None)
+        if target=='running' and old!='running': job['active_started_at']=t
+        if end: job['end_at']=t
+
     def job_view(self, job):
         job=copy.deepcopy(job)
         job['errors']={sid:self.safe_error(msg) for sid,msg in job.get('errors',{}).items()}
@@ -55,6 +70,11 @@ class Service:
         skipped=set(job.get('skipped',[])); failed=set(job['errors']) & set(job['completed'])
         job['counts']=dict(total=total,success=len(set(job['completed'])-failed-skipped),failed=len(failed),
                            skipped=len(skipped),remaining=max(0,total-len(set(job['completed']))),uncertain=len(job.get('uncertain',{})))
+        t=now(); job['start_time']=job.get('start_at'); job['end_time']=job.get('end_at')
+        job['total_seconds']=self._seconds(job.get('start_at'),job.get('end_at') or t) if job.get('start_at') else None
+        active=job.get('active_seconds',0)
+        if job.get('active_started_at') and job.get('status') in {'running','pausing'}: active+=self._seconds(job['active_started_at'],t) or 0
+        job['active_seconds']=round(active,3) if job.get('start_at') else None
         return job
 
     def reconcile(self,jid,sid,decision):
@@ -133,7 +153,7 @@ class Service:
             if expected_revision is not None and plan['revision'] != expected_revision:
                 raise ValueError('执行计划已变化，请重新预览')
             job_id = uuid.uuid4().hex
-            job = dict(id=job_id, status='running', uncertain={}, skipped=[], created_at=now(), plan=plan, completed=[], errors={}, current=None,request_id=request_id)
+            job = dict(id=job_id, status='running', start_at=now(), active_started_at=now(), active_seconds=0, uncertain={}, skipped=[], created_at=now(), plan=plan, completed=[], errors={}, current=None,request_id=request_id)
             self.store.change('创建处理任务', lambda d: d['jobs'].update({job_id: job}))
             self._launch(job_id)
             return job
@@ -242,10 +262,10 @@ class Service:
         with self.store.lock:
             state=self.store.data['jobs'][jid]['status']
             if state=='cancelling':
-                self.store.change('手动结束任务',lambda d:d['jobs'][jid].update(status='cancelled',end_reason='manual',current=None))
+                self.store.change('手动结束任务',lambda d:(self._timing(d['jobs'][jid],'cancelled',True),d['jobs'][jid].update(status='cancelled',end_reason='manual',current=None)))
                 return False
             if state=='pausing':
-                self.store.change('暂停完成',lambda d:d['jobs'][jid].update(status='paused',current=None))
+                self.store.change('暂停完成',lambda d:(self._timing(d['jobs'][jid],'paused'),d['jobs'][jid].update(status='paused',current=None)))
                 return False
             if state!='running': return False
             self.store.change('开始执行 '+sid,lambda d:d['jobs'][jid].update(current=sid))
@@ -254,7 +274,7 @@ class Service:
     def _finish(self,jid):
         with self.store.lock:
             manual=self.store.data['jobs'][jid]['status'] in {'cancelling','cancelled'}
-            self.store.change('任务结束',lambda d:d['jobs'][jid].update(status='cancelled' if manual else 'completed',end_reason='manual' if manual else 'natural',current=None))
+            self.store.change('任务结束',lambda d:(self._timing(d['jobs'][jid],'cancelled' if manual else 'completed',True),d['jobs'][jid].update(status='cancelled' if manual else 'completed',end_reason='manual' if manual else 'natural',current=None)))
 
     def _interrupted(self,jid,exc):
         def save(d):
@@ -308,7 +328,8 @@ class Service:
                 target='running'
             else: raise ValueError('当前状态不能执行该操作；已安全结束的任务不可继续')
             def save(d):
-                j=d['jobs'][job_id];j['status']=target
+                j=d['jobs'][job_id];self._timing(j,target,target in {'cancelled'})
+                j['status']=target
                 if action=='cancel':j['end_reason']='manual'
                 if action=='resume':j.pop('end_reason',None)
             self.store.change('任务 '+action,save)
@@ -354,9 +375,18 @@ class Service:
             self._interrupted(job_id,exc)
 
     def execute(self, source, config):
-        result = run_pipeline(self.store.file(source['file']).read_bytes(), self.options(config))
-        stages = [dict(code=s.code, label=s.label, status=s.status, detail=s.detail, metrics=s.metrics, artifact=self.store.artifact(s.image_bytes)) for s in result.stages]
-        return dict(status=result.status, stages=stages, reasons=result.reasons, artifact=self.store.artifact(result.output_bytes) if result.output_bytes else None)
+        options=self.options(config); acquired=False
+        if options.background_mode=='hivision':
+            with self.hivision_condition:
+                while self.hivision_active >= options.hivision_concurrency: self.hivision_condition.wait(timeout=max(1,options.hivision_timeout))
+                self.hivision_active+=1; acquired=True
+        try:
+            result=run_pipeline(self.store.file(source['file']).read_bytes(), options)
+            stages=[dict(code=s.code,label=s.label,status=s.status,detail=s.detail,metrics=s.metrics,artifact=self.store.artifact(s.image_bytes)) for s in result.stages]
+            return dict(status=result.status,stages=stages,reasons=result.reasons,artifact=self.store.artifact(result.output_bytes) if result.output_bytes else None)
+        finally:
+            if acquired:
+                with self.hivision_condition: self.hivision_active-=1; self.hivision_condition.notify_all()
 
     def historical_delivery(self, ids, reason, cohort=None):
         if not reason.strip():

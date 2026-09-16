@@ -2,7 +2,7 @@ export const names={quality_enabled:'启用内置预检',auto_orient:'校正90/1
 export const groups=[
  ['原图预检','启用内置预检后执行以下检查；阈值与对应检查放在一起。',['quality_enabled','stop_on_reject','auto_orient','orientation_min_confidence','orientation_confidence_margin','check_grayscale','grayscale_ratio_threshold','grayscale_delta_limit','check_face','face_confidence_threshold','check_glare','glare_ratio_threshold','glare_luma_threshold','check_recapture','recapture_score_threshold']],
  ['背景处理','选择处理引擎；不处理背景时保留原背景。',['background_mode','background_color']],
- ['Hivision · 服务与模型','仅在选择 Hivision 引擎时使用。接口测试只检查连接，不上传照片。',['hivision_url','hivision_timeout','hivision_matting_model','hivision_face_model']],
+ ['Hivision · 服务与模型','仅在选择 Hivision 引擎时使用。接口测试只检查连接，不上传照片。',['hivision_url','hivision_timeout','hivision_concurrency','hivision_matting_model','hivision_face_model']],
  ['Hivision · 尺寸与构图','标准图尺寸与最终输出尺寸独立；高清返回仍会受最终裁切设置影响。',['hivision_width','hivision_height','hivision_dpi','hivision_hd','hivision_face_align','hivision_head_measure_ratio','hivision_head_height_ratio','hivision_top_distance_min','hivision_top_distance_max']],
  ['Hivision · 画面调整','保留 0 使用默认效果。建议先在单张照片上试处理。',['hivision_brightness_strength','hivision_contrast_strength','hivision_sharpen_strength','hivision_saturation_strength']],
  ['最终输出','在背景处理之后执行；开启后按以下宽高裁切并缩放。',['crop_enabled','crop_width','crop_height']]

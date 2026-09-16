@@ -28,7 +28,7 @@ async function test(){testing.value=true;try{testResult.value=JSON.stringify(awa
    </div>
    <template v-if="keys.includes('hivision_url')">
     <div class="toolbar"><el-button @click="add">添加当前地址到历史</el-button><el-button @click="test" :loading="testing">测试当前 API（不上传照片）</el-button></div>
-    <p class="muted">输入新地址后按回车确认。展开可选择历史，× 仅删除历史记录。切换后保存配置供下次运行使用。</p>
+    <p class="muted">输入新地址后按回车确认。展开可选择历史，× 仅删除历史记录。请求并发数表示同时请求数量（1 为串行），需根据 Hivision 服务性能调整；保存后对新调度生效，已发出的请求不受影响。</p>
     <pre v-if="testResult" data-testid="engine-test-result">{{testResult}}</pre>
    </template>
   </el-card>

@@ -58,6 +58,7 @@ class PipelineOptions:
     background_color: str = "#438EDB"
     hivision_url: str = "http://127.0.0.1:8080"
     hivision_timeout: int = 120
+    hivision_concurrency: int = 1
     hivision_height: int = 413
     hivision_width: int = 295
     hivision_dpi: int = 300
@@ -814,6 +815,9 @@ def validate_pipeline_options(options: PipelineOptions) -> None:
     if options.background_mode == "hivision" and not options.hivision_url.strip():
         raise PipelineError("选择 Hivision 时必须填写 API 地址")
     options.hivision_timeout = int(options.hivision_timeout)
+    options.hivision_concurrency = int(options.hivision_concurrency)
+    if not (1 <= options.hivision_concurrency <= 16):
+        raise PipelineError("Hivision 请求并发数必须在 1 到 16 之间")
     options.hivision_height = int(options.hivision_height)
     options.hivision_width = int(options.hivision_width)
     options.hivision_dpi = int(options.hivision_dpi)

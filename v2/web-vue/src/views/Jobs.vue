@@ -2,7 +2,10 @@
 import {state,refresh} from '../workspace';
 import {api} from '../api';
 import {ElMessage,ElMessageBox} from 'element-plus';
-import {ref,reactive} from 'vue';
+import {ref,reactive,onMounted,onUnmounted} from 'vue';
+const tick=ref(Date.now());let timer;onMounted(()=>timer=setInterval(()=>tick.value=Date.now(),1000));onUnmounted(()=>clearInterval(timer));
+function duration(sec){if(sec==null)return '未记录';sec=Math.max(0,Math.round(sec));return `${Math.floor(sec/3600)}时${Math.floor(sec%3600/60)}分${sec%60}秒`;}
+function time(v){return v?new Date(v).toLocaleString('zh-CN',{hour12:false}):'未记录';}
 const collapsed=reactive({});
 function toggleErrors(id){collapsed[id]=!collapsed[id];}
 const busy=ref('');
@@ -15,6 +18,7 @@ async function reconcile(job,sid,decision){const cid=state.cohort;await ElMessag
  <el-empty v-if="!state.jobs.length" description="暂无任务"/>
  <el-card v-for="job in state.jobs" :key="job.id" shadow="never" data-testid="job" :data-job="job.id">
   <div class="section-heading"><h3>{{job.kind==='import'?'原图接收':'照片处理'}} · {{job.id.slice(0,8)}}</h3><el-tag>{{labels[job.status]||job.status}}{{job.status==='completed'&&job.counts?.failed?'，失败 '+job.counts.failed+' 人':''}}</el-tag></div>
+  <p class="job-times">开始 {{time(job.start_time)}} · 结束 {{job.end_time?time(job.end_time):'—'}} · 总历时 {{duration(job.total_seconds)}} · 实际运行 {{duration(job.active_seconds)}}</p>
   <p>成功 {{job.counts?.success||0}} · 失败 {{job.counts?.failed||0}} · 未执行 {{(job.counts?.remaining||0)+(job.counts?.skipped||0)}} · 总计 {{job.counts?.total||0}} · 当前 {{job.current||'—'}}</p>
   <el-progress :percentage="Math.min(100,Math.round(((job.counts?.success||0)+(job.counts?.failed||0))/Math.max(1,job.counts?.total||0)*100))"/>
   <div class="toolbar"><el-button v-if="job.status==='running'" :loading="busy===job.id" @click="action(job,'pause')">暂停</el-button><el-button v-if="['paused','interrupted'].includes(job.status)" :disabled="Object.keys(job.uncertain||{}).length>0" :loading="busy===job.id" @click="action(job,'resume')">继续未完成项</el-button><el-button v-if="['running','pausing','paused','interrupted'].includes(job.status)" type="danger" :loading="busy===job.id" @click="action(job,'cancel')">安全结束</el-button></div>
@@ -24,3 +28,4 @@ async function reconcile(job,sid,decision){const cid=state.cohort;await ElMessag
   <el-collapse><el-collapse-item title="处理计划"><pre>{{JSON.stringify(job.plan.items,null,2)}}</pre></el-collapse-item></el-collapse>
  </el-card>
 </template>
+
