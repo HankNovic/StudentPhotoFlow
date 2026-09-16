@@ -52,7 +52,7 @@ class System:
     def child(self,cid):
         c=self.cohort(cid)
         if cid not in self.apps:
-            app=create_app(self.root/'cohorts'/cid,self.token)
+            app=create_app(self.root/'cohorts'/cid,self.token,self.control.state.service.requests)
             store=app.state.store
             store.fixed_cohort=cid
             store.cohort_name=lambda: self.cohort(cid)['name']
@@ -127,8 +127,6 @@ class BusinessRoute:
             async def dispatch():
                 if cid and scope['method']!='GET':
                     if system.cohort(cid)['archived']: raise ValueError('归档届次只读，请在系统设置恢复后操作')
-                    starts_work=suffix in {'processing-jobs','imports/xlsx','imports/zip'} or suffix.endswith(('/resume','/preview'))
-                    if starts_work and any(a.state.service.thread and a.state.service.thread.is_alive() for key,a in system.apps.items() if key!=cid): raise ValueError('其他届次有活动任务，请先等待完成或安全中断')
                 inner=dict(scope,path=path,raw_path=path.encode(),root_path='')
                 inner['headers']=[(k,v) for k,v in scope['headers'] if k not in {b'authorization',b'origin'}]+[(b'authorization',('Bearer '+system.token).encode())]
                 await target(inner,receive,send)

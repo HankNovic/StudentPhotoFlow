@@ -77,9 +77,9 @@ def detect_cohort(reader, sheet, header_row, headers):
     return next(iter(found), None)
 
 
-def create_app(root, token=None):
+def create_app(root, token=None, requests=None):
     store = Store(root)
-    service = Service(store)
+    service = Service(store,requests)
     app = FastAPI(title='StudentPhotoFlow V2', version=VERSION, description=API_DESCRIPTION)
     app.state.store, app.state.service = store, service
     token = token or secrets.token_urlsafe(32)
@@ -220,6 +220,7 @@ def create_app(root, token=None):
     def save_config(body: dict):
         config = asdict(service.options(body))
         store.change('保存配置',lambda d:d.update(config=config))
+        service.requests.configure(config['hivision_concurrency'])
         return config
 
     @app.get('/api/v1/engines/hivision/urls', tags=['处理配置'], summary='读取历史 Hivision 地址')
@@ -277,7 +278,7 @@ def create_app(root, token=None):
         if body.get('confirmed') is not True: raise ValueError('请先核对外部服务及本地结果后明确确认')
         return service.reconcile(job_id,sid,body.get('decision'))
 
-    @app.post('/api/v1/jobs/{job_id}/{action}', tags=['任务与预览'], summary='暂停、恢复或中断任务', description='job_id 为任务标识；action 可填 pause（暂停）、resume（继续未完成项）、cancel（安全结束，不可恢复）。暂停和中断在当前学生结束后生效。返回任务记录；不允许的操作返回 409。')
+    @app.post('/api/v1/jobs/{job_id}/{action}', tags=['任务与预览'], summary='暂停、恢复或中断任务', description='job_id 为任务标识；action 可填 pause（暂停）、resume（继续未完成项）、cancel（安全结束，不可恢复）。暂停和结束等待所有正在处理的项目收尾后生效。返回任务记录；不允许的操作返回 409。')
     def control(job_id: str, action: str):
         return service.control(job_id,action)
 

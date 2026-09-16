@@ -5,7 +5,7 @@ import { names,groups,choices,engineNames } from '../config';
 import { state } from '../workspace';
 import { api } from '../api';
 import HivisionUrlPicker from './HivisionUrlPicker.vue';
-const props=defineProps({modelValue:Object}),emit=defineEmits(['update:modelValue']);
+const props=defineProps({modelValue:Object,globalSettings:Boolean}),emit=defineEmits(['update:modelValue']);
 const testResult=ref(''),testing=ref(false);
 function set(key,value){emit('update:modelValue',{...props.modelValue,[key]:value});}
 async function add(){state.urls=await api('engines/hivision/urls',{url:props.modelValue.hivision_url});ElMessage.success('地址已保存到历史');}
@@ -18,6 +18,7 @@ async function test(){testing.value=true;try{testResult.value=JSON.stringify(awa
    <div class="config-grid">
     <el-form-item v-for="key in keys" :key="key" :label="names[key]" :data-config="key">
      <HivisionUrlPicker v-if="key==='hivision_url'" :model-value="modelValue[key]" @update:model-value="set(key,$event)"/>
+     <el-input-number v-else-if="key==='hivision_concurrency'" :model-value="modelValue[key]??1" @update:model-value="set(key,$event)" :min="1" :max="16" :precision="0" :step="1" step-strictly :disabled="!globalSettings" :aria-label="names[key]"/>
      <el-select v-else-if="choices[key]" :model-value="modelValue[key]" @update:model-value="set(key,$event)" :aria-label="names[key]">
       <el-option v-for="value in choices[key]" :key="value" :value="value" :label="engineNames[value]||value"/>
      </el-select>
@@ -28,7 +29,8 @@ async function test(){testing.value=true;try{testResult.value=JSON.stringify(awa
    </div>
    <template v-if="keys.includes('hivision_url')">
     <div class="toolbar"><el-button @click="add">添加当前地址到历史</el-button><el-button @click="test" :loading="testing">测试当前 API（不上传照片）</el-button></div>
-    <p class="muted">输入新地址后按回车确认。展开可选择历史，× 仅删除历史记录。请求并发数表示同时请求数量（1 为串行），需根据 Hivision 服务性能调整；保存后对新调度生效，已发出的请求不受影响。</p>
+    <p class="muted">输入新地址后按回车确认。展开可选择历史，× 仅删除历史记录。</p>
+    <p class="muted">请求并发数：同一应用内，每个 Hivision 服务地址共享的同时请求数量，1 为串行，需根据 Hivision 服务性能调整。仅在处理配置保存后生效（含运行中任务的后续调度）；降低上限不取消已发出的请求。本次参数调整不能覆盖全局上限。</p>
     <pre v-if="testResult" data-testid="engine-test-result">{{testResult}}</pre>
    </template>
   </el-card>

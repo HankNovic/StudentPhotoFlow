@@ -502,15 +502,8 @@ class PhotoPipelineTests(unittest.TestCase):
         }).encode("utf-8")
         captured: dict[str, object] = {}
 
-        class FakeResponse:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args) -> None:
-                return None
-
-            def read(self, _limit: int) -> bytes:
-                return response_body
+        class FakeResponse(io.BytesIO):
+            def __init__(self): super().__init__(response_body)
 
         def fake_urlopen(request, timeout):
             captured["request"] = request

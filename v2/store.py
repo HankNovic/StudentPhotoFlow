@@ -79,6 +79,13 @@ class Store:
             self.data = candidate
             return result
 
+    def checkpoint(self, callback):
+        with self.lock:
+            candidate=copy.deepcopy(self.data)
+            callback(candidate)
+            atomic(self.path,candidate)
+            self.data=candidate
+
     def file(self, relative):
         path = (self.root / relative).resolve()
         if not path.is_relative_to(self.root) or not path.is_file():

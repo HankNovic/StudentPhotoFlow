@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -773,11 +774,26 @@ def _hivision_replace_background(image, options: PipelineOptions):
             "User-Agent": "StudentPhotoFlow/1",
         },
     )
+    deadline=time.monotonic()+options.hivision_timeout
+    def read_bounded(response,limit):
+        chunks=[];size=0
+        while size<limit:
+            remaining=deadline-time.monotonic()
+            if remaining<=0: raise TimeoutError('Hivision 请求超过配置的总超时')
+            sock=getattr(getattr(getattr(response,'fp',None),'raw',None),'_sock',None)
+            if sock is not None:sock.settimeout(remaining)
+            chunk=getattr(response,'read1',response.read)(min(65536,limit-size))
+            if not chunk:break
+            chunks.append(chunk);size+=len(chunk)
+        return b''.join(chunks)
     try:
-        with urllib.request.urlopen(request, timeout=max(5, int(options.hivision_timeout))) as response:
-            raw = response.read(50 * 1024 * 1024)
+        with urllib.request.urlopen(request, timeout=options.hivision_timeout) as response:
+            raw=read_bounded(response,50*1024*1024+1)
+            if len(raw)>50*1024*1024: raise PipelineError('Hivision 响应超过50MB')
     except urllib.error.HTTPError as exc:
-        detail = exc.read(2048).decode("utf-8", errors="replace")
+        try: detail=read_bounded(exc,2048).decode('utf-8',errors='replace')
+        except (TimeoutError,OSError): detail='读取错误响应超时'
+        finally: exc.close()
         raise PipelineError(f"Hivision API 返回 HTTP {exc.code}：{detail}") from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise PipelineError(f"无法连接 Hivision API：{exc}") from exc
@@ -815,8 +831,7 @@ def validate_pipeline_options(options: PipelineOptions) -> None:
     if options.background_mode == "hivision" and not options.hivision_url.strip():
         raise PipelineError("选择 Hivision 时必须填写 API 地址")
     options.hivision_timeout = int(options.hivision_timeout)
-    options.hivision_concurrency = int(options.hivision_concurrency)
-    if not (1 <= options.hivision_concurrency <= 16):
+    if type(options.hivision_concurrency) is not int or not (1 <= options.hivision_concurrency <= 16):
         raise PipelineError("Hivision 请求并发数必须在 1 到 16 之间")
     options.hivision_height = int(options.hivision_height)
     options.hivision_width = int(options.hivision_width)
