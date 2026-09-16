@@ -1,12 +1,12 @@
 name: container
 on:
   push:
-    branches: [main, 'feature/**', 'repair/**']
+    branches: [main, 'feature/**', 'repair/**', 'fix/**']
   pull_request:
   workflow_dispatch:
     inputs:
       version:
-        description: Unused candidate version matching v2/version.py (for example 2.4.0-rc.4)
+        description: Unused candidate version matching v2/version.py (for example 2.4.0-rc.5)
         required: true
 permissions:
   contents: read

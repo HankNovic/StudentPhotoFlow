@@ -100,7 +100,7 @@ class V2Test(unittest.TestCase):
         with zipfile.ZipFile(self.store.root/'deliveries'/batch['id']/'photos.zip') as z:
             self.assertIn('001.jpg',z.namelist())
 
-    def test_cancel_resume_checkpoints_and_no_duplicate(self):
+    def test_pause_resume_checkpoints_and_no_duplicate(self):
         import threading
         self.store.upload('001',photo())
         self.store.upload('002',photo())
@@ -114,11 +114,11 @@ class V2Test(unittest.TestCase):
         with patch.object(self.service,'execute',side_effect=slow):
             job=self.service.start(['001','002'],{})
             self.assertTrue(entered.wait(5))
-            self.service.control(job['id'],'cancel')
+            self.service.control(job['id'],'pause')
             release.set()
             self.service.thread.join(10)
         saved=self.store.snapshot()['jobs'][job['id']]
-        self.assertEqual(saved['status'],'cancelled')
+        self.assertEqual(saved['status'],'paused')
         self.assertEqual(saved['completed'],['001'])
         self.service.control(job['id'],'resume')
         self.service.thread.join(10)

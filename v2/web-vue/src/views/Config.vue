@@ -1,10 +1,13 @@
 <script setup>
+import {computed} from 'vue';
+import {useDraft} from '../drafts';
 import { ElMessage } from 'element-plus';
 import { state } from '../workspace';
 import { api,download,run } from '../api';
 import ConfigFields from '../components/ConfigFields.vue';
-async function save(){state.config=await api('config',state.config,'PUT');ElMessage.success('运行配置已保存');}
-async function importConfig(file){state.config=await api('config',JSON.parse(await file.raw.text()),'PUT');ElMessage.success('配置已导入并保存');}
+useDraft('config',computed(()=>JSON.stringify(state.config)!==JSON.stringify(state.savedConfig)),()=>{state.config={...state.savedConfig};});
+async function save(){state.config=await api('config',state.config,'PUT');state.savedConfig={...state.config};ElMessage.success('运行配置已保存');}
+async function importConfig(file){state.config=await api('config',JSON.parse(await file.raw.text()),'PUT');state.savedConfig={...state.config};ElMessage.success('配置已导入并保存');}
 </script>
 <template>
  <div class="toolbar sticky-tools"><el-button type="primary" @click="save">保存配置</el-button><el-button @click="download('StudentPhotoFlow配置.json',state.config)">导出配置 JSON</el-button><el-upload :auto-upload="false" :show-file-list="false" accept=".json" :on-change="file=>run(()=>importConfig(file))"><el-button>导入配置 JSON</el-button></el-upload></div>

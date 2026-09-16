@@ -270,9 +270,14 @@ def create_app(root, token=None):
 
     @app.get('/api/v1/jobs', tags=['任务与预览'], summary='查看任务进度', description='返回任务数组，最新在前；id 为任务标识，status 为状态，completed 为已完成学号，errors 为失败明细，current 为当前学号。completed 状态表示任务结束，不代表每张均成功。')
     def jobs():
-        return list(store.snapshot()['jobs'].values())[::-1]
+        return [service.job_view(j) for j in list(store.snapshot()['jobs'].values())[::-1]]
 
-    @app.post('/api/v1/jobs/{job_id}/{action}', tags=['任务与预览'], summary='暂停、恢复或中断任务', description='job_id 为任务标识；action 可填 pause（暂停）、resume（继续未完成项）、cancel（安全中断）。暂停和中断在当前学生结束后生效。返回任务记录；不允许的操作返回 409。')
+    @app.post('/api/v1/jobs/{job_id}/reconcile/{sid}')
+    def reconcile(job_id:str,sid:str,body:dict):
+        if body.get('confirmed') is not True: raise ValueError('请先核对外部服务及本地结果后明确确认')
+        return service.reconcile(job_id,sid,body.get('decision'))
+
+    @app.post('/api/v1/jobs/{job_id}/{action}', tags=['任务与预览'], summary='暂停、恢复或中断任务', description='job_id 为任务标识；action 可填 pause（暂停）、resume（继续未完成项）、cancel（安全结束，不可恢复）。暂停和中断在当前学生结束后生效。返回任务记录；不允许的操作返回 409。')
     def control(job_id: str, action: str):
         return service.control(job_id,action)
 

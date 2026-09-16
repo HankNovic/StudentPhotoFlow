@@ -140,6 +140,8 @@ class BusinessRoute:
 
 def create_system_app(root,token):
     if not token or len(token)<16 or token=='replace-with-a-long-random-secret': raise ValueError('请设置至少 16 位随机 SPF_API_TOKEN，不能使用示例值')
+    build_file=Path(__file__).parent/'web'/'build-info.json'
+    build_id=json.loads(build_file.read_text('utf-8')).get('build_id','unknown') if build_file.exists() else 'unknown'
     system=System(root,token)
     sessions={}
     async def cleaner():
@@ -173,7 +175,7 @@ def create_system_app(root,token):
             response=await call_next(request)
             if protected and request.method!='GET' and response.status_code>=400:
                 system.save('操作失败 '+path+' HTTP '+str(response.status_code),lambda d:None,result_status='failed')
-            response.headers.update({'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'})
+            response.headers.update({'Cache-Control':('public, max-age=31536000, immutable' if path.startswith('/assets/') and response.status_code==200 else 'no-store'),'X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer'})
             return response
         finally: actor.reset(context)
 
@@ -198,7 +200,7 @@ def create_system_app(root,token):
         response=JSONResponse({'ok':True}); response.delete_cookie('spf_session'); return response
 
     @app.get('/healthz')
-    def probe(): return dict(status='ok',version=VERSION,source_commit=os.getenv('SPF_SOURCE_COMMIT','unknown'),schema_version=3)
+    def probe(): return dict(status='ok',version=VERSION,source_commit=os.getenv('SPF_SOURCE_COMMIT','unknown'),build_id=build_id,schema_version=3)
 
     @app.get('/api/v1/health')
     def health(): return dict(probe(),workspace=str(system.root),docker_mode=True)
@@ -211,6 +213,17 @@ def create_system_app(root,token):
     async def save_settings(request:Request):
         body=await request.json()
         async with system.gate: return system.update(body)
+
+    @app.delete('/api/v1/cohorts/{cid}')
+    async def remove_cohort(cid:str,request:Request):
+        body=await request.json()
+        async with system.gate:
+            if body.get('confirmed') is not True: raise ValueError('删除空届次需要专门确认')
+            current=system.settings()
+            system.cohort(cid)
+            current['cohorts']=[c for c in current['cohorts'] if c['id']!=cid]
+            current['confirmed_deletions']=[cid]
+            return system.update(current)
 
     @app.get('/api/v1/recycle-bin')
     def trash():

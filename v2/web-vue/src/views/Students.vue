@@ -24,8 +24,8 @@ async function applyBatch(){
  const student_ids=state.students.filter(s=>selected.value.includes(s.id)&&s.status==='review').map(s=>s.id);
  busy.value=true;try{const d=await api('reviews/batch',{student_ids,decision:batchDecision.value,reason:reason.value});batchDecision.value='';selected.value=[];await refresh();ElMessage.success('已批量审核 '+d.count+' 人');}finally{busy.value=false;}
 }
-async function replan(){planData.value=await api('processing-jobs',{student_ids:planIds.value,config:state.config,new_version:newVersion.value,dry_run:true});}
-async function openPlan(){if(!selected.value.length)throw Error('请先选中学生');planIds.value=[...selected.value];await replan();planOpen.value=true;}
+async function replan(){const cid=state.cohort;const data=await api('processing-jobs',{student_ids:planIds.value,config:state.config,new_version:newVersion.value,dry_run:true},undefined,cid);if(cid!==state.cohort)return false;planData.value=data;return true;}
+async function openPlan(){if(!selected.value.length)throw Error('请先选中学生');planIds.value=[...selected.value];if(await replan())planOpen.value=true;}
 async function start(){
  busy.value=true;try{await api('processing-jobs',{student_ids:planIds.value,config:planData.value.config,new_version:newVersion.value,dry_run:false,expected_revision:planData.value.revision});planOpen.value=false;await refresh();emit('navigate','jobs');ElMessage.success('处理任务已创建');}finally{busy.value=false;}
 }

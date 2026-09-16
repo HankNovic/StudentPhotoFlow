@@ -4,8 +4,9 @@ import { api,url } from '../api';
 import { ElMessage,ElMessageBox } from 'element-plus';
 const labels={prepared:'待实际交付',delivered:'已交付',cancelled:'已取消'};
 async function action(batch,value){
+ const cid=state.cohort;
  if(value==='confirm')await ElMessageBox.confirm('确认照片已实际发送给接收方？','确认实际交付',{confirmButtonText:'确认已发送',cancelButtonText:'取消'});
- await api('deliveries/'+batch.id+'/'+value,{});await refresh();ElMessage.success(value==='confirm'?'已确认交付':'交付包已取消');
+ await api('deliveries/'+batch.id+'/'+value,{},undefined,cid);await refresh();ElMessage.success(value==='confirm'?'已确认交付':'交付包已取消');
 }
 </script>
 <template>

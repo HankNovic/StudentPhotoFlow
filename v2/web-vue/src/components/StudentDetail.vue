@@ -6,9 +6,13 @@ import {state,refresh} from '../workspace';
 import Photo from './Photo.vue';
 import Stages from './Stages.vue';
 import ConfigFields from './ConfigFields.vue';
+import {useDraft,confirmLeave} from '../drafts';
 const props=defineProps({id:String,visibleIds:{type:Array,default:()=>[]}}),emit=defineEmits(['update:id']);
 const detail=ref(null),preview=ref(null),busy=ref(false),settings=ref([]),config=ref({}),jobs=ref([]),batches=ref([]),cohort=ref(''),cohortName=ref(''),newVersion=ref(false),plan=ref(null);
 let timer,requestId='';
+const initialConfig=ref('');
+useDraft('single',computed(()=>!!props.id&&!!initialConfig.value&&JSON.stringify(config.value)!==initialConfig.value),()=>{config.value=JSON.parse(initialConfig.value);});
+async function close(){if(await confirmLeave())emit('update:id','');}
 const source=computed(()=>detail.value?.sources.at(-1));
 const result=computed(()=>detail.value?.results.filter(r=>r.source_id===source.value?.id).at(-1));
 const active=computed(()=>jobs.value.some(j=>['running','pausing','paused','cancelling','queued'].includes(j.status)));
@@ -18,21 +22,21 @@ const canReview=computed(()=>!!result.value?.artifact&&!detail.value?.status.sta
 const position=computed(()=>props.visibleIds.indexOf(props.id));
 const call=(p,b,m)=>api(p,b,m,cohort.value);
 async function load(){const sid=props.id,cid=cohort.value;if(!sid||!cid)return;const [d,j,b]=await Promise.all([api('students/'+encodeURIComponent(sid),undefined,undefined,cid),api('jobs',undefined,undefined,cid),api('deliveries',undefined,undefined,cid)]);if(sid!==props.id||cid!==cohort.value)return;detail.value=d;jobs.value=j.filter(j=>j.plan.items.some(i=>i.student_id===sid));batches.value=b.filter(b=>b.items.some(i=>i.student_id===sid));}
-watch(()=>props.id,async(id)=>{if(!id)return;detail.value=null;cohort.value=state.cohort;cohortName.value=state.cohortName;plan.value=null;preview.value=null;newVersion.value=false;requestId='';await run(async()=>{const saved=await api('config');if(id!==props.id)return;config.value={...saved.defaults,...saved.saved};await load();});},{immediate:true});
+watch(()=>props.id,async(id)=>{if(!id)return;detail.value=null;cohort.value=state.cohort;cohortName.value=state.cohortName;plan.value=null;preview.value=null;newVersion.value=false;requestId='';await run(async()=>{const saved=await api('config');if(id!==props.id)return;config.value={...saved.defaults,...saved.saved};initialConfig.value=JSON.stringify(config.value);await load();});},{immediate:true});
 watch(()=>[JSON.stringify(config.value),newVersion.value],()=>{plan.value=null;requestId='';});
 async function review(decision){let reason='';if(decision==='rejected')reason=(await ElMessageBox.prompt('退回原因（可留空）','退回当前成片',{confirmButtonText:'保存'})).value||'';await call('reviews',{student_id:props.id,result_id:result.value.id,decision,expected_revision:detail.value.revision,reason});await load();await refresh();ElMessage.success('审核已保存');}
-function move(delta){const next=props.visibleIds[position.value+delta];if(next&&cohort.value===state.cohort)emit('update:id',next);}
+async function move(delta){if(!await confirmLeave())return;const next=props.visibleIds[position.value+delta];if(next&&cohort.value===state.cohort)emit('update:id',next);}
 async function test(){busy.value=true;try{preview.value=await call('students/'+encodeURIComponent(props.id)+'/preview',config.value);}finally{busy.value=false;}}
 async function replace(){const {value}=await ElMessageBox.prompt('保留原交付历史，请填写替换原因','启动照片替换',{inputValidator:v=>!!v?.trim()||'请填写原因',confirmButtonText:'启动替换'});await call('students/'+encodeURIComponent(props.id)+'/replacement',{reason:value});await load();await refresh();}
 async function upload(file){busy.value=true;try{const body=new FormData();body.append('photo',file.raw);await call('students/'+encodeURIComponent(props.id)+'/photos',body);plan.value=null;requestId='';await load();await refresh();ElMessage.success('原图已保存，请预览单人处理计划');}finally{busy.value=false;}}
 async function replan(){plan.value=await call('processing-jobs',{student_ids:[props.id],config:config.value,new_version:newVersion.value,dry_run:true});requestId=crypto.randomUUID();}
-async function start(){busy.value=true;try{const j=await call('processing-jobs',{student_ids:[props.id],config:plan.value.config,new_version:newVersion.value,dry_run:false,expected_revision:plan.value.revision,request_id:requestId});plan.value=null;await load();await refresh();ElMessage.success(j.status==='skipped'?'已有结果，无需重复提交':'正式单人任务已创建，关闭窗口后继续执行');}finally{busy.value=false;}}
+async function start(){busy.value=true;try{const j=await call('processing-jobs',{student_ids:[props.id],config:plan.value.config,new_version:newVersion.value,dry_run:false,expected_revision:plan.value.revision,request_id:requestId});plan.value=null;initialConfig.value=JSON.stringify(config.value);await load();await refresh();ElMessage.success(j.status==='skipped'?'已有结果，无需重复提交':'正式单人任务已创建，关闭窗口后继续执行');}finally{busy.value=false;}}
 async function deliver(){busy.value=true;try{await call('deliveries',{student_ids:[props.id]});await load();await refresh();ElMessage.success('已生成单人交付包，下载后仍需确认已交付');}finally{busy.value=false;}}
 async function confirm(b){await ElMessageBox.confirm('确认这个单人交付包已实际发送？','确认已交付');await call('deliveries/'+b.id+'/confirm',{});await load();await refresh();}
 onMounted(()=>{timer=setInterval(()=>{if(props.id)run(load);},2000);});onUnmounted(()=>clearInterval(timer));
 </script>
 <template>
- <el-dialog :model-value="!!id" @update:model-value="emit('update:id','')" :title="'学生 '+id+' · 流程与审核'" width="min(1120px,96vw)" :close-on-click-modal="true" destroy-on-close>
+ <el-dialog :model-value="!!id" @update:model-value="close" :title="'学生 '+id+' · 流程与审核'" width="min(1120px,96vw)" :close-on-click-modal="true" destroy-on-close>
   <template v-if="detail"><p>固定届次：{{cohortName}} · 学号：{{id}} <span v-if="detail.name">· 姓名：{{detail.name}}</span></p><el-alert v-if="cohort!==state.cohort" title="侧栏已切换；本窗口操作仍属于打开时的届次。" type="info" :closable="false"/>
    <div class="toolbar"><el-tag>{{labels[detail.status]||detail.status}}</el-tag><span class="muted">修订号 {{detail.revision}}</span><el-tag v-if="archived">归档只读</el-tag></div>
    <div class="comparison"><Photo :artifact="source" label="原始照片"/><Photo :artifact="result?.artifact" label="当前成片"/></div>

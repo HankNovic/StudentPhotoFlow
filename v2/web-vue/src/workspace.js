@@ -1,10 +1,11 @@
 import { reactive } from 'vue';
 import { api,scope } from './api';
-export const state=reactive({ready:false,cohort:'',cohortName:'',archived:false,cohorts:[],allCohorts:[],students:[],jobs:[],deliveries:[],config:{},urls:[],health:{}});
+export const state=reactive({ready:false,cohort:'',cohortName:'',archived:false,cohorts:[],allCohorts:[],students:[],jobs:[],deliveries:[],config:{},savedConfig:{},urls:[],health:{}});
+let refreshRequest=0;
 export async function refresh(){
-  const cid=state.cohort;if(!cid){Object.assign(state,{students:[],jobs:[],deliveries:[]});return;}
+  const cid=state.cohort,request=++refreshRequest;if(!cid){Object.assign(state,{students:[],jobs:[],deliveries:[]});return;}
   const [students,jobs,deliveries]=await Promise.all([api('students',undefined,undefined,cid),api('jobs',undefined,undefined,cid),api('deliveries',undefined,undefined,cid)]);
-  if(cid===state.cohort)Object.assign(state,{students,jobs,deliveries});
+  if(cid===state.cohort&&request===refreshRequest)Object.assign(state,{students,jobs,deliveries});
 }
 export async function loadCohorts(){
   const data=await api('cohorts');state.allCohorts=data.cohorts;state.cohorts=data.cohorts.filter(c=>!c.archived);
@@ -15,7 +16,7 @@ export async function loadCohorts(){
 export async function changeCohort(value){
   const c=state.allCohorts.find(c=>c.id===value||c.name===value);
   if(!c)throw Error('届次未登记，请先到系统设置添加');
-  Object.assign(state,{cohort:c.id,cohortName:c.name,archived:c.archived});scope.id=c.id;sessionStorage.setItem('spf-cohort',c.id);await refresh();
+  Object.assign(state,{students:[],jobs:[],deliveries:[],cohort:c.id,cohortName:c.name,archived:c.archived});scope.id=c.id;sessionStorage.setItem('spf-cohort',c.id);await refresh();
 }
 export async function initialize(){
   const token=new URLSearchParams(location.hash.slice(1)).get('token');
@@ -25,6 +26,6 @@ export async function initialize(){
     history.replaceState(null,'',location.pathname);
   }
   const [health,config,urls]=await Promise.all([api('health'),api('config'),api('engines/hivision/urls')]);
-  state.health=health;state.config={...config.defaults,...config.saved};state.urls=urls;
+  state.health=health;state.config={...config.defaults,...config.saved};state.savedConfig={...state.config};state.urls=urls;
   await loadCohorts();await refresh();state.ready=true;
 }

@@ -106,7 +106,7 @@ class Store:
 
     @staticmethod
     def add_roster(d, ids, cohort=None):
-        ids = [valid_id(x.strip()) for x in ids]
+        ids = list(dict.fromkeys(valid_id(x.strip()) for x in ids))
         if not ids or len({x.casefold() for x in ids}) != len(ids):
             raise ValueError('名单为空或包含重复学号')
         cohort = cohort or d.get('active_cohort') or str(datetime.now().year)+'级'
@@ -134,6 +134,8 @@ class Store:
         with self.lock:
             if sid not in self.data['students']:
                 raise ValueError('请先导入该学号到名单')
+            if any(sid in j.get('uncertain',{}) for j in self.data['jobs'].values()):
+                raise ValueError('该学生有结果不确定的中断项目，请先在任务进度核对')
             if self.processing(self.data, sid):
                 raise ValueError('该学生有活动任务，请先安全停止任务')
             if self.data['students'][sid]['delivered'] and not self.data['students'][sid]['replacement']:
