@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Unused candidate version matching v2/version.py (for example 2.4.0-rc.5)
+        description: Unused candidate version matching v2/version.py (for example 2.4.0-rc.6)
         required: true
 permissions:
   contents: read

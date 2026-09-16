@@ -1,6 +1,6 @@
 services:
   studentphotoflow:
-    image: ${SPF_IMAGE:-ghcr.io/hanknovic/studentphotoflow:2.4.0-rc.5}
+    image: ${SPF_IMAGE:-ghcr.io/hanknovic/studentphotoflow:2.4.0-rc.6}
     env_file: .env
     environment:
       SPF_DOCKER_MODE: "1"

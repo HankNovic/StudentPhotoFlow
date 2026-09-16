@@ -8,7 +8,7 @@ const emit=defineEmits(['navigate']);
 const roster=ref(''),excel=ref(null),zip=ref(null),photos=ref([]),report=ref(null),zipReport=ref(null),migration=ref(null),legacy=ref(''),historyIds=ref(''),historyReason=ref(''),confirmed=ref(false),busy=ref(false);
 const fields=reactive({sheet:'',header_row:1,id_column:'A',image_column:'B'});
 const cohortDialog=ref(false),chosen=ref(''),checked=ref(false);
-watch(()=>[excel.value,fields.sheet,fields.header_row],()=>{checked.value=false;});
+watch(()=>[excel.value,fields.sheet,fields.header_row],()=>{checked.value=false;},{flush:'sync'});
 async function operation(fn){busy.value=true;try{await fn();}finally{busy.value=false;}}
 const rosterBase=ref(''),rosterCount=ref(null),rosterError=ref(''),rosterLoading=ref(false);
 const dirty=computed(()=>roster.value!==rosterBase.value||!!historyIds.value||!!historyReason.value||!!excel.value||!!zip.value||photos.value.length>0);
