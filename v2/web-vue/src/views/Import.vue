@@ -1,18 +1,18 @@
 <script setup>
 import { ref,reactive,watch,computed } from 'vue';
 import {useDraft,confirmLeave} from '../drafts';
-import { ElMessage } from 'element-plus';
+import { ElMessage,ElMessageBox } from 'element-plus';
 import { api,ids,run,url } from '../api';
 import { state,refresh,changeCohort,loadCohorts } from '../workspace';
 const emit=defineEmits(['navigate']);
-const roster=ref(''),excel=ref(null),zip=ref(null),photos=ref([]),report=ref(null),zipReport=ref(null),migration=ref(null),legacy=ref(''),historyIds=ref(''),historyReason=ref(''),confirmed=ref(false),busy=ref(false);
+const roster=ref(''),excel=ref(null),zip=ref(null),zipCheck=ref(null),photos=ref([]),report=ref(null),zipReport=ref(null),migration=ref(null),legacy=ref(''),historyIds=ref(''),historyReason=ref(''),confirmed=ref(false),busy=ref(false);
 const fields=reactive({sheet:'',header_row:1,id_column:'A',image_column:'B'});
 const cohortDialog=ref(false),chosen=ref(''),checked=ref(false);
 watch(()=>[excel.value,fields.sheet,fields.header_row],()=>{checked.value=false;},{flush:'sync'});
 async function operation(fn){busy.value=true;try{await fn();}finally{busy.value=false;}}
 const rosterBase=ref(''),rosterCount=ref(null),rosterError=ref(''),rosterLoading=ref(false);
 const dirty=computed(()=>roster.value!==rosterBase.value||!!historyIds.value||!!historyReason.value||!!excel.value||!!zip.value||photos.value.length>0);
-function discard(){roster.value=rosterBase.value;historyIds.value='';historyReason.value='';excel.value=null;zip.value=null;photos.value=[];checked.value=false;}
+function discard(){zipCheck.value=null;roster.value=rosterBase.value;historyIds.value='';historyReason.value='';excel.value=null;zip.value=null;photos.value=[];checked.value=false;}
 useDraft('import',dirty,discard);
 let rosterRequest=0;
 async function loadRoster(){const cid=state.cohort,n=++rosterRequest;rosterLoading.value=true;try{const rows=await api('students',undefined,undefined,cid);if(cid!==state.cohort||n!==rosterRequest)return;const text=rows.map(s=>s.id).sort().join('\n');rosterCount.value=rows.length;rosterError.value='';if(roster.value===rosterBase.value){roster.value=text;rosterBase.value=text;}}catch(e){if(cid===state.cohort&&n===rosterRequest)rosterError.value='名单加载失败：'+e.message;}finally{if(n===rosterRequest)rosterLoading.value=false;}}
@@ -37,7 +37,8 @@ async function importExcel(){if(!checked.value)throw Error('请先检查表格�
 });}
 async function zipAction(inspectOnly){if(!zip.value)throw Error('请选择照片压缩包');await operation(async()=>{
  const body=new FormData();body.append('file',zip.value);body.append('cohort',state.cohortName);body.append('inspect_only',inspectOnly);
- zipReport.value=await api('imports/zip',body);if(!inspectOnly){zip.value=null;await refresh();emit('navigate','jobs');}ElMessage.success(inspectOnly?'压缩包检查完成':'压缩包接收任务已创建');
+ if(!inspectOnly){if(!zipCheck.value||zipCheck.value.name!==zip.value.name||zipCheck.value.cohort!==state.cohortName)throw Error('请先为当前压缩包和届次重新检查');await ElMessageBox.confirm('检查已通过，确认接收压缩包原图？','确认接收',{confirmButtonText:'确认接收',cancelButtonText:'取消'});body.append('check_token',zipCheck.value.token);}
+ zipReport.value=await api('imports/zip',body);if(inspectOnly){zipCheck.value={name:zip.value.name,cohort:state.cohortName,token:zipReport.value.check_token};}else{zip.value=null;zipCheck.value=null;await refresh();emit('navigate','jobs');}ElMessage.success(inspectOnly?'压缩包检查完成':'压缩包接收任务已创建');
 });}
 async function uploadPhotos(){if(!photos.value.length)throw Error('请选择照片');await operation(async()=>{
  const cid=state.cohort;for(const file of photos.value){const body=new FormData();body.append('photo',file.raw);await api('students/'+encodeURIComponent(file.name.replace(/\.[^.]+$/,''))+'/photos',body,undefined,cid);}
@@ -54,7 +55,7 @@ function photoList(file,list){photos.value=list;}
   <el-form label-position="top" class="config-grid"><el-form-item label="工作表"><el-input v-model="fields.sheet" placeholder="留空使用第一张"/></el-form-item><el-form-item label="表头行"><el-input-number v-model="fields.header_row" :min="1"/></el-form-item><el-form-item label="学号列"><el-input v-model="fields.id_column" aria-label="学号列"/></el-form-item><el-form-item label="图片列"><el-input v-model="fields.image_column" aria-label="图片列"/></el-form-item></el-form>
   <div class="toolbar"><el-button @click="inspect" :loading="busy">检查表格</el-button><el-button type="primary" @click="importExcel" :disabled="!checked" :loading="busy">接收原始图片</el-button></div><pre v-if="report" data-testid="excel-report">{{JSON.stringify(report,null,2)}}</pre>
  </el-card>
- <el-card shadow="never" data-testid="zip-import"><template #header><h3>导入照片压缩包</h3></template><p class="muted">压缩包名称不限，图片文件名为“学号-姓名.png”等。重复照片不增加版本，已交付记录跳过。</p><el-upload :auto-upload="false" :show-file-list="false" accept=".zip" :on-change="file=>{zip=file.raw;}"><el-button>选择照片 ZIP</el-button></el-upload><p>{{zip?.name}}</p><div class="toolbar"><el-button @click="zipAction(true)" :loading="busy">检查压缩包</el-button><el-button type="primary" @click="zipAction(false)" :loading="busy">接收压缩包原图</el-button></div><pre v-if="zipReport" data-testid="zip-report">{{JSON.stringify(zipReport,null,2)}}</pre></el-card>
+ <el-card shadow="never" data-testid="zip-import"><template #header><h3>导入照片压缩包</h3></template><p class="muted">压缩包名称不限，图片文件名为“学号-姓名.png”等。重复照片不增加版本，已交付记录跳过。</p><el-upload :auto-upload="false" :show-file-list="false" accept=".zip" :on-change="file=>{zip=file.raw;zipCheck=null;zipReport=null;}"><el-button>选择照片 ZIP</el-button></el-upload><p>{{zip?.name}}</p><div class="toolbar"><el-button @click="zipAction(true)" :loading="busy">检查压缩包</el-button><el-button type="primary" :disabled="!zipCheck" @click="zipAction(false)" :loading="busy">接收压缩包原图</el-button></div><pre v-if="zipReport" data-testid="zip-report">{{JSON.stringify(zipReport,null,2)}}</pre></el-card>
  <el-card shadow="never" data-testid="photo-upload"><template #header><h3>批量上传图片</h3></template><p class="muted">文件名为学号；学号须已在名单中。</p><el-upload :auto-upload="false" multiple accept="image/*" :on-change="photoList" :on-remove="photoList"><el-button>选择原图</el-button></el-upload><el-button @click="uploadPhotos" :loading="busy">上传所选原图</el-button></el-card>
  <el-card shadow="never" data-testid="historical"><template #header><h3>登记历史已交付名单</h3></template><p class="muted">未登记学号会自动加入当前届名单。只登记交付事实，不将当前成片标为已审核。</p><el-input v-model="historyIds" type="textarea" :rows="4" aria-label="历史已交付学号"/><el-input v-model="historyReason" placeholder="交付依据，例如已发送办卡第一批" class="spaced"/><el-checkbox v-model="confirmed">确认这些照片已经实际发送</el-checkbox><div><el-button @click="historical">登记已交付名单</el-button></div></el-card>
  <el-alert title="支持 rc.4 工作区保留数据升级；rc.3 及更早目录仍不支持直接导入。" type="info" :closable="false"/>

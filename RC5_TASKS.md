@@ -19,3 +19,6 @@
 rc.5上传后补查Excel切届监听缺陷，已修复并使用未占用的rc.6重跑全部最终验收。rc.5标签不覆盖，不创建Release。报告提交仅记录证据，不改变已验证镜像源码。
 
 发布完成：https://github.com/HankNovic/StudentPhotoFlow/releases/tag/v2.4.0-rc.6 。Registry digest见 RC6_ACCEPTANCE.md。证据提交仅包含文档；镜像、发布标签保持178f8b7实际验收源码，不重建或覆盖产物。
+
+
+rc.7 修复清单：更新检查文案、失败详情折叠、ZIP预检查签名门禁、执行计划分页、移除新处理版本勾选项。

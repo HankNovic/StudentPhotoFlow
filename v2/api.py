@@ -367,7 +367,7 @@ def create_app(root, token=None):
         return StreamingResponse(stream(),media_type='text/event-stream')
 
     @app.post('/api/v1/imports/zip', tags=['导入与迁移'], summary='检查或导入采集系统照片压缩包', description='multipart/form-data：file 为 ZIP，压缩包名称不限，内部图片为 学号-姓名.扩展名；inspect_only 默认 true 只检查，false 创建可暂停和恢复的后台任务。自动补入学号，重复照片不增加版本。最多500MB，解压总大小2GB，单张30MB；重复学号或不合法文件名拒绝导入。')
-    def import_zip(file: UploadFile = File(...), cohort: str = Form(''), inspect_only: bool = Form(True)):
+    def import_zip(file: UploadFile = File(...), cohort: str = Form(''), inspect_only: bool = Form(True), check_token: str = Form('')):
         import zipfile
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'input.zip'
@@ -382,8 +382,13 @@ def create_app(root, token=None):
                 rows=service.inspect_zip(path)
             except zipfile.BadZipFile:
                 raise ValueError('不是有效的ZIP压缩包')
+            import hashlib
+            target = (cohort or store.snapshot().get('active_cohort')).strip()
+            token = hashlib.sha256(raw + target.encode() + json.dumps(rows, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
             if inspect_only:
-                return dict(count=len(rows),student_ids=[r['student_id'] for r in rows])
+                return dict(ok=True, count=len(rows), student_ids=[r['student_id'] for r in rows], check_token=token, cohort=target)
+            if not check_token or check_token != token:
+                raise ValueError('压缩包尚未通过本次届次的预检查，请重新检查后再接收')
             if cohort.strip(): store.set_cohort(cohort.strip())
             return service.start_zip(path,rows)
 

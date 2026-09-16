@@ -21,7 +21,7 @@ async function switchCohort(value){if(value===state.cohort||!await confirmLeave(
 async function update(){
  checking.value=true;try{const d=await api('update');
  if(d.ok===false){ElMessage.warning(d.message);return;} const newer=d.version&&d.version!==state.health.version;
- if(newer){await ElMessageBox.confirm('发现版本 '+d.version+'，打开发布页下载？','检查更新',{confirmButtonText:'打开发布页',cancelButtonText:'取消'});if(d.url?.startsWith('https://github.com/HankNovic/StudentPhotoFlow/'))window.open(d.url,'_blank','noopener');}
+ if(newer){await ElMessageBox.confirm('发现新版本 '+d.version+'，是否查看？','检查更新',{confirmButtonText:'查看发布页',cancelButtonText:'取消'});if(d.url?.startsWith('https://github.com/HankNovic/StudentPhotoFlow/'))window.open(d.url,'_blank','noopener');}
  else ElMessage.success('当前已是最新版本');}finally{checking.value=false;}
 }
 async function startWorkspace(){await initialize();needsLogin.value=false;failure.value='';if(!state.cohort)page.value='settings';clearInterval(timer);timer=setInterval(async()=>{await checkDeployment();if(state.ready&&!deployed.value&&!needsLogin.value)run(refresh);},2500);}

@@ -1,4 +1,4 @@
-# StudentPhotoFlow 2.4.0-rc.6 · Linux Docker 部署
+# StudentPhotoFlow 2.4.0-rc.7 · Linux Docker 部署
 
 本候选版继续使用 Vue 3 + Element Plus、Notion 主题和单进程 Python 服务。本次不更新 stable/latest。镜像不依赖 Windows EXE 或宿主机开发环境。
 
@@ -6,7 +6,7 @@
 
 rc.6 继续使用 rc.4 的 schema 3 届次目录。**保留现有 SPF_DATA_DIR、SPF_WORKSPACE 和 Compose 项目名**，不得改成空目录。学生、照片、配置、届次、回收站到期时间、审核和交付记录保留。每个子工作区首次启动时追加 task_semantics=2，并先写 backups/before-task-semantics-2.json；使用原子替换，读取或写入失败会报错，不重置数据。此索引备份不能代替整个数据目录备份。
 
-更新前在任务页点击“暂停”，等待“已暂停”（保留继续资格），或等待自然完成。“安全结束”表示永久结束该任务，不可再继续。停止容器后备份整个原挂载目录。更新 .env 中 SPF_IMAGE=ghcr.io/hanknovic/studentphotoflow:2.4.0-rc.6，其余数据路径和口令保持原值。
+更新前在任务页点击“暂停”，等待“已暂停”（保留继续资格），或等待自然完成。“安全结束”表示永久结束该任务，不可再继续。停止容器后备份整个原挂载目录。更新 .env 中 SPF_IMAGE=ghcr.io/hanknovic/studentphotoflow:2.4.0-rc.7，其余数据路径和口令保持原值。
 
 ```sh
 # 在原部署目录执行；spf-rc4 替换为原有 Compose 项目名
@@ -52,7 +52,7 @@ curl --fail http://127.0.0.1:8769/healthz
 
 **口令使用英文单引号**，例如 `.env` 中 `SPF_API_TOKEN='你自己生成的至少16位随机口令'`，防止 `$` 被 Compose 插值。示例占位值会被后端拒绝。不要把真实口令放到 Git、聊天、命令参数或截图。
 
-SPF_IMAGE 固定为 ghcr.io/hanknovic/studentphotoflow:2.4.0-rc.6；SPF_PORT=8769 为宿主机端口，容器内部始终 8769；SPF_DATA_DIR=./data-rc4；SPF_UPDATE_CHANNEL=candidate。如需固定 digest，将 SPF_IMAGE 改成发布说明中的 `ghcr.io/hanknovic/studentphotoflow@sha256:…`。
+SPF_IMAGE 固定为 ghcr.io/hanknovic/studentphotoflow:2.4.0-rc.7；SPF_PORT=8769 为宿主机端口，容器内部始终 8769；SPF_DATA_DIR=./data-rc4；SPF_UPDATE_CHANNEL=candidate。如需固定 digest，将 SPF_IMAGE 改成发布说明中的 `ghcr.io/hanknovic/studentphotoflow@sha256:…`。
 
 ## 数据、回收站和并发
 
@@ -68,7 +68,7 @@ SPF_DATA_DIR 整目录挂载到 /data；工作区 /data/workspace。system.json 
 
 ```sh
 docker compose --env-file .env -p spf-rc4 images
-docker image inspect ghcr.io/hanknovic/studentphotoflow:2.4.0-rc.6 --format '{{json .RepoDigests}}'
+docker image inspect ghcr.io/hanknovic/studentphotoflow:2.4.0-rc.7 --format '{{json .RepoDigests}}'
 docker compose --env-file .env -p spf-rc4 stop
 tar -czf "data-rc4-backup-$(date +%Y%m%d-%H%M%S).tar.gz" data-rc4
 # 安全备份 .env，不与公开附件放在一起

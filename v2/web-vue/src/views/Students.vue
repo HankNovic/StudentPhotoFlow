@@ -10,13 +10,13 @@ const emit=defineEmits(['navigate']);
 const recycle=ref();
 async function single(){if(!state.cohort)throw Error('请先选择届次');const cid=state.cohort;const {value}=await ElMessageBox.prompt('在 '+state.cohortName+' 中精确查找已有学号，不会新建学生','单人补录',{inputPlaceholder:'完整学号'});const sid=value.trim();await api('students/'+encodeURIComponent(sid),undefined,undefined,cid);if(cid!==state.cohort)throw Error('届次已切换，请重新确认学生');detailId.value=sid;}
 const q=ref(''),status=ref(''),selected=ref([]),detailId=ref(''),batchDecision=ref(''),reason=ref('');
-const planOpen=ref(false),planData=ref(null),newVersion=ref(false),planIds=ref([]),busy=ref(false);
+const planOpen=ref(false),planData=ref(null),planIds=ref([]),busy=ref(false);
 const filtered=computed(()=>state.students.filter(s=>(!status.value||s.status===status.value)&&s.id.includes(q.value.trim())));
-const visibleIds=computed(()=>filtered.value.map(s=>s.id));
+const visibleIds=computed(()=>filtered.value.map(s=>s.id));const planPage=ref(1),planSize=ref(20);const shownPlan=computed(()=>planData.value?.items.slice((planPage.value-1)*planSize.value,planPage.value*planSize.value)||[]);
 const all=computed(()=>filtered.value.length>0&&filtered.value.every(s=>selected.value.includes(s.id)));
 watch([q,status,()=>state.cohort],()=>{selected.value=[];planOpen.value=false;});
 watch(()=>state.students,()=>{selected.value=selected.value.filter(id=>visibleIds.value.includes(id));});
-watch(()=>[newVersion.value,JSON.stringify(state.config)],()=>{planData.value=null;});
+watch(()=>JSON.stringify(state.config),()=>{planData.value=null;});
 function toggle(id,value){selected.value=value?[...new Set([...selected.value,id])]:selected.value.filter(x=>x!==id);}
 function toggleAll(value){selected.value=value?[...visibleIds.value]:[];}
 function batch(decision){if(!state.students.some(s=>selected.value.includes(s.id)&&s.status==='review'))throw Error('请先选中待人工审核学生');batchDecision.value=decision;reason.value='';}
@@ -24,10 +24,10 @@ async function applyBatch(){
  const student_ids=state.students.filter(s=>selected.value.includes(s.id)&&s.status==='review').map(s=>s.id);
  busy.value=true;try{const d=await api('reviews/batch',{student_ids,decision:batchDecision.value,reason:reason.value});batchDecision.value='';selected.value=[];await refresh();ElMessage.success('已批量审核 '+d.count+' 人');}finally{busy.value=false;}
 }
-async function replan(){const cid=state.cohort;const data=await api('processing-jobs',{student_ids:planIds.value,config:state.config,new_version:newVersion.value,dry_run:true},undefined,cid);if(cid!==state.cohort)return false;planData.value=data;return true;}
+async function replan(){const cid=state.cohort;const data=await api('processing-jobs',{student_ids:planIds.value,config:state.config,dry_run:true},undefined,cid);if(cid!==state.cohort)return false;planData.value=data;return true;}
 async function openPlan(){if(!selected.value.length)throw Error('请先选中学生');planIds.value=[...selected.value];if(await replan())planOpen.value=true;}
 async function start(){
- busy.value=true;try{await api('processing-jobs',{student_ids:planIds.value,config:planData.value.config,new_version:newVersion.value,dry_run:false,expected_revision:planData.value.revision});planOpen.value=false;await refresh();emit('navigate','jobs');ElMessage.success('处理任务已创建');}finally{busy.value=false;}
+ busy.value=true;try{await api('processing-jobs',{student_ids:planIds.value,config:planData.value.config,dry_run:false,expected_revision:planData.value.revision});planOpen.value=false;await refresh();emit('navigate','jobs');ElMessage.success('处理任务已创建');}finally{busy.value=false;}
 }
 async function deliver(){
  if(!selected.value.length)throw Error('请选择审核通过的学生');
@@ -63,11 +63,12 @@ async function deliver(){
   <template #footer><el-button @click="batchDecision=''">取消</el-button><el-button type="primary" @click="applyBatch" :loading="busy">确认批量审核</el-button></template>
  </el-dialog>
  <el-dialog v-model="planOpen" title="本次执行计划" width="min(850px,94vw)">
-  <el-checkbox v-model="newVersion">明确生成新处理版本（仍遵守已交付保护）</el-checkbox>
+  
   <el-button @click="replan">重新计算计划</el-button>
-  <p v-if="planData">执行 {{planData.items.filter(x=>x.execute).length}} 人，跳过 {{planData.items.filter(x=>!x.execute).length}} 人</p>
+  <p v-if="planData">执行 {{planData.items.filter(x=>x.execute).length}} 人，跳过 {{planData.items.filter(x=>!x.execute).length}} 人，共 {{planData.items.length}} 条</p><el-pagination v-if="planData" v-model:current-page="planPage" v-model:page-size="planSize" :page-sizes="[20,50,100]" layout="total,sizes,prev,pager,next" :total="planData.items.length" />
   <el-alert v-else title="参数或范围已变化，请重新计算计划" type="warning" :closable="false"/>
-  <el-table :data="planData?.items||[]"><el-table-column prop="student_id" label="学号"/><el-table-column label="执行情况"><template #default="{row}">{{row.execute?'将处理':row.reason}}</template></el-table-column></el-table>
+  <el-table :data="shownPlan"><el-table-column prop="student_id" label="学号"/><el-table-column label="执行情况"><template #default="{row}">{{row.execute?'将处理':row.reason}}</template></el-table-column></el-table>
   <template #footer><el-button @click="planOpen=false">取消</el-button><el-button type="primary" :disabled="!planData" :loading="busy" @click="start">按此计划开始处理</el-button></template>
  </el-dialog>
 </template>
+

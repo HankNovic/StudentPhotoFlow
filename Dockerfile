@@ -16,7 +16,7 @@ COPY v2/*.py /app/v2/
 COPY --from=frontend /src/dist /app/v2/web
 RUN test -f /app/v2/web/build-info.json && test -f /app/v2/web/index.html && find /app/v2/web/assets -name '*.js' | grep -q .
 ARG SOURCE_COMMIT=unknown
-ARG APP_VERSION=2.4.0-rc.6
+ARG APP_VERSION=2.4.0-rc.7
 RUN test "$(python -c 'from v2.version import VERSION; print(VERSION)')" = "$APP_VERSION"
 ENV SPF_SOURCE_COMMIT=$SOURCE_COMMIT
 LABEL org.opencontainers.image.source="https://github.com/HankNovic/StudentPhotoFlow" org.opencontainers.image.revision=$SOURCE_COMMIT org.opencontainers.image.version=$APP_VERSION

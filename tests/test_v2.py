@@ -221,9 +221,10 @@ class V2Test(unittest.TestCase):
         raw=archive(['照片/00003-测试.png'])
         checked=self.client.post(route,files={'file':('custom.zip',raw)})
         self.assertEqual(checked.json()['count'],1)
+        check_token=checked.json()['check_token']
         self.assertNotIn('00003',self.store.snapshot()['students'])
         for _ in range(2):
-            response=self.client.post(route,data={'inspect_only':'false'},files={'file':('other.zip',raw)})
+            response=self.client.post(route,data={'inspect_only':'false','check_token':check_token},files={'file':('other.zip',raw)})
             self.assertEqual(response.status_code,200,response.text)
             self.service.thread.join(10)
             self.assertFalse(self.service.thread.is_alive())
