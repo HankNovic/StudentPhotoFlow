@@ -5,7 +5,7 @@ COPY v2/web-vue/package*.json ./
 RUN npm ci --no-audit --no-fund
 COPY v2/web-vue/ ./
 ARG SOURCE_COMMIT=unknown
-ARG APP_VERSION=2.4.1-rc.2
+ARG APP_VERSION=2.4.1-rc.3
 RUN test "$SOURCE_COMMIT" != unknown && SPF_APP_VERSION=$APP_VERSION SPF_BUILD_ID=$SOURCE_COMMIT SPF_VUE_OUT=/src/dist npm run build
 FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 SPF_DOCKER_MODE=1 SPF_HOST=0.0.0.0
@@ -17,7 +17,7 @@ COPY v2/*.py /app/v2/
 COPY --from=frontend /src/dist /app/v2/web
 RUN test -f /app/v2/web/build-info.json && test -f /app/v2/web/index.html && find /app/v2/web/assets -name '*.js' | grep -q .
 ARG SOURCE_COMMIT=unknown
-ARG APP_VERSION=2.4.1-rc.2
+ARG APP_VERSION=2.4.1-rc.3
 RUN test "$(python -c 'from v2.version import VERSION; print(VERSION)')" = "$APP_VERSION"
 ENV SPF_SOURCE_COMMIT=$SOURCE_COMMIT
 LABEL org.opencontainers.image.source="https://github.com/HankNovic/StudentPhotoFlow" org.opencontainers.image.revision=$SOURCE_COMMIT org.opencontainers.image.version=$APP_VERSION
