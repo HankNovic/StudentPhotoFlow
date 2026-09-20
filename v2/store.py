@@ -8,6 +8,7 @@ import re
 import tempfile
 import threading
 import uuid
+from .export_profiles import default_profile
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,13 +57,16 @@ class Store:
         if self.path.exists():
             self.data = json.loads(self.path.read_text(encoding='utf-8'))
             self.data.setdefault('active_cohort', str(datetime.now().year)+'级'); self.data.setdefault('hivision_urls', []); self.data.setdefault('cohort_records', {}); self.data.setdefault('recycle_bin', [])
-            for student in self.data.get('students', {}).values(): student.setdefault('cohort', self.data['active_cohort'])
+            self.data.setdefault('export_profiles', [default_profile()])
+            for student in self.data.get('students', {}).values():
+                student.setdefault('cohort', self.data['active_cohort'])
+                student.setdefault('name', None)
             if self.data.get('schema_version') != 2:
                 raise ValueError('工作区版本不支持，请使用V2工作区目录')
         else:
             if (self.root / 'export_state.json').exists():
                 raise ValueError('请选择新的V2目录，然后从迁移入口导入旧数据')
-            default=str(datetime.now().year)+'级'; self.data = dict(schema_version=2, revision=0, active_cohort=default, students={}, deliveries={}, jobs={}, config={}, hivision_urls=[], events=[], cohort_records={default:{'id':uuid.uuid4().hex,'name':default,'archived':False}}, recycle_bin=[])
+            default=str(datetime.now().year)+'级'; self.data = dict(schema_version=2, revision=0, active_cohort=default, students={}, deliveries={}, jobs={}, config={}, hivision_urls=[], events=[], cohort_records={default:{'id':uuid.uuid4().hex,'name':default,'archived':False}}, recycle_bin=[], export_profiles=[default_profile()])
             atomic(self.path, self.data)
 
     def snapshot(self):
@@ -121,7 +125,7 @@ class Store:
         for sid in ids:
             if sid.casefold() in existing and existing[sid.casefold()] != sid:
                 raise ValueError('学号大小写冲突')
-            d['students'].setdefault(sid, dict(id=sid, cohort=cohort, sources=[], results=[], approved=None, delivered=None, replacement=False, history=[]))
+            d['students'].setdefault(sid, dict(id=sid, name=None, cohort=cohort, sources=[], results=[], approved=None, delivered=None, replacement=False, history=[]))
         return {'count': len(d['students'])}
 
     def roster(self, ids, cohort=None):

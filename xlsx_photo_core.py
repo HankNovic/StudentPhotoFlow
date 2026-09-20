@@ -97,6 +97,7 @@ class SelectedRow:
     row_number: int
     student_id: str
     source: SourceRef
+    name: str | None = None
 
 
 @dataclass
@@ -500,13 +501,15 @@ class WorkbookReader:
         header_row: int,
         id_col: int,
         image_col: int,
+        name_col: int | None = None,
     ) -> tuple[list[str], list[SelectedRow]]:
         info = self.sheet(sheet_name)
         values, hyperlinks = self._sheet_values(info)
         images = self._sheet_images(info)
         max_col = max(
             [id_col, image_col]
-            + [col for row, col in values if row == header_row],
+            + [col for row, col in values if row == header_row]
+            + ([name_col] if name_col is not None else []),
         )
         headers = [values.get((header_row, col), "") for col in range(max_col + 1)]
         max_row = max(
@@ -517,6 +520,7 @@ class WorkbookReader:
         rows: list[SelectedRow] = []
         for row_number in range(header_row + 1, max_row + 1):
             student_id = values.get((row_number, id_col), "").strip()
+            name = values.get((row_number, name_col), "").strip() if name_col is not None else None
             embedded = images.get((row_number, image_col), [])
             cell_text = values.get((row_number, image_col), "").strip()
             link = hyperlinks.get((row_number, image_col), "").strip()
@@ -532,7 +536,7 @@ class WorkbookReader:
                 source = SourceRef(kind="missing", display="空白")
             if not student_id and source.kind == "missing":
                 continue
-            rows.append(SelectedRow(row_number, student_id, source))
+            rows.append(SelectedRow(row_number, student_id, source, name or None))
         return headers, rows
 
 
@@ -641,9 +645,10 @@ def inspect_selection(
     header_row: int,
     id_col: int,
     image_col: int,
+    name_col: int | None = None,
 ) -> InspectionReport:
     with WorkbookReader(path) as reader:
-        headers, rows = reader.selected_rows(sheet_name, header_row, id_col, image_col)
+        headers, rows = reader.selected_rows(sheet_name, header_row, id_col, image_col, name_col)
     ids = [row.student_id for row in rows if row.student_id]
     duplicates = sorted(key for key, count in Counter(ids).items() if count > 1)
     expired = 0
@@ -661,6 +666,17 @@ def inspect_selection(
         elif (expiry - current).total_seconds() <= 900:
             expiring += 1
     source_counts = Counter(row.source.kind for row in rows)
+    names_by_id: dict[str, set[str]] = {}
+    name_rows: dict[str, list[int]] = {}
+    for row in rows:
+        if row.student_id and row.name:
+            names_by_id.setdefault(row.student_id, set()).add(row.name)
+        if row.student_id and name_col is not None and not row.name:
+            name_rows.setdefault(row.student_id, []).append(row.row_number)
+    name_conflicts = [
+        {'student_id': sid, 'names': sorted(names), 'rows': [r.row_number for r in rows if r.student_id == sid and r.name in names]}
+        for sid, names in sorted(names_by_id.items()) if len(names) > 1
+    ]
     summary = {
         "data_rows": len(rows),
         "valid_ids": len(ids),
@@ -672,6 +688,9 @@ def inspect_selection(
         "expiring_links": expiring,
         "missing_sources": source_counts.get("missing", 0),
         "unsupported_sources": source_counts.get("unsupported", 0),
+        "name_empty": sum(len(rows) for rows in name_rows.values()),
+        "name_empty_rows": [r for values in name_rows.values() for r in values],
+        "name_conflicts": name_conflicts,
     }
     return InspectionReport(str(Path(path)), sheet_name, header_row, headers, rows, summary)
 

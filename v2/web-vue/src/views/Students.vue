@@ -10,7 +10,7 @@ const emit=defineEmits(['navigate']);
 const recycle=ref();
 async function single(){if(!state.cohort)throw Error('请先选择届次');const cid=state.cohort;const {value}=await ElMessageBox.prompt('在 '+state.cohortName+' 中精确查找已有学号，不会新建学生','单人补录',{inputPlaceholder:'完整学号'});const sid=value.trim();await api('students/'+encodeURIComponent(sid),undefined,undefined,cid);if(cid!==state.cohort)throw Error('届次已切换，请重新确认学生');detailId.value=sid;}
 const q=ref(''),status=ref(''),selected=ref([]),detailId=ref(''),batchDecision=ref(''),reason=ref('');
-const planOpen=ref(false),planData=ref(null),planIds=ref([]),busy=ref(false);
+const planOpen=ref(false),planData=ref(null),planIds=ref([]),busy=ref(false),deliveryOpen=ref(false),deliveryPlan=ref(null),profileId=ref('');
 const filtered=computed(()=>state.students.filter(s=>(!status.value||s.status===status.value)&&s.id.includes(q.value.trim())));
 const visibleIds=computed(()=>filtered.value.map(s=>s.id));const planPage=ref(1),planSize=ref(20);const shownPlan=computed(()=>planData.value?.items.slice((planPage.value-1)*planSize.value,planPage.value*planSize.value)||[]);
 const all=computed(()=>filtered.value.length>0&&filtered.value.every(s=>selected.value.includes(s.id)));
@@ -31,8 +31,10 @@ async function start(){
 }
 async function deliver(){
  if(!selected.value.length)throw Error('请选择审核通过的学生');
- await api('deliveries',{student_ids:selected.value});await refresh();emit('navigate','deliveries');ElMessage.success('交付包已生成，实际发送后再确认交付');
+ profileId.value=state.exportProfiles.find(p=>p.is_default&&p.status==='active')?.id||state.exportProfiles.find(p=>p.status==='active')?.id||'';
+ deliveryPlan.value=await api('deliveries/preview',{student_ids:selected.value,profile_id:profileId.value});deliveryOpen.value=true;
 }
+async function createDelivery(){busy.value=true;try{await api('deliveries',{student_ids:selected.value,profile_id:profileId.value});deliveryOpen.value=false;await refresh();emit('navigate','deliveries');ElMessage.success('交付包已生成，实际发送后再确认交付');}finally{busy.value=false;}}
 </script>
 <template>
  <div class="toolbar"><el-button type="primary" @click="single" :disabled="!state.cohort||state.archived">单人补录</el-button><el-button type="danger" :disabled="!selected.length||state.archived" @click="recycle.show(state.cohort,selected)">选中学生移入回收站</el-button></div>
@@ -45,12 +47,13 @@ async function deliver(){
   </div>
   <div class="toolbar">
    <el-button @click="batch('approved')">批量审核通过</el-button><el-button @click="batch('rejected')">批量退回</el-button>
-   <el-button type="primary" @click="openPlan">预览处理计划</el-button><el-button @click="deliver">生成选中照片交付包</el-button>
+   <el-button type="primary" @click="openPlan">预览处理计划</el-button><el-button @click="deliver">预览并生成照片交付包</el-button>
    <el-button @click="download('选中学号.json',{student_ids:selected})">导出选中名单</el-button>
   </div>
   <el-table :data="filtered" row-key="id" empty-text="当前届次暂无学生，请前往数据接入" data-testid="student-table">
    <el-table-column width="56"><template #default="{row}"><el-checkbox :model-value="selected.includes(row.id)" @update:model-value="toggle(row.id,$event)" :aria-label="'选择学生 '+row.id"/></template></el-table-column>
    <el-table-column prop="id" label="学号" min-width="140"/>
+   <el-table-column prop="name" label="姓名" min-width="120"/>
    <el-table-column label="照片" width="150"><template #default="{row}"><Photo :artifact="row.result?.artifact||row.source" :label="row.id"/></template></el-table-column>
    <el-table-column label="状态" min-width="150"><template #default="{row}"><el-tag>{{labels[row.status]||row.status}}</el-tag></template></el-table-column>
    <el-table-column label="操作" min-width="180"><template #default="{row}"><el-button link type="primary" @click="detailId=row.id">查看流程 / 审核</el-button><el-button v-if="row.status==='missing'" link :disabled="state.archived" @click="detailId=row.id">补交照片</el-button><el-button link type="danger" :disabled="state.archived" @click="recycle.show(state.cohort,[row.id])">移入回收站</el-button></template></el-table-column>
@@ -61,6 +64,12 @@ async function deliver(){
  <el-dialog :model-value="!!batchDecision" @update:model-value="batchDecision=''" :title="batchDecision==='approved'?'批量审核通过':'批量退回'" width="440px">
   <p>仅处理当前选中的待人工审核学生。</p><el-input v-model="reason" type="textarea" placeholder="备注（可留空）"/>
   <template #footer><el-button @click="batchDecision=''">取消</el-button><el-button type="primary" @click="applyBatch" :loading="busy">确认批量审核</el-button></template>
+ </el-dialog>
+ <el-dialog v-model="deliveryOpen" title="预览交付文件名" width="min(900px,94vw)">
+  <el-select v-model="profileId" aria-label="导出格式" @change="async()=>{deliveryPlan=await api('deliveries/preview',{student_ids:selected,profile_id:profileId})}"><el-option v-for="p in state.exportProfiles.filter(x=>x.status==='active')" :key="p.id" :label="p.name+' · '+p.template" :value="p.id"/></el-select>
+  <el-alert v-if="deliveryPlan&&!deliveryPlan.ok" type="error" :closable="false" title="文件名检查未通过，请切换格式或修改名单字段"/>
+  <el-table v-if="deliveryPlan" :data="deliveryPlan.items"><el-table-column prop="student_id" label="学号"/><el-table-column prop="file_name" label="实际文件名"/><el-table-column prop="reason" label="状态"/></el-table>
+  <template #footer><el-button @click="deliveryOpen=false">取消</el-button><el-button type="primary" :disabled="!deliveryPlan?.ok" :loading="busy" @click="createDelivery">确认生成交付包</el-button></template>
  </el-dialog>
  <el-dialog v-model="planOpen" title="本次执行计划" width="min(850px,94vw)">
   

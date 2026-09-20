@@ -17,6 +17,7 @@ from photo_pipeline import PipelineOptions, test_hivision_api
 from .store import Store, now
 from .service import Service
 from .version import VERSION
+from .export_profiles import default_profile, validate_profile
 
 
 class Ids(BaseModel):
@@ -55,6 +56,20 @@ class Reason(BaseModel):
 class Historical(Ids):
     reason: str = Field(..., description='操作原因或历史交付依据。')
     confirmed_sent: bool = Field(False, description='必须为 true，确认照片已实际发送。')
+
+class Delivery(Ids):
+    profile_id: str | None = None
+
+class ExportProfileInput(BaseModel):
+    name: str
+    template: str
+    rules: dict = Field(default_factory=dict)
+
+class ExportProfileImport(BaseModel):
+    schema_version: int = 1
+    name: str
+    template: str
+    rules: dict = Field(default_factory=dict)
 
 
 API_DESCRIPTION = '学生照片工作台的本地接口。所有学号使用字符串，保留前导零。\n\n### 认证与错误\n从启动器打开工作台后，浏览器使用会话 Cookie。外部程序在每次请求中添加 `Authorization: Bearer <令牌>`；可在启动前设置环境变量 `SPF_API_TOKEN`。端口由启动器分配，固定端口可用 `--port 8769`。\n\nJSON 请求使用 `Content-Type: application/json`；上传文件使用 multipart/form-data。\n403：认证失败或跨站访问；404：记录不存在；409：业务状态冲突或配置非法（message 为中文原因）；422：请求字段验证失败（detail 为字段错误列表）。遇到修订号冲突应刷新记录，检查后重试。\n\n### 推荐调用顺序\n登记名单 → 上传原图 → 预览处理计划 → 正式处理 → 查询任务 → 查询学生详情 → 审核成片 → 生成交付包 → 下载 → 实际发送后确认交付。\n\n预览计划示例：`{"student_ids":["001"],"config":{"crop_enabled":true,"crop_width":295,"crop_height":413},"dry_run":true}`。\n正式处理复用同一份 student_ids 和 config，设置 dry_run=false，并传入预览返回的 revision 作为 expected_revision。\n审核示例：`{"student_id":"001","result_id":"从详情取得的版本ID","decision":"approved","expected_revision":3}`，修订号也应从当前详情取得。\n\n### 学生状态\nmissing 未采集；pending 原图待处理；processing 任务未完成；review 待人工审核；approved 审核通过待交付；delivered 已交付；delivered_updated 交付后照片变化；machine_rejected 机器退回；review_rejected 人工退回；failed 处理失败。\n\n### 处理配置参数\nGET /config 返回每项默认值及已保存值。配置和单张预览接收相同字段；background_mode 为 none（不处理）、quick（快速换色）、ai（本地抠图）或 hivision（外部服务）。颜色使用 #RRGGBB，宽高单位为像素；布尔值使用 true/false。Hivision 参数仅在该引擎下生效；最终裁切在背景处理之后执行。\n\n| 字段 | 中文含义 |\n| --- | --- |\n| `quality_enabled` | 启用内置预检 |\n| `auto_orient` | 校正90/180/270度方向 |\n| `check_grayscale` | 黑白检查 |\n| `check_face` | 人脸检查 |\n| `check_glare` | 反光检查 |\n| `check_recapture` | 翻拍检查 |\n| `background_mode` | 图像处理引擎 |\n| `background_color` | 背景颜色 |\n| `crop_enabled` | 最终裁切并缩放 |\n| `crop_width` | 最终宽度（像素） |\n| `crop_height` | 最终高度（像素） |\n| `hivision_url` | Hivision API地址 |\n| `hivision_timeout` | API超时（秒） |\n| `hivision_width` | Hivision标准图宽 |\n| `hivision_height` | Hivision标准图高 |\n| `hivision_hd` | 使用高清返回 |\n| `hivision_face_align` | Hivision小角度对齐 |\n| `hivision_matting_model` | Hivision抠图模型 |\n| `hivision_face_model` | Hivision人脸模型 |\n| `hivision_dpi` | 打印DPI |\n| `stop_on_reject` | 预检不通过时停止 |\n| `grayscale_ratio_threshold` | 黑白比例阈值 |\n| `grayscale_delta_limit` | 灰度色差阈值 |\n| `face_confidence_threshold` | 人脸置信度阈值 |\n| `glare_ratio_threshold` | 反光比例阈值 |\n| `glare_luma_threshold` | 过曝亮度阈值 |\n| `recapture_score_threshold` | 翻拍分数阈值 |\n| `orientation_min_confidence` | 方向最低置信度 |\n| `orientation_confidence_margin` | 旋转置信度优势 |\n| `hivision_head_measure_ratio` | 面部占比 |\n| `hivision_head_height_ratio` | 面部中心高度 |\n| `hivision_top_distance_max` | 头顶留白最大比例 |\n| `hivision_top_distance_min` | 头顶留白最小比例 |\n| `hivision_brightness_strength` | 亮度调整 |\n| `hivision_contrast_strength` | 对比度调整 |\n| `hivision_sharpen_strength` | 锐化调整 |\n| `hivision_saturation_strength` | 饱和度调整 |\n'
@@ -184,6 +199,91 @@ def create_app(root, token=None, requests=None):
         ids=sorted(sid for sid,s in d['students'].items() if s.get('cohort',active)==active and s.get('delivered'))
         return PlainTextResponse('\n'.join(ids)+'\n',media_type='text/plain; charset=utf-8',headers={'Content-Disposition':'attachment; filename=delivered.txt'})
 
+    @app.get('/api/v1/export-profiles', tags=['审核与交付'], summary='读取照片导出格式')
+    def export_profiles():
+        return store.snapshot().get('export_profiles',[default_profile()])
+
+    @app.post('/api/v1/export-profiles', tags=['审核与交付'], summary='新建照片导出格式')
+    def create_export_profile(body: ExportProfileInput):
+        values=validate_profile(body.name,body.template,body.rules); stamp=now(); pid=uuid.uuid4().hex
+        profile=dict(id=pid,**values,revision=1,status='active',is_default=False,created_at=stamp,updated_at=stamp,history=[])
+        def update(d):
+            profiles=d.setdefault('export_profiles',[default_profile()])
+            if any(p.get('name')==profile['name'] for p in profiles): raise ValueError('格式名称已存在，请改名或使用复制')
+            profiles.append(profile); return profile
+        return store.change('新建照片导出格式',update)
+
+    @app.put('/api/v1/export-profiles/{profile_id}', tags=['审核与交付'], summary='修改照片导出格式')
+    def update_export_profile(profile_id: str, body: ExportProfileInput):
+        values=validate_profile(body.name,body.template,body.rules); stamp=now()
+        def update(d):
+            profiles=d.setdefault('export_profiles',[default_profile()]); p=next((x for x in profiles if x['id']==profile_id),None)
+            if not p: raise ValueError('导出格式不存在')
+            if any(x is not p and x.get('name')==values['name'] for x in profiles): raise ValueError('格式名称已存在，请改名')
+            p.setdefault('history',[]).append({k:p.get(k) for k in ('revision','name','template','rules','updated_at')})
+            p.update(values,revision=p.get('revision',1)+1,updated_at=stamp); return p
+        return store.change('修改照片导出格式',update)
+
+    @app.post('/api/v1/export-profiles/{profile_id}/copy', tags=['审核与交付'], summary='复制照片导出格式')
+    def copy_export_profile(profile_id: str):
+        def update(d):
+            profiles=d.setdefault('export_profiles',[default_profile()]); source=next((x for x in profiles if x['id']==profile_id),None)
+            if not source: raise ValueError('导出格式不存在')
+            stamp=now(); p=dict(source,id=uuid.uuid4().hex,name=source['name']+' 副本',revision=1,is_default=False,created_at=stamp,updated_at=stamp,history=[])
+            profiles.append(p); return p
+        return store.change('复制照片导出格式',update)
+
+    @app.post('/api/v1/export-profiles/{profile_id}/default', tags=['审核与交付'], summary='设置默认照片导出格式')
+    def default_export_profile(profile_id: str):
+        def update(d):
+            profiles=d.setdefault('export_profiles',[default_profile()]); found=False
+            for p in profiles:
+                if p['id']==profile_id:
+                    if p.get('status')!='active': raise ValueError('停用格式不能设为默认')
+                    p['is_default']=True; found=True
+                else:p['is_default']=False
+            if not found: raise ValueError('导出格式不存在')
+            return next(p for p in profiles if p['id']==profile_id)
+        return store.change('设置默认导出格式',update)
+
+    @app.post('/api/v1/export-profiles/{profile_id}/status', tags=['审核与交付'], summary='停用或恢复照片导出格式')
+    def status_export_profile(profile_id: str, body: dict):
+        def update(d):
+            p=next((x for x in d.setdefault('export_profiles',[default_profile()]) if x['id']==profile_id),None)
+            if not p: raise ValueError('导出格式不存在')
+            p['status']='active' if body.get('status')=='active' else 'inactive'
+            if p['status']!='active' and p.get('is_default'): p['is_default']=False
+            p['updated_at']=now(); return p
+        return store.change('修改导出格式状态',update)
+
+    @app.delete('/api/v1/export-profiles/{profile_id}', tags=['审核与交付'], summary='删除未使用照片导出格式')
+    def delete_export_profile(profile_id: str):
+        def update(d):
+            profiles=d.setdefault('export_profiles',[default_profile()]); p=next((x for x in profiles if x['id']==profile_id),None)
+            if not p: raise ValueError('导出格式不存在')
+            if p.get('is_default'): raise ValueError('默认格式不能删除')
+            if any(b.get('format_snapshot',{}).get('profile_id')==profile_id for b in d.get('deliveries',{}).values()): raise ValueError('该格式已被交付记录使用，不能删除')
+            profiles.remove(p); return {'ok':True}
+        return store.change('删除导出格式',update)
+
+    @app.get('/api/v1/export-profiles/{profile_id}/json', tags=['审核与交付'], summary='导出照片格式 JSON')
+    def export_profile_json(profile_id: str):
+        p=next((x for x in store.snapshot().get('export_profiles',[]) if x['id']==profile_id),None)
+        if not p: raise ValueError('导出格式不存在')
+        payload={'schema_version':1,'name':p['name'],'template':p['template'],'rules':p['rules'],'fields':p.get('fields',[]),'revision':p.get('revision',1)}
+        return JSONResponse(payload,headers={'Content-Disposition':f'attachment; filename="export-profile-{profile_id}.json"'})
+
+    @app.post('/api/v1/export-profiles/import', tags=['审核与交付'], summary='导入照片格式 JSON')
+    def import_export_profile(body: ExportProfileImport):
+        if body.schema_version != 1: raise ValueError('格式文件 schema_version 不支持')
+        values=validate_profile(body.name,body.template,body.rules); stamp=now(); pid=uuid.uuid4().hex
+        def update(d):
+            profiles=d.setdefault('export_profiles',[default_profile()]); name=values['name'];
+            if any(p['name']==name for p in profiles): name += ' 导入副本'
+            imported=dict(values,name=name)
+            p=dict(id=pid,**imported,revision=1,status='active',is_default=False,created_at=stamp,updated_at=stamp,history=[]); profiles.append(p); return p
+        return store.change('导入照片导出格式',update)
+
     @app.get('/api/v1/students', tags=['学生与原图'], summary='查询学生列表', description='status 为状态代码，留空不过滤；q 按学号包含匹配。返回数组，每项含 id、status、source、result、revision。状态代码见上方说明。')
     def students(status: str = '', q: str = ''):
         rows = []
@@ -195,7 +295,7 @@ def create_app(root, token=None, requests=None):
             source,result = Store.current(s)
             state = 'processing' if Store.processing(snapshot,sid) else Store.status(s)
             if (not status or status == state) and q.casefold() in sid.casefold():
-                rows.append(dict(id=sid,status=state,source=source,result=result,revision=len(s['history'])))
+                rows.append(dict(id=sid,name=s.get('name'),status=state,source=source,result=result,revision=len(s['history'])))
         return sorted(rows,key=lambda r:r['id'])
 
     @app.get('/api/v1/students/{sid}', tags=['学生与原图'], summary='查询学生完整记录', description='sid 为学号（保留前导零）。返回 sources 原图版本、results 处理版本、history 操作记录、delivered 交付事实及 revision。不存在返回 404。')
@@ -316,8 +416,12 @@ def create_app(root, token=None, requests=None):
         return list(store.snapshot()['deliveries'].values())[::-1]
 
     @app.post('/api/v1/deliveries', tags=['审核与交付'], summary='生成照片交付包', description='提交 student_ids。仅接收审核通过且不在其他待交付包中的学生。返回 prepared 批次及 id；此操作尚未标记实际交付。ZIP 内含学号命名照片与 manifest.json。')
-    def deliver(body: Ids):
-        return service.delivery(body.student_ids)
+    def deliver(body: Delivery):
+        return service.delivery(body.student_ids,body.profile_id)
+
+    @app.post('/api/v1/deliveries/preview', tags=['审核与交付'], summary='预览交付包文件名')
+    def delivery_preview(body: Delivery):
+        return service.export_preview(body.student_ids,body.profile_id)
 
     @app.post('/api/v1/historical-deliveries', tags=['审核与交付'], summary='登记历史已交付名单', description='提交学号名单、交付依据 reason，并设置 confirmed_sent=true。只记录历史交付事实，不把当前成片标为审核通过。返回历史批次；缺少的学号自动加入名单；校验失败时整批不保存。')
     def historical(body: Historical):
@@ -395,8 +499,8 @@ def create_app(root, token=None, requests=None):
             if cohort.strip(): store.set_cohort(cohort.strip())
             return service.start_zip(path,rows)
 
-    @app.post('/api/v1/imports/xlsx', tags=['导入与迁移'], summary='检查 Excel 或创建原图接收任务', description='multipart/form-data：file 为 .xlsx（最大 50MB）；sheet 留空取首张；header_row 表头行从 1 开始；id_column 学号列默认 A；image_column 图片列默认 B。inspect_only=true 每次按表头识别列，未识别的列默认 A/B，返回 summary、headers、sheet、id_column、image_column；false 严格使用所选列并创建后台导入任务。照片链接须仍有效。')
-    def import_xlsx(file: UploadFile = File(...), sheet: str = Form(''), header_row: int = Form(1), id_column: str = Form('A'), image_column: str = Form('B'), cohort: str = Form(''), inspect_only: bool = Form(True)):
+    @app.post('/api/v1/imports/xlsx', tags=['导入与迁移'], summary='检查 Excel 或创建原图接收任务', description='multipart/form-data：file 为 .xlsx（最大 50MB）；sheet 留空取首张；header_row 表头行从 1 开始；id_column 学号列默认 A；image_column 图片列默认 B；name_column 可选姓名列，空值不覆盖已保存姓名。inspect_only=true 默认按表头识别列，detect_columns=false 检查用户所选列，未识别的列默认 A/B，返回 summary、headers、sheet、id_column、image_column；false 严格使用所选列并创建后台导入任务。照片链接须仍有效。')
+    def import_xlsx(file: UploadFile = File(...), sheet: str = Form(''), header_row: int = Form(1), id_column: str = Form('A'), image_column: str = Form('B'), name_column: str = Form(''), cohort: str = Form(''), inspect_only: bool = Form(True), detect_columns: bool = Form(True)):
         from xlsx_photo_core import WorkbookReader, inspect_selection, column_index, column_label, suggest_columns, _fetch_source
         raw = file.file.read(50*1024*1024+1)
         if len(raw)>50*1024*1024:
@@ -416,21 +520,33 @@ def create_app(root, token=None, requests=None):
                 name=sheet or sheets[0].name
                 headers = reader.headers(name, header_row)
                 detected_cohort = detect_cohort(reader, name, header_row, headers)
-            if inspect_only:
+            if inspect_only and detect_columns:
                 id_col, image_col = suggest_columns(headers + [''] * max(0, 2-len(headers)))
+                import re
+                name_col = next((i for i,h in enumerate(headers) if re.fullmatch(r'(?:学生)?姓名|名字|name',str(h).strip(),re.I)), None)
             else:
                 id_col, image_col = column_index(id_column or 'A'), column_index(image_column or 'B')
+                name_col = column_index(name_column) if name_column.strip() else None
             if id_col == image_col:
                 raise ValueError('学号列和图片列不能是同一列，请手动选择后接收原始图片')
-            report=inspect_selection(path,name,header_row,id_col,image_col)
+            if name_col in {id_col, image_col}:
+                raise ValueError('姓名列不能与学号列或图片列相同')
+            if name_col is not None and not 0 <= name_col < len(headers):
+                raise ValueError('姓名列超出表格表头范围')
+            report=inspect_selection(path,name,header_row,id_col,image_col,name_col)
             if inspect_only:
                 return dict(summary=report.summary,headers=report.headers,sheet=name,
-                            id_column=column_label(id_col),image_column=column_label(image_col),cohort=detected_cohort)
+                            id_column=column_label(id_col),image_column=column_label(image_col),name_column=column_label(name_col) if name_col is not None else '',cohort=detected_cohort,
+                            name_header=headers[name_col] if name_col is not None else '',
+                            can_import=not (report.summary['duplicate_count'] or report.summary['empty_ids'] or report.summary['name_conflicts']))
+            if report.summary.get('name_conflicts'):
+                details='；'.join(x['student_id']+'（第'+ '、'.join(map(str,x['rows']))+'行）：'+', '.join(x['names']) for x in report.summary['name_conflicts'])
+                raise ValueError('同一批次同一学号存在不同姓名，请修正：'+details)
             if report.summary['duplicate_count'] or report.summary['empty_ids']:
                 raise ValueError('请先修正空学号或重复学号')
             target_cohort = (cohort or detected_cohort or store.snapshot().get('active_cohort')).strip()
             store.set_cohort(target_cohort)
-            return service.start_import(raw,name,header_row,id_col,image_col,report.rows)
+            return service.start_import(raw,name,header_row,id_col,image_col,report.rows,name_col)
 
     @app.post('/api/v1/migrations/legacy', tags=['导入与迁移'], summary='检查或迁移旧版工作区', description='提交 {"path":"D:\\\\旧版\\\\导出结果","apply":false} 先检查；apply=true 才复制迁移，目标须符合空工作区要求。path 是运行服务的电脑路径。返回迁移报告；不覆盖旧数据。')
     def migrate(body: dict):

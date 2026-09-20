@@ -16,6 +16,7 @@ from pathlib import Path
 
 from photo_pipeline import PipelineOptions, run_pipeline, validate_pipeline_options
 from .store import Store, atomic, now
+from .export_profiles import default_profile, preview as preview_names, validate_profile
 
 
 class Service:
@@ -289,18 +290,24 @@ class Service:
         except Exception as exc:
             self._interrupted(jid,exc)
 
-    def start_import(self, raw, sheet, header_row, id_col, image_col, rows):
+    def start_import(self, raw, sheet, header_row, id_col, image_col, rows, name_col=None):
         with self.gate, self.store.lock:
             if self.thread and self.thread.is_alive():
                 raise ValueError('已有任务运行中，请先中断或等待完成')
-            self.store.roster([r.student_id for r in rows], self.store.snapshot().get('active_cohort'))
             relative='inputs/'+hashlib.sha256(raw).hexdigest()+'.xlsx'
             atomic(self.store.root/relative,raw)
             jid=uuid.uuid4().hex
             job=dict(id=jid,kind='import',status='running',uncertain={},skipped=[],created_at=now(),completed=[],errors={},current=None,
-                     timing=self._new_timing(),in_flight=[],input_file=relative,sheet=sheet,header_row=header_row,id_col=id_col,image_col=image_col,
-                     plan={'items':[dict(student_id=r.student_id,execute=True,reason=None) for r in rows]})
-            self.store.change('创建原图接收任务',lambda d:d['jobs'].update({jid:job}))
+                     timing=self._new_timing(),in_flight=[],input_file=relative,sheet=sheet,header_row=header_row,id_col=id_col,image_col=image_col,name_col=name_col,
+                     plan={'items':[dict(student_id=r.student_id,name=r.name,execute=True,reason=None) for r in rows]})
+            def accept(d):
+                Store.add_roster(d, [r.student_id for r in rows])
+                for row in rows:
+                    if row.name:
+                        d['students'][row.student_id]['name'] = row.name
+                d['jobs'][jid] = job
+            # Metadata is accepted with the roster, independently of photo/processing state.
+            self.store.change('创建原图接收任务并保存姓名',accept)
             self._launch(jid)
             return job
 
@@ -354,7 +361,7 @@ class Service:
         from xlsx_photo_core import inspect_selection,_fetch_source
         try:
             job=self.store.snapshot()['jobs'][jid]
-            report=inspect_selection(self.store.file(job['input_file']),job['sheet'],job['header_row'],job['id_col'],job['image_col'])
+            report=inspect_selection(self.store.file(job['input_file']),job['sheet'],job['header_row'],job['id_col'],job['image_col'],job.get('name_col'))
             for row in report.rows:
                 sid=row.student_id
                 if sid in job['completed']:
@@ -496,9 +503,32 @@ class Service:
             return batch
         return self.store.change('登记历史交付名单',update)
 
-    def delivery(self, ids):
+    def export_profile(self, profile_id=None, d=None):
+        profiles=(d or self.store.snapshot()).setdefault('export_profiles',[default_profile()])
+        if profile_id is None: return next((p for p in profiles if p.get('is_default') and p.get('status')=='active'),profiles[0])
+        try: return next(p for p in profiles if p['id']==profile_id)
+        except StopIteration: raise ValueError('导出格式不存在')
+
+    def export_preview(self, ids, profile_id=None, cohort=None):
+        d=self.store.snapshot(); profile=self.export_profile(profile_id,d)
+        if profile.get('status')!='active': raise ValueError('该导出格式已停用，请先恢复使用')
+        active=cohort or d.get('active_cohort'); students=[]
+        for sid in dict.fromkeys(ids):
+            s=d['students'].get(sid)
+            if not s or s.get('cohort',active)!=active: raise ValueError(sid+' 不属于当前届次')
+            if Store.status(s)!='approved': raise ValueError(sid+' 未审核通过')
+            r=next((x for x in s['results'] if x['id']==s['approved']),None)
+            if not r or not r.get('artifact'): raise ValueError(sid+' 没有可交付成片')
+            students.append({'student_id':sid,'name':s.get('name'),'ext':Path(r['artifact']['file']).suffix})
+        result=preview_names(profile,students)
+        result.update(profile_id=profile['id'],profile_snapshot={'profile_id':profile['id'],'name':profile.get('name'),'template':profile.get('template'),'revision':profile.get('revision'),'rules':profile.get('rules')})
+        return result
+
+    def delivery(self, ids, profile_id=None):
         with self.store.lock:
             d = self.store.snapshot()
+            profile=self.export_profile(profile_id,d)
+            if profile.get('status')!='active': raise ValueError('该导出格式已停用，请先恢复使用')
             entries = []
             reserved = {x['student_id'] for batch in d['deliveries'].values() if batch['status'] == 'prepared' for x in batch['items']}
             for sid in dict.fromkeys(ids):
@@ -511,11 +541,16 @@ class Service:
                 artifact = r['artifact']
                 if hashlib.sha256(self.store.file(artifact['file']).read_bytes()).hexdigest() != artifact['id']:
                     raise ValueError('成片完整性校验失败：'+sid)
-                entries.append(dict(student_id=sid, result_id=r['id'], source_id=r['source_id'], artifact=artifact))
+                entries.append(dict(student_id=sid, name=s.get('name'), result_id=r['id'], source_id=r['source_id'], artifact=artifact, ext=Path(artifact['file']).suffix))
             if not entries:
                 raise ValueError('请选择已通过的学生')
+            names=preview_names(profile,[{'student_id':e['student_id'],'name':e.get('name'),'ext':e['ext']} for e in entries])
+            if not names['ok']:
+                raise ValueError('导出文件名检查未通过：'+ '; '.join(x['student_id']+' '+x['reason'] for x in names['items'] if x['status']=='error'))
+            for e,row in zip(entries,names['items']): e['file_name']=row['file_name']
+            snapshot={'profile_id':profile['id'],'name':profile.get('name'),'template':profile.get('template'),'revision':profile.get('revision'),'rules':profile.get('rules')}
             batch_id = uuid.uuid4().hex
-            batch = dict(id=batch_id, at=now(), status='prepared', items=entries)
+            batch = dict(id=batch_id, at=now(), status='prepared', format_snapshot=snapshot, items=entries)
             jid=uuid.uuid4().hex
             task=dict(id=jid,kind='delivery',status='running',created_at=now(),completed=[],errors={},uncertain={},skipped=[],current=None,in_flight=[],timing=self._new_timing(),plan={'items':[dict(student_id=e['student_id'],execute=True) for e in entries]})
             self.store.change('创建交付打包任务',lambda d:d['jobs'].update({jid:task}))
@@ -524,7 +559,7 @@ class Service:
                 folder = self.store.root / 'deliveries' / batch_id
                 for entry in entries:
                     art = entry['artifact']
-                    atomic(folder / 'photos' / (entry['student_id']+Path(art['file']).suffix), self.store.file(art['file']).read_bytes())
+                    atomic(folder / 'photos' / entry['file_name'], self.store.file(art['file']).read_bytes())
                 atomic(folder / 'manifest.json', batch)
                 with zipfile.ZipFile(folder / 'photos.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
                     for path in sorted((folder / 'photos').iterdir()):

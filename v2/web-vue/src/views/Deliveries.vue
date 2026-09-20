@@ -1,20 +1,28 @@
 <script setup>
-import { state,refresh } from '../workspace';
-import { api,url } from '../api';
-import { ElMessage,ElMessageBox } from 'element-plus';
+import {ref,onMounted} from 'vue';
+import {ElMessage,ElMessageBox} from 'element-plus';
+import {state,refresh} from '../workspace';
+import {api,url,download} from '../api';
 const labels={prepared:'待实际交付',delivered:'已交付',cancelled:'已取消'};
-async function action(batch,value){
- const cid=state.cohort;
- if(value==='confirm')await ElMessageBox.confirm('确认照片已实际发送给接收方？','确认实际交付',{confirmButtonText:'确认已发送',cancelButtonText:'取消'});
- await api('deliveries/'+batch.id+'/'+value,{},undefined,cid);await refresh();ElMessage.success(value==='confirm'?'已确认交付':'交付包已取消');
-}
+const profiles=ref([]),open=ref(false),editing=ref(null),form=ref({name:'',template:'{student_id}{ext}'}),file=ref();
+async function load(){profiles.value=await api('export-profiles');state.exportProfiles=profiles.value;}
+onMounted(load);
+async function action(batch,value){const cid=state.cohort;if(value==='confirm')await ElMessageBox.confirm('确认照片已实际发送给接收方？','确认实际交付',{confirmButtonText:'确认已发送',cancelButtonText:'取消'});await api('deliveries/'+batch.id+'/'+value,{},undefined,cid);await refresh();ElMessage.success(value==='confirm'?'已确认交付':'交付包已取消');}
+function add(){editing.value=null;form.value={name:'',template:'{student_id}{ext}'};open.value=true;}
+function edit(p){editing.value=p;form.value={name:p.name,template:p.template};open.value=true;}
+function appendToken(token){form.value.template+=token;}
+async function save(){const wasEdit=!!editing.value;if(wasEdit)await api('export-profiles/'+editing.value.id,form.value,'PUT');else await api('export-profiles',form.value);open.value=false;await load();ElMessage.success(wasEdit?'格式已保存，旧版本已保留':'格式已创建');}
+async function copy(p){await api('export-profiles/'+p.id+'/copy',{});await load();ElMessage.success('格式已复制');}
+async function setDefault(p){await api('export-profiles/'+p.id+'/default',{});await load();}
+async function toggle(p){await api('export-profiles/'+p.id+'/status',{status:p.status==='active'?'inactive':'active'});await load();}
+async function remove(p){await ElMessageBox.confirm('仅删除未被交付记录使用的格式？','删除格式',{type:'warning'});await api('export-profiles/'+p.id,{},'DELETE');await load();}
+function exportJson(p){fetch(url('export-profiles/'+p.id+'/json')).then(r=>r.json()).then(x=>download(p.name+'.export-profile.json',x));}
+async function importJson(event){const f=event.target.files?.[0];if(!f)return;try{await api('export-profiles/import',JSON.parse(await f.text()));await load();ElMessage.success('格式已导入');}catch(e){ElMessage.error(e.message)}finally{event.target.value='';}}
 </script>
 <template>
- <p class="muted">显示当前届次交付记录。生成交付包后，实际发送完成再确认已交付。</p><el-empty v-if="!state.deliveries.length" description="暂无交付批次"/>
- <el-card v-for="batch in state.deliveries" :key="batch.id" shadow="never" data-testid="delivery">
-  <div class="section-heading"><h3>{{batch.historical?'历史登记':'照片交付包'}} · {{batch.id.slice(0,16)}}</h3><el-tag>{{labels[batch.status]}}</el-tag></div>
-  <p>{{batch.items.length}} 人 · {{batch.at}}</p>
-  <div class="toolbar"><el-button v-if="!batch.historical&&batch.status!=='cancelled'" tag="a" :href="url('deliveries/'+batch.id+'/download')">下载学号命名照片包</el-button><el-button v-if="batch.status==='prepared'" type="primary" @click="action(batch,'confirm')">确认这批照片已经实际交付</el-button><el-button v-if="batch.status==='prepared'" @click="action(batch,'cancel')">取消交付包</el-button></div>
-  <el-collapse><el-collapse-item title="查看学号"><p>{{batch.items.map(x=>x.student_id).join('、')}}</p></el-collapse-item></el-collapse>
- </el-card>
+ <div class="section-heading"><p class="muted">显示当前届次交付记录。生成交付包前先选择格式并预览实际文件名。</p><div class="toolbar"><el-button @click="add">新建导出格式</el-button><el-button @click="file?.click()">导入 JSON</el-button><input ref="file" type="file" accept="application/json,.json" hidden @change="importJson"/></div></div>
+ <el-card shadow="never"><template #header><h3>导出格式</h3></template><el-empty v-if="!profiles.length" description="暂无导出格式"/><el-table v-else :data="profiles"><el-table-column prop="name" label="名称"/><el-table-column prop="template" label="模板"/><el-table-column label="状态"><template #default="{row}"><el-tag>{{row.status==='active'?'启用':'停用'}}</el-tag><el-tag v-if="row.is_default" type="success">默认</el-tag></template></el-table-column><el-table-column label="修订"><template #default="{row}">v{{row.revision}}<el-collapse v-if="row.history?.length"><el-collapse-item title="历史"><p v-for="h in row.history" :key="h.revision">v{{h.revision}} · {{h.template}}</p></el-collapse-item></el-collapse></template></el-table-column><el-table-column label="操作" min-width="390"><template #default="{row}"><el-button link @click="edit(row)">修改</el-button><el-button link @click="copy(row)">复制</el-button><el-button link @click="setDefault(row)" :disabled="row.status!=='active'||row.is_default">设为默认</el-button><el-button link @click="toggle(row)">{{row.status==='active'?'停用':'恢复'}}</el-button><el-button link @click="exportJson(row)">导出 JSON</el-button><el-button link type="danger" @click="remove(row)" :disabled="row.is_default">删除</el-button></template></el-table-column></el-table></el-card>
+ <el-empty v-if="!state.deliveries.length" description="暂无交付批次"/>
+ <el-card v-for="batch in state.deliveries" :key="batch.id" shadow="never" data-testid="delivery"><div class="section-heading"><h3>{{batch.historical?'历史登记':'照片交付包'}} · {{batch.id.slice(0,16)}}</h3><el-tag>{{labels[batch.status]}}</el-tag></div><p>{{batch.items.length}} 人 · {{batch.at}} <span v-if="batch.format_snapshot">· 格式：{{batch.format_snapshot.name}} v{{batch.format_snapshot.revision}}</span><span v-else>· 历史学号命名格式</span></p><div class="toolbar"><el-button v-if="!batch.historical&&batch.status!=='cancelled'" tag="a" :href="url('deliveries/'+batch.id+'/download')">下载照片包</el-button><el-button v-if="batch.status==='prepared'" type="primary" @click="action(batch,'confirm')">确认这批照片已经实际交付</el-button><el-button v-if="batch.status==='prepared'" @click="action(batch,'cancel')">取消交付包</el-button></div><el-collapse><el-collapse-item title="查看文件名"><p>{{batch.items.map(x=>x.file_name||x.student_id).join('、')}}</p></el-collapse-item></el-collapse></el-card>
+ <el-dialog v-model="open" :title="editing?'修改导出格式':'新建导出格式'" width="560px"><el-form label-position="top"><el-form-item label="格式名称"><el-input v-model="form.name" placeholder="校园卡照片"/></el-form-item><el-form-item label="普通组合"><div class="toolbar"><el-button v-for="field in ['{student_id}','{name}','{ext}']" :key="field" @click="appendToken(field)">添加 {{field}}</el-button><el-input v-model="form.template" placeholder="在模板中输入连接符或文字"/></div><p class="muted">可使用任意连接符或普通文字，例如 -、_、空格、·、#。字段按钮只提供当前真实可用字段。</p></el-form-item><el-form-item label="高级模板"><el-input v-model="form.template" placeholder="{student_id}-{name}{ext}"/><p class="muted">支持字段：{student_id}（学号）、{name}（Excel 导入的姓名）、{ext}（实际图片扩展名）。缺少姓名会阻止姓名模板导出；班级、年级、专业等字段暂不支持。</p></el-form-item></el-form><template #footer><el-button @click="open=false">取消</el-button><el-button type="primary" @click="save">保存格式</el-button></template></el-dialog>
 </template>
