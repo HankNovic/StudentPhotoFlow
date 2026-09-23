@@ -52,7 +52,7 @@ chmod 600 .env
 # 生成随机口令，编辑.env，勿使用示例占位值
 openssl rand -hex 32
 nano .env
-mkdir -p data-rc5
+mkdir -p data-rc4
 docker compose --env-file .env -p studentphotoflow pull
 docker compose --env-file .env -p studentphotoflow up -d
 curl --fail http://127.0.0.1:8769/healthz
@@ -93,3 +93,4 @@ docker compose --env-file .env -p "$SPF_PROJECT" up -d
 暂停/安全结束收到请求即停止新调度，等待所有在途项目（包括失败/超时）收尾并保存。手动结束不再继续。处理请求有配置超时，不自动重试。总历时包含暂停及停机，实际运行时长按任务运行区间累计，不相加各学生耗时；每秒原子保存运行检查点。异常退出只使用已落盘时长，并提示是已确认下限，最多可能漏记最后检查点后的尾段；服务停机不计入运行时长。不确定结果仍须核对。历史缺失计时显示未记录；旧任务恢复后只能报告恢复后的部分时长。
 
 此前并发性能/错误/停止时序验收使用独立模拟服务，不代表真实Hivision性能或人像效果。本轮只验证导出格式及姓名闭环，未调用真实Hivision。网页更新检查继承2.4.0只查询正式Release的限制，候选升级请以本Release固定镜像为准。
+
