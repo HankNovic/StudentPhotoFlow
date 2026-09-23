@@ -7,16 +7,18 @@ import Photo from './Photo.vue';
 import Stages from './Stages.vue';
 import ConfigFields from './ConfigFields.vue';
 import ActionHelp from './ActionHelp.vue';
+import DeliveryPreview from './DeliveryPreview.vue';
 import {useDraft,confirmLeave} from '../drafts';
 import {newRequestId,reviewState,taskLabels} from '../review';
 const props=defineProps({id:String,visibleIds:{type:Array,default:()=>[]}}),emit=defineEmits(['update:id']);
 const detail=ref(null),preview=ref(null),busy=ref(''),settings=ref([]),historyOpen=ref([]),config=ref({}),jobs=ref([]),batches=ref([]),cohort=ref(''),cohortName=ref(''),plan=ref(null);
 const initialConfig=ref(''),navigation=ref([]),loadError=ref(''),notice=ref(null);
+const deliveryPreview=ref(),deliveryBusy=ref(false);
 let timer,epoch=0,loadSequence=0,planSequence=0;
 const archived=computed(()=>state.allCohorts.find(c=>c.id===cohort.value)?.archived);
 const stage=computed(()=>reviewState(detail.value,jobs.value,batches.value,archived.value));
 const source=computed(()=>stage.value.source),result=computed(()=>stage.value.result);
-const disabled=computed(()=>!!busy.value||!!loadError.value);
+const disabled=computed(()=>!!busy.value||deliveryBusy.value||!!loadError.value);
 const position=computed(()=>navigation.value.indexOf(props.id));
 const readyPlan=computed(()=>!!plan.value?.requestId&&plan.value.items.some(i=>i.execute));
 const progressText=computed(()=>({load:'正在加载详情',reload:'正在刷新详情',upload:'正在保存原始照片',replace:'正在提交替换操作',plan:'正在检查处理计划',start:'正在创建正式处理任务',preview:'正在生成临时预览',deliver:'正在生成交付包',confirm:'正在确认实际交付'})[busy.value]||(busy.value.startsWith('review-')?'正在提交审核操作':'正在下载交付包'));
@@ -35,7 +37,7 @@ function invalidatePlan(){planSequence++;plan.value=null;}
 const context=()=>({sid:props.id,cid:cohort.value,epoch});
 const current=c=>c.epoch===epoch&&c.sid===props.id&&c.cid===cohort.value;
 const call=(c,p,b,m)=>api(p,b,m,c.cid);
-async function close(){if(busy.value){ElMessage.info('正在提交操作，请等待返回后关闭；已创建的后台任务不受关闭影响。');return;}if(await confirmLeave())emit('update:id','');}
+async function close(){if(busy.value||deliveryBusy.value){ElMessage.info('正在提交操作，请等待返回后关闭；已创建的后台任务不受关闭影响。');return;}if(await confirmLeave()){deliveryPreview.value?.close();emit('update:id','');}}
 async function load(){
   const c=context(),seq=++loadSequence;if(!c.sid||!c.cid)return;
   try{
@@ -62,6 +64,7 @@ async function perform(key,fn){
   finally{if(current(c))busy.value='';}
 }
 watch(()=>props.id,async(id,old)=>{
+  deliveryPreview.value?.close();
   epoch++;loadSequence++;invalidatePlan();busy.value='';detail.value=null;preview.value=null;jobs.value=[];batches.value=[];loadError.value='';notice.value=null;initialConfig.value='';historyOpen.value=[];settings.value=[];
   if(!id)return;
   if(!old||cohort.value!==state.cohort){navigation.value=[...props.visibleIds];if(!navigation.value.includes(id))navigation.value.push(id);}
@@ -124,9 +127,12 @@ function review(decision){return perform('review-'+decision,async c=>{
 });}
 function deliver(){return perform('deliver',async c=>{
   if(!stage.value.deliver)throw Error('请确认正式成片已审核通过，且没有待交付包。');
-  await call(c,'deliveries',{student_ids:[c.sid]});
-  await reloadAfter(c,'已生成单人交付包，下载后仍需确认已交付');
+  await deliveryPreview.value.show(c.cid,[c.sid]);
 });}
+async function deliveryCreated(batch,selected){
+ const c=context();if(c.cid!==selected.cid||c.sid!==selected.ids[0])return;
+ await reloadAfter(c,'已生成单人交付包 · '+batch.format_snapshot.name+' v'+batch.format_snapshot.revision+'，下载后仍需确认已交付');
+}
 function confirm(b){return perform('confirm',async c=>{
   await ElMessageBox.confirm('确认这个单人交付包已实际交给学生？下载不等于交付。','确认已交付');
   if(!current(c))return;
@@ -182,7 +188,7 @@ onMounted(()=>{timer=setInterval(()=>{if(props.id&&!busy.value)load().catch(()=>
    <section v-if="stage.deliver||batches.length" class="review-section" aria-label="照片交付">
     <h3>照片交付</h3>
     <div v-if="stage.deliver" class="toolbar"><el-button :loading="busy==='deliver'" :disabled="disabled" @click="deliver">生成单人交付包</el-button><ActionHelp label="生成交付包" text="打包已审核通过的正式成片；生成、下载均不等于交付，实际交给学生后还需确认。"/></div>
-    <el-card v-for="b in batches" :key="b.id" shadow="never"><p>交付记录 {{b.id.slice(0,8)}} · {{({prepared:'待确认实际交付',delivered:'已实际交付',cancelled:'已取消'})[b.status]||b.status}} · {{b.items.length}} 人</p>
+    <el-card v-for="b in batches" :key="b.id" shadow="never"><p>交付记录 {{b.id.slice(0,8)}} · {{({prepared:'待确认实际交付',delivered:'已实际交付',cancelled:'已取消'})[b.status]||b.status}} · {{b.items.length}} 人</p><p class="muted">{{b.format_snapshot?'格式：'+b.format_snapshot.name+' v'+b.format_snapshot.revision:'历史学号命名格式'}}</p>
      <div class="toolbar"><span v-if="!b.historical&&b.status!=='cancelled'" class="action-pair"><el-button :loading="busy==='download-'+b.id" :disabled="!!busy" @click="downloadBatch(b)">下载交付包</el-button><ActionHelp label="下载交付包" text="下载已有交付文件，不会自动把学生标记为已交付；多人批次下载的是整个原交付包。"/></span>
      <span v-if="b.status==='prepared'&&b.items.length===1&&!stage.lockReason" class="action-pair"><el-button :loading="busy==='confirm'" :disabled="disabled" @click="confirm(b)">确认已交付</el-button><ActionHelp label="确认已交付" text="确认照片已实际交给学生，保存交付事实。尚未发送时请不要确认。"/></span></div>
      <p v-if="b.status==='prepared'" class="muted">{{b.items.length>1?'多人交付包请在照片交付页面统一确认。':'下载后请在实际交付时确认。'}}取消待交付包请前往“照片交付”。</p>
@@ -201,6 +207,7 @@ onMounted(()=>{timer=setInterval(()=>{if(props.id&&!busy.value)load().catch(()=>
    <nav class="toolbar review-navigation" aria-label="学生导航"><el-button @click="move(-1)" :disabled="!!busy||position<=0||cohort!==state.cohort">上一张</el-button><el-button @click="move(1)" :disabled="!!busy||position<0||position>=navigation.length-1||cohort!==state.cohort">下一张</el-button><ActionHelp label="学生导航" text="按打开时的筛选顺序切换学生，不会保存或跳过审核；已有审核决定即时保存。"/><span class="muted">仅切换学生，不写入跳过状态。{{busy?'正在提交操作，请稍候。':''}}</span></nav>
   </template>
  </el-dialog>
+ <DeliveryPreview ref="deliveryPreview" @busy="deliveryBusy=$event" @generated="deliveryCreated"/>
 </template>
 <style scoped>
 .review-section{border-top:1px solid #e9e9e7;margin-top:16px;padding-top:14px}.action-pair{display:inline-flex;align-items:center;gap:6px}.config-fieldset{border:0;margin:0;padding:0;min-width:0}.config-fieldset:disabled{pointer-events:none;opacity:.65}.review-navigation{border-top:1px solid #e9e9e7;padding-top:12px}.task-summary{border-bottom:1px solid #e9e9e7;padding:6px 0}.comparison{margin:14px 0}

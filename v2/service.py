@@ -532,7 +532,9 @@ class Service:
             entries = []
             reserved = {x['student_id'] for batch in d['deliveries'].values() if batch['status'] == 'prepared' for x in batch['items']}
             for sid in dict.fromkeys(ids):
-                s = d['students'][sid]
+                s = d['students'].get(sid)
+                if not s or s.get('cohort',d.get('active_cohort')) != d.get('active_cohort'):
+                    raise ValueError(sid+' 不属于当前届次')
                 if Store.processing(d,sid):
                     raise ValueError(sid+' 在未完成处理任务中')
                 if Store.status(s) != 'approved' or sid in reserved:

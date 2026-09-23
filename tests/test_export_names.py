@@ -298,6 +298,39 @@ class NameContractTests(unittest.TestCase):
         self.assertEqual((folder/'manifest.json').read_bytes(),raw)
         self.assertEqual(Store(self.root).snapshot()['deliveries'][batch['id']],batch)
 
+    def test_delivery_checks_current_cohort_before_writing(self):
+        self.approve(('00123','张三'))
+        pid=self.profile()
+        self.store.change('模拟不属于当前届次',lambda d:d['students']['00123'].update(cohort='2027级'))
+        before=self.store.snapshot()
+        self.assertEqual(self.client.post('/api/v1/deliveries/preview',json={'student_ids':['00123'],'profile_id':pid}).status_code,409)
+        response=self.deliver(['00123'],pid)
+        self.assertEqual(response.status_code,409,response.text)
+        self.assertEqual(self.store.snapshot(),before)
+
+    def test_selected_profile_protections_and_delivery_lifecycle(self):
+        self.approve(('00123','张三'))
+        pid=self.profile()
+        for chosen in ['other-cohort-profile','unknown']:
+            self.assertEqual(self.deliver(['00123'],chosen).status_code,409)
+        self.accepted(self.client.post('/api/v1/export-profiles/'+pid+'/status',json={'status':'inactive'}))
+        self.assertEqual(self.deliver(['00123'],pid).status_code,409)
+        self.accepted(self.client.post('/api/v1/export-profiles/'+pid+'/status',json={'status':'active'}))
+        before=self.store.snapshot()
+        preview=self.preview(['00123'],pid)
+        self.assertEqual(self.store.snapshot(),before)  # cancelling a preview writes nothing
+        batch=self.accepted(self.deliver(['00123'],pid))
+        self.zip_check(batch,[preview['items'][0]['file_name']])
+        self.assertEqual(batch['format_snapshot']['profile_id'],pid)
+        self.assertEqual(self.deliver(['00123'],'default-student-id').status_code,409)
+        self.assertEqual(len(self.store.snapshot()['deliveries']),1)
+        self.accepted(self.client.post('/api/v1/deliveries/'+batch['id']+'/cancel'))
+        next_batch=self.accepted(self.deliver(['00123'],'default-student-id'))
+        self.zip_check(next_batch,['00123.jpg'])
+        self.accepted(self.client.post('/api/v1/deliveries/'+next_batch['id']+'/confirm'))
+        self.assertEqual(self.store.snapshot()['deliveries'][next_batch['id']]['status'],'delivered')
+        self.assertEqual(self.store.snapshot()['deliveries'][batch['id']]['status'],'cancelled')
+
     def test_json_roundtrip_and_unimplemented_fields_rejected(self):
         pid=self.profile()
         doc=self.accepted(self.client.get('/api/v1/export-profiles/'+pid+'/json'))

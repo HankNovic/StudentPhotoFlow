@@ -6,13 +6,15 @@ import { api,labels,download } from '../api';
 import Photo from '../components/Photo.vue';
 import RecycleDialog from '../components/RecycleDialog.vue';
 import StudentDetail from '../components/StudentDetail.vue';
+import DeliveryPreview from '../components/DeliveryPreview.vue';
+import PagedTable from '../components/PagedTable.vue';
 const emit=defineEmits(['navigate']);
 const recycle=ref();
 async function single(){if(!state.cohort)throw Error('请先选择届次');const cid=state.cohort;const {value}=await ElMessageBox.prompt('在 '+state.cohortName+' 中精确查找已有学号，不会新建学生','单人补录',{inputPlaceholder:'完整学号'});const sid=value.trim();await api('students/'+encodeURIComponent(sid),undefined,undefined,cid);if(cid!==state.cohort)throw Error('届次已切换，请重新确认学生');detailId.value=sid;}
 const q=ref(''),status=ref(''),selected=ref([]),detailId=ref(''),batchDecision=ref(''),reason=ref('');
-const planOpen=ref(false),planData=ref(null),planIds=ref([]),busy=ref(false),deliveryOpen=ref(false),deliveryPlan=ref(null),profileId=ref('');
+const planOpen=ref(false),planData=ref(null),planIds=ref([]),busy=ref(false),deliveryPreview=ref();
 const filtered=computed(()=>state.students.filter(s=>(!status.value||s.status===status.value)&&s.id.includes(q.value.trim())));
-const visibleIds=computed(()=>filtered.value.map(s=>s.id));const planPage=ref(1),planSize=ref(20);const shownPlan=computed(()=>planData.value?.items.slice((planPage.value-1)*planSize.value,planPage.value*planSize.value)||[]);
+const visibleIds=computed(()=>filtered.value.map(s=>s.id));
 const all=computed(()=>filtered.value.length>0&&filtered.value.every(s=>selected.value.includes(s.id)));
 watch([q,status,()=>state.cohort],()=>{selected.value=[];planOpen.value=false;});
 watch(()=>state.students,()=>{selected.value=selected.value.filter(id=>visibleIds.value.includes(id));});
@@ -31,10 +33,12 @@ async function start(){
 }
 async function deliver(){
  if(!selected.value.length)throw Error('请选择审核通过的学生');
- profileId.value=state.exportProfiles.find(p=>p.is_default&&p.status==='active')?.id||state.exportProfiles.find(p=>p.status==='active')?.id||'';
- deliveryPlan.value=await api('deliveries/preview',{student_ids:selected.value,profile_id:profileId.value});deliveryOpen.value=true;
+ await deliveryPreview.value.show(state.cohort,selected.value);
 }
-async function createDelivery(){busy.value=true;try{await api('deliveries',{student_ids:selected.value,profile_id:profileId.value});deliveryOpen.value=false;await refresh();emit('navigate','deliveries');ElMessage.success('交付包已生成，实际发送后再确认交付');}finally{busy.value=false;}}
+async function deliveryCreated(batch){
+ selected.value=[];emit('navigate','deliveries');ElMessage.success('交付包已生成 · '+batch.format_snapshot.name+' v'+batch.format_snapshot.revision+'，实际发送后再确认交付');
+ try{await refresh();}catch(e){ElMessage.warning('交付包已生成，但页面刷新失败：'+e.message+'。请刷新确认，不要重复提交。');}
+}
 </script>
 <template>
  <div class="toolbar"><el-button type="primary" @click="single" :disabled="!state.cohort||state.archived">单人补录</el-button><el-button type="danger" :disabled="!selected.length||state.archived" @click="recycle.show(state.cohort,selected)">选中学生移入回收站</el-button></div>
@@ -65,18 +69,13 @@ async function createDelivery(){busy.value=true;try{await api('deliveries',{stud
   <p>仅处理当前选中的待人工审核学生。</p><el-input v-model="reason" type="textarea" placeholder="备注（可留空）"/>
   <template #footer><el-button @click="batchDecision=''">取消</el-button><el-button type="primary" @click="applyBatch" :loading="busy">确认批量审核</el-button></template>
  </el-dialog>
- <el-dialog v-model="deliveryOpen" title="预览交付文件名" width="min(900px,94vw)">
-  <el-select v-model="profileId" aria-label="导出格式" @change="async()=>{deliveryPlan=await api('deliveries/preview',{student_ids:selected,profile_id:profileId})}"><el-option v-for="p in state.exportProfiles.filter(x=>x.status==='active')" :key="p.id" :label="p.name+' · '+p.template" :value="p.id"/></el-select>
-  <el-alert v-if="deliveryPlan&&!deliveryPlan.ok" type="error" :closable="false" title="文件名检查未通过，请切换格式或修改名单字段"/>
-  <el-table v-if="deliveryPlan" :data="deliveryPlan.items"><el-table-column prop="student_id" label="学号"/><el-table-column prop="file_name" label="实际文件名"/><el-table-column prop="reason" label="状态"/></el-table>
-  <template #footer><el-button @click="deliveryOpen=false">取消</el-button><el-button type="primary" :disabled="!deliveryPlan?.ok" :loading="busy" @click="createDelivery">确认生成交付包</el-button></template>
- </el-dialog>
+ <DeliveryPreview ref="deliveryPreview" @generated="deliveryCreated"/>
  <el-dialog v-model="planOpen" title="本次执行计划" width="min(850px,94vw)">
   
   <el-button @click="replan">重新计算计划</el-button>
-  <p v-if="planData">执行 {{planData.items.filter(x=>x.execute).length}} 人，跳过 {{planData.items.filter(x=>!x.execute).length}} 人，共 {{planData.items.length}} 条</p><el-pagination v-if="planData" v-model:current-page="planPage" v-model:page-size="planSize" :page-sizes="[20,50,100]" layout="total,sizes,prev,pager,next" :total="planData.items.length" />
+  <p v-if="planData">执行 {{planData.items.filter(x=>x.execute).length}} 人，跳过 {{planData.items.filter(x=>!x.execute).length}} 人，共 {{planData.items.length}} 条</p>
   <el-alert v-else title="参数或范围已变化，请重新计算计划" type="warning" :closable="false"/>
-  <el-table :data="shownPlan"><el-table-column prop="student_id" label="学号"/><el-table-column label="执行情况"><template #default="{row}">{{row.execute?'将处理':row.reason}}</template></el-table-column></el-table>
+  <PagedTable :items="planData?.items||[]"><el-table-column prop="student_id" label="学号"/><el-table-column label="执行情况"><template #default="{row}">{{row.execute?'将处理':row.reason}}</template></el-table-column></PagedTable>
   <template #footer><el-button @click="planOpen=false">取消</el-button><el-button type="primary" :disabled="!planData" :loading="busy" @click="start">按此计划开始处理</el-button></template>
  </el-dialog>
 </template>
