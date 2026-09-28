@@ -3,6 +3,7 @@ import io
 import tempfile
 import time
 import unittest
+import zipfile
 from datetime import datetime,timedelta,timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -129,6 +130,21 @@ class SystemTest(unittest.TestCase):
         self.assertEqual(self.store.data['students']['00001']['results'][0]['config']['crop_width'],99)
         self.assertTrue(any(e.get('actor','').startswith('session-') for e in self.store.data['events']))
         self.assertNotEqual(self.client.post('/api/v1/shutdown').status_code,200)
+
+    def test_global_manifest_option_controls_cohort_delivery_zip(self):
+        self.process(['00001'])
+        self.store.review('00001', self.store.snapshot()['students']['00001']['results'][-1]['id'], 'approved', len(self.store.snapshot()['students']['00001']['history']))
+        first=self.service.delivery(['00001'])
+        with zipfile.ZipFile(self.store.root/'deliveries'/first['id']/'photos.zip') as archive:
+            self.assertNotIn('manifest.json', archive.namelist())
+        settings=self.client.get('/api/v1/config').json()
+        self.client.put('/api/v1/config',json={**settings['defaults'],**settings['saved'],'include_manifest':True})
+        self.client.post(self.base+'deliveries/'+first['id']+'/cancel')
+        second=self.service.delivery(['00001'])
+        with zipfile.ZipFile(self.store.root/'deliveries'/second['id']/'photos.zip') as archive:
+            self.assertIn('manifest.json', archive.namelist())
+        self.assertIn(first['id'], self.store.snapshot()['deliveries'])
+        self.assertIn(second['id'], self.store.snapshot()['deliveries'])
 
     def test_trash_blocks_cohort_delete_and_retention_changes(self):
         p=recycle.impact(self.service,[],True);tid=recycle.move(self.service,[],30,p['revision'],True)['id']

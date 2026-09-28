@@ -59,6 +59,7 @@ class System:
             if store.data['active_cohort']!=cid:
                 store.change('绑定届次 ID',lambda d:d.update(active_cohort=cid))
             app.state.docker_mode=True
+            app.state.service.config_provider=lambda: self.control.state.store.snapshot().get('config', {})
             self.apps[cid]=app
         return self.apps[cid]
 

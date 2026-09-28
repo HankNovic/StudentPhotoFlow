@@ -23,6 +23,7 @@ class Service:
     def __init__(self, store, requests=None):
         self.store = store
         self.requests = requests or HivisionRequests(store.snapshot()["config"].get("hivision_concurrency",1))
+        self.config_provider = None
         self._ticks = {}
         self.thread = None
         self.gate = threading.Lock()
@@ -158,7 +159,9 @@ class Service:
     def plan(self, ids, config, new_version=False):
         options = self.options(config)
         d = self.store.snapshot()
-        image_config=asdict(options);image_config.pop('hivision_concurrency',None)
+        image_config=asdict(options)
+        image_config.pop('hivision_concurrency',None)
+        image_config.pop('include_manifest',None)
         fingerprint = hashlib.sha256(json.dumps(image_config, sort_keys=True).encode()).hexdigest()
         rows = []
         for sid in list(dict.fromkeys(ids)):
@@ -561,6 +564,8 @@ class Service:
         with self.store.lock:
             d = self.store.snapshot()
             profile=self.export_profile(profile_id,d)
+            config = self.config_provider() if self.config_provider else d.get('config', {})
+            include_manifest = config.get('include_manifest', False)
             if profile.get('status')!='active': raise ValueError('该导出格式已停用，请先恢复使用')
             entries = []
             reserved = {x['student_id'] for batch in d['deliveries'].values() if batch['status'] == 'prepared' for x in batch['items']}
@@ -592,7 +597,8 @@ class Service:
                 with zipfile.ZipFile(folder / 'photos.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
                     for path in sorted((folder / 'photos').iterdir()):
                         archive.write(path, path.name)
-                    archive.write(folder / 'manifest.json', 'manifest.json')
+                    if include_manifest:
+                        archive.write(folder / 'manifest.json', 'manifest.json')
                 self.store.change('生成交付包', lambda d: d['deliveries'].update({batch_id:batch}))
                 self.store.change('交付打包检查点',lambda d:d['jobs'][jid].update(completed=[e['student_id'] for e in entries]))
                 return batch

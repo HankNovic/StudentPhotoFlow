@@ -14,7 +14,7 @@ async function test(){if(testing.value)return;testing.value=true;testResult.valu
 </script>
 <template>
  <el-form label-position="top">
-  <el-card v-for="[title,help,keys] in groups" :key="title" shadow="never" class="config-group">
+  <el-card v-for="[title,help,keys] in groups" v-show="globalSettings || title !== '交付导出'" :key="title" shadow="never" class="config-group">
    <template #header><h3>{{title}}</h3><p class="muted">{{help}}</p></template>
    <div class="config-grid">
     <el-form-item v-for="key in keys" :key="key" :label="names[key]" :data-config="key">

@@ -312,7 +312,7 @@ def create_app(root, token=None, requests=None):
         if service.thread and service.thread.is_alive(): raise ValueError('有活动接收或处理任务，请等待完成或安全中断后上传')
         return store.upload(sid,photo.file.read(30*1024*1024+1))
 
-    @app.get('/api/v1/config', tags=['处理配置'], summary='读取默认和已保存配置', description='返回 defaults 和 saved 两个对象。配置项中文含义见下方参数对照。')
+    @app.get('/api/v1/config', tags=['处理配置'], summary='读取默认和已保存配置', description='返回 defaults 和 saved 两个对象。include_manifest 默认 false，旧配置缺少该字段时按 false 处理。配置项中文含义见下方参数对照。')
     def config():
         return dict(defaults=asdict(PipelineOptions()),saved=store.snapshot()['config'])
 
@@ -415,7 +415,7 @@ def create_app(root, token=None, requests=None):
     def deliveries():
         return list(store.snapshot()['deliveries'].values())[::-1]
 
-    @app.post('/api/v1/deliveries', tags=['审核与交付'], summary='生成照片交付包', description='提交 student_ids。仅接收审核通过且不在其他待交付包中的学生。返回 prepared 批次及 id；此操作尚未标记实际交付。ZIP 内含学号命名照片与 manifest.json。')
+    @app.post('/api/v1/deliveries', tags=['审核与交付'], summary='生成照片交付包', description='提交 student_ids。仅接收审核通过且不在其他待交付包中的学生。返回 prepared 批次及 id；此操作尚未标记实际交付。ZIP 是否包含 manifest.json 由系统配置“导出包包含 manifest.json”决定。')
     def deliver(body: Delivery):
         return service.delivery(body.student_ids,body.profile_id)
 

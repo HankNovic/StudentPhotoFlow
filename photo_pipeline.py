@@ -40,6 +40,7 @@ class PipelineError(RuntimeError):
 
 @dataclass
 class PipelineOptions:
+    include_manifest: bool = False
     quality_enabled: bool = False
     auto_orient: bool = True
     check_grayscale: bool = True

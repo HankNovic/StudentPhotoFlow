@@ -110,6 +110,7 @@ class ExportNameTests(unittest.TestCase):
         profile.update(id='name-profile', revision=1, status='active', is_default=False, created_at='', updated_at='', history=[])
         store.change('测试格式', lambda d: d['export_profiles'].append(profile))
         service = Service(store)
+        store.change('启用 manifest 测试选项', lambda d: d['config'].update(include_manifest=True))
         single = service.delivery(['00123'], 'name-profile')
         batch = service.delivery(['00456', '00789'], 'name-profile')
         for expected, batch_data in [('00123-张三.jpg', single), ('00456-李四.jpg', batch)]:
@@ -139,6 +140,8 @@ class NameContractTests(unittest.TestCase):
         self.service = self.app.state.service
         self.photo = image_bytes()
         self.uri = 'data:image/jpeg;base64,' + base64.b64encode(self.photo).decode()
+        # Existing manifest assertions exercise the opt-in path explicitly.
+        self.store.change('启用 manifest 测试选项', lambda d: d['config'].update(include_manifest=True))
 
     def accepted(self, r):
         self.assertEqual(r.status_code, 200, r.text)
@@ -204,6 +207,26 @@ class NameContractTests(unittest.TestCase):
         self.assertEqual(self.accepted(self.client.get('/api/v1/students/00123'))['name'],'李四')
         self.assertEqual(self.accepted(self.client.get('/api/v1/students'))[0]['name'],'李四')
         self.assertEqual(len(self.store.snapshot()['students']['00123']['sources']),1)
+
+    def test_manifest_option_defaults_off_and_can_be_enabled(self):
+        self.assertFalse(self.accepted(self.client.get('/api/v1/config'))['defaults']['include_manifest'])
+        self.store.change('关闭 manifest 测试选项', lambda d: d['config'].pop('include_manifest', None))
+        self.approve(('00008', '无清单'))
+        off = self.accepted(self.deliver(['00008']))
+        off_bytes = self.client.get('/api/v1/deliveries/'+off['id']+'/download').content
+        with zipfile.ZipFile(io.BytesIO(off_bytes)) as z:
+            self.assertEqual(z.namelist(), ['00008.jpg'])
+        self.assertTrue((self.root / 'deliveries' / off['id'] / 'manifest.json').exists())
+        self.assertIn(off['id'], self.store.snapshot()['deliveries'])
+
+        saved = self.accepted(self.client.put('/api/v1/config', json={'include_manifest': True}))
+        self.assertTrue(saved['include_manifest'])
+        self.approve(('00009', '有清单'))
+        on = self.accepted(self.deliver(['00009']))
+        with zipfile.ZipFile(io.BytesIO(self.client.get('/api/v1/deliveries/'+on['id']+'/download').content)) as z:
+            self.assertEqual(set(z.namelist()), {'00009.jpg', 'manifest.json'})
+        self.assertIn(on['id'], self.store.snapshot()['deliveries'])
+        self.assertEqual(self.client.get('/api/v1/deliveries/'+off['id']+'/download').content, off_bytes)
 
     def test_selected_mapping_checked_and_imported(self):
         fields=dict(id_column='B',image_column='C',name_column='A')
