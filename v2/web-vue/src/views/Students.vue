@@ -22,6 +22,23 @@ watch(()=>JSON.stringify(state.config),()=>{planData.value=null;});
 function toggle(id,value){selected.value=value?[...new Set([...selected.value,id])]:selected.value.filter(x=>x!==id);}
 function toggleAll(value){selected.value=value?[...visibleIds.value]:[];}
 function batch(decision){if(!state.students.some(s=>selected.value.includes(s.id)&&s.status==='review'))throw Error('请先选中待人工审核学生');batchDecision.value=decision;reason.value='';}
+const deliveryReasons={
+ missing:'未采集照片',pending:'照片待处理，尚未审核通过',review:'照片待人工审核',
+ review_rejected:'照片已退回，请重新处理并审核',machine_rejected:'照片处理未通过，请重新处理',
+ failed:'照片处理失败，请重新处理',processing:'在未完成处理任务中'
+};
+function deliveryIssues(ids){
+ const prepared=new Set(state.deliveries.filter(b=>b.status==='prepared').flatMap(b=>b.items.map(i=>i.student_id)));
+ return ids.flatMap(id=>{
+  const student=state.students.find(s=>s.id===id);
+  if(!student)return [{student_id:id,reason:'学生不属于当前届次'}];
+  if(student.status==='processing')return [{student_id:id,reason:deliveryReasons.processing}];
+  if(prepared.has(id))return [{student_id:id,reason:'已在待实际交付包中'}];
+  if(student.status==='delivered_updated')return [{student_id:id,reason:'照片已变更，请先启动替换流程重新处理并审核'}];
+  if(student.status==='approved'||student.status==='delivered')return [];
+  return [{student_id:id,reason:deliveryReasons[student.status]||('当前状态为'+student.status+'，无法交付')}];
+ });
+}
 async function applyBatch(){
  const student_ids=state.students.filter(s=>selected.value.includes(s.id)&&s.status==='review').map(s=>s.id);
  busy.value=true;try{const d=await api('reviews/batch',{student_ids,decision:batchDecision.value,reason:reason.value});batchDecision.value='';selected.value=[];await refresh();ElMessage.success('已批量审核 '+d.count+' 人');}finally{busy.value=false;}
@@ -33,7 +50,7 @@ async function start(){
 }
 async function deliver(){
  if(!selected.value.length)throw Error('请选择审核通过的学生');
- await deliveryPreview.value.show(state.cohort,selected.value);
+ await deliveryPreview.value.show(state.cohort,selected.value,deliveryIssues(selected.value));
 }
 async function deliveryCreated(batch){
  selected.value=[];emit('navigate','deliveries');ElMessage.success('交付包已生成 · '+batch.format_snapshot.name+' v'+batch.format_snapshot.revision+'，实际发送后再确认交付');

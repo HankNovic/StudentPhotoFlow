@@ -1,6 +1,6 @@
-# StudentPhotoFlow 2.4.1-rc.5 · Linux Docker 候选部署
+# StudentPhotoFlow 2.4.1-rc.6 · Linux Docker 候选部署
 
-候选版以正式 v2.4.0 为业务基线，使用 Vue 3 + Element Plus、Notion 主题和单进程 Python。部署端无需编译，不需要 Windows EXE。默认固定镜像 ghcr.io/hanknovic/studentphotoflow:2.4.1-rc.5；本次不更新 stable/latest。固定版本不覆盖，实际 digest 见 Release。
+候选版以正式 v2.4.0 为业务基线，使用 Vue 3 + Element Plus、Notion 主题和单进程 Python。部署端无需编译，不需要 Windows EXE。默认固定镜像 ghcr.io/hanknovic/studentphotoflow:2.4.1-rc.6；本次不更新 stable/latest。固定版本不覆盖，实际 digest 见 Release。
 
 ## v2.4.1-rc.3 保留数据升级
 
@@ -10,7 +10,7 @@
 
 1. 页面暂停任务，等待所有正在处理的项目完成并显示已暂停；或等待任务自然完成。安全结束属于不可继续的终态，仅在确实不再继续时使用。
 2. 停止服务、备份整个实际挂载目录和 .env，记录旧镜像digest。
-3. .env 中仅将 SPF_IMAGE 改为 ghcr.io/hanknovic/studentphotoflow:2.4.1-rc.5；SPF_UPDATE_CHANNEL 可改 rc（现有检查更新入口仍只查询正式 Release）。路径、口令不变。
+3. .env 中仅将 SPF_IMAGE 改为 ghcr.io/hanknovic/studentphotoflow:2.4.1-rc.6；SPF_UPDATE_CHANNEL 可改 rc（现有检查更新入口仍只查询正式 Release）。路径、口令不变。
 4. 使用原项目名 pull/up，检查健康、版本、届次、学生、任务、照片和交付记录。
 
 ```sh
@@ -23,11 +23,11 @@ docker compose --env-file .env -p "$SPF_PROJECT" images
 docker image inspect ghcr.io/hanknovic/studentphotoflow:2.4.1-rc.3 --format '{{json .RepoDigests}}'
 docker compose --env-file .env -p "$SPF_PROJECT" stop
 umask 077
-SPF_BACKUP_DIR="backup-before-2.4.1-rc.5-$(date +%Y%m%d-%H%M%S)"
+SPF_BACKUP_DIR="backup-before-2.4.1-rc.6-$(date +%Y%m%d-%H%M%S)"
 mkdir "$SPF_BACKUP_DIR"
 cp .env "$SPF_BACKUP_DIR/environment.env"
 tar -czf "$SPF_BACKUP_DIR/data.tar.gz" -C "$SPF_BACKUP_SOURCE" .
-# 编辑原 .env，保留路径和口令，只改镜像为2.4.1-rc.5
+# 编辑原 .env，保留路径和口令，只改镜像为2.4.1-rc.6
 nano .env
 docker compose --env-file .env -p "$SPF_PROJECT" pull
 docker compose --env-file .env -p "$SPF_PROJECT" up -d
@@ -37,7 +37,7 @@ docker compose --env-file .env -p "$SPF_PROJECT" logs --tail 100
 curl --fail http://127.0.0.1:8769/healthz
 ```
 
-2.4.0→2.4.1-rc.5 为兼容的增量字段升级，不重置数据；每个届次首次打开前保存 backups/before-task-timing-1.json 索引备份，完整照片仍需按上述命令备份整个目录。原子写入失败会报错，不清空或跳过原工作区。重建后需重新登录；已保存结果、配置、回收站保留期与任务进度保留。中断在途项目需人工核对后明确重试或跳过，不自动重复调用外部服务。前端提示服务已更新时先保存输入，再刷新。2.4.0-rc.3及更早仍不支持直接挂载，必须保留原目录另行处理；此限制不适用于2.4.0。
+2.4.0→2.4.1-rc.6 为兼容的增量字段升级，不重置数据；每个届次首次打开前保存 backups/before-task-timing-1.json 索引备份，完整照片仍需按上述命令备份整个目录。原子写入失败会报错，不清空或跳过原工作区。重建后需重新登录；已保存结果、配置、回收站保留期与任务进度保留。中断在途项目需人工核对后明确重试或跳过，不自动重复调用外部服务。前端提示服务已更新时先保存输入，再刷新。2.4.0-rc.3及更早仍不支持直接挂载，必须保留原目录另行处理；此限制不适用于2.4.0。
 
 ## 全新部署
 
@@ -84,7 +84,7 @@ docker compose --env-file .env -p "$SPF_PROJECT" up -d
 
 通过处理配置填写外部Hivision地址；同网络容器用服务名，其他服务器用可达DNS/IP，宿主机用host.docker.internal（Linux需host-gateway映射）。容器localhost只指自身。本镜像复用现有本地快速处理和外部Hivision；可选本地AI以依赖检测为准。模拟测试不代表真实人像效果。
 
-网页只查询GitHub正式Release并展示发布页，不拉镜像、不挂Docker socket、不停止服务。日常更新由运维主动执行pull/up；固定2.4.1-rc.5标签以后升级需改目标版本。镜像公开可匿名pull；私有包使用read:packages凭据docker login，不将凭据放源码或Compose。包管理：https://github.com/users/HankNovic/packages/container/package/studentphotoflow 。日志滚动3×10MB，健康检查/重启策略见compose.yaml。
+网页只查询GitHub正式Release并展示发布页，不拉镜像、不挂Docker socket、不停止服务。日常更新由运维主动执行pull/up；固定2.4.1-rc.6标签以后升级需改目标版本。镜像公开可匿名pull；私有包使用read:packages凭据docker login，不将凭据放源码或Compose。包管理：https://github.com/users/HankNovic/packages/container/package/studentphotoflow 。日志滚动3×10MB，健康检查/重启策略见compose.yaml。
 
 ## 任务计时与 Hivision 并发
 

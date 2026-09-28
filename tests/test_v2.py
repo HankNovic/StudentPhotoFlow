@@ -9,6 +9,7 @@ from unittest.mock import patch
 from PIL import Image
 from fastapi.testclient import TestClient
 from v2.api import create_app
+from v2.export_profiles import validate_profile
 from v2.store import Store, atomic
 
 
@@ -56,6 +57,84 @@ class V2Test(unittest.TestCase):
         self.store.upload('001',photo('red'))
         self.assertIsNotNone(self.store.snapshot()['students']['001']['delivered'])
         self.assertTrue(self.service.plan(['001'],{})['items'][0]['execute'])
+
+    def test_delivered_current_source_can_be_reissued(self):
+        s=self.process()
+        self.store.review('001',s['results'][-1]['id'],'approved',len(s['history']))
+        first=self.service.delivery(['001'])
+        self.service.confirm_delivery(first['id'])
+
+        preview=self.service.export_preview(['001'])
+        self.assertTrue(preview['ok'])
+        second=self.service.delivery(['001'])
+        self.assertEqual(second['status'],'prepared')
+        self.assertNotEqual(first['id'],second['id'])
+        self.assertEqual(len(self.store.snapshot()['deliveries']),2)
+
+    def test_delivered_updated_reports_replacement_required(self):
+        s=self.process()
+        self.store.review('001',s['results'][-1]['id'],'approved',len(s['history']))
+        first=self.service.delivery(['001'])
+        self.service.confirm_delivery(first['id'])
+        artifact=self.store.artifact(photo('red'))
+        self.store.change('模拟已交付后新原图',lambda d:d['students']['001']['sources'].append(dict(artifact,at='now')))
+
+        with self.assertRaisesRegex(ValueError,'照片已变更，请先启动替换流程'):
+            self.service.export_preview(['001'])
+
+    def test_delivered_reissue_uses_new_profile_and_keeps_old_zip(self):
+        s=self.process()
+        self.store.change('设置姓名',lambda d:d['students']['001'].update(name='张三'))
+        self.store.review('001',s['results'][-1]['id'],'approved',len(self.store.snapshot()['students']['001']['history']))
+        first=self.service.delivery(['001'])
+        self.service.confirm_delivery(first['id'])
+        old_zip=(self.store.root/'deliveries'/first['id']/'photos.zip').read_bytes()
+        profile=validate_profile('姓名格式','{student_id}-{name}{ext}')
+        profile.update(id='name-profile',revision=1,status='active',is_default=False,created_at='',updated_at='',history=[])
+        self.store.change('新增姓名格式',lambda d:d['export_profiles'].append(profile))
+
+        second=self.service.delivery(['001'],'name-profile')
+        import zipfile
+        with zipfile.ZipFile(self.store.root/'deliveries'/second['id']/'photos.zip') as archive:
+            self.assertIn('001-张三.jpg',archive.namelist())
+        self.assertEqual(old_zip,(self.store.root/'deliveries'/first['id']/'photos.zip').read_bytes())
+
+    def test_delivery_blocks_processing_student(self):
+        s=self.process()
+        self.store.review('001',s['results'][-1]['id'],'approved',len(s['history']))
+        self.store.change('模拟活动任务',lambda d:d['jobs'].update({'active':{'id':'active','kind':'processing','status':'running','completed':[],'errors':{},'plan':{'items':[{'student_id':'001','execute':True}]}}}))
+        with self.assertRaisesRegex(ValueError,'在未完成处理任务中'):
+            self.service.export_preview(['001'])
+
+    def test_delivery_missing_result_reports_clear_error(self):
+        s=self.process()
+        self.store.review('001',s['results'][-1]['id'],'approved',len(s['history']))
+        self.store.change('移除成片引用',lambda d:d['students']['001'].update(approved='missing-result'))
+        with self.assertRaisesRegex(ValueError,'没有可交付成片'):
+            self.service.delivery(['001'])
+
+    def test_delivery_status_reasons_and_integrity_error(self):
+        with self.assertRaisesRegex(ValueError,'002 未采集照片'):
+            self.service.export_preview(['002'])
+        self.store.upload('002',photo())
+        with self.assertRaisesRegex(ValueError,'002 照片待处理，尚未审核通过'):
+            self.service.export_preview(['002'])
+        s=self.process()
+        for review, status, message in [
+            ('pending','success','照片待人工审核'),
+            ('rejected','success','照片已退回'),
+            ('pending','rejected','照片处理未通过'),
+            ('pending','failed','照片处理失败'),
+        ]:
+            self.store.change('设置状态',lambda d,review=review,status=status:d['students']['001']['results'][-1].update(review=review,status=status))
+            with self.assertRaisesRegex(ValueError,'001 '+message):
+                self.service.export_preview(['001'])
+        self.store.change('恢复审核',lambda d:d['students']['001']['results'][-1].update(review='approved',status='success'))
+        s=self.store.snapshot()['students']['001']
+        self.store.review('001',s['results'][-1]['id'],'approved',len(s['history']))
+        self.store.change('篡改成片校验值',lambda d:d['students']['001']['results'][-1]['artifact'].update(id='bad-sha'))
+        with self.assertRaisesRegex(ValueError,'成片完整性校验失败：001'):
+            self.service.delivery(['001'])
 
     def test_duplicate_keeps_review_and_stale_review_rejected(self):
         s=self.process()

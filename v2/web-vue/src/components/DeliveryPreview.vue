@@ -5,13 +5,13 @@ import {api} from '../api';
 import {state} from '../workspace';
 import PagedTable from './PagedTable.vue';
 const emit=defineEmits(['generated','busy']);
-const open=ref(false),profiles=ref([]),profileId=ref(''),plan=ref(null),loading=ref(false),generating=ref(false),error=ref(''),cid=ref(''),ids=ref([]),cohortName=ref('');
+const open=ref(false),profiles=ref([]),profileId=ref(''),plan=ref(null),preflightIssues=ref([]),loading=ref(false),generating=ref(false),error=ref(''),cid=ref(''),ids=ref([]),cohortName=ref('');
 let sequence=0;
 const signature=p=>JSON.stringify({profile:p.profile_snapshot,items:p.items});
 const available=computed(()=>profiles.value.filter(p=>p.status==='active'));
-const allowed=computed(()=>!!plan.value?.ok&&plan.value.profile_id===profileId.value&&!loading.value&&!generating.value&&!error.value);
+const allowed=computed(()=>!preflightIssues.value.length&&!!plan.value?.ok&&plan.value.profile_id===profileId.value&&!loading.value&&!generating.value&&!error.value);
 watch(generating,v=>emit('busy',v),{flush:'sync'});
-function close(){if(generating.value)return;sequence++;loading.value=false;open.value=false;plan.value=null;}
+function close(){if(generating.value)return;sequence++;loading.value=false;open.value=false;plan.value=null;preflightIssues.value=[];}
 watch(()=>state.cohort,()=>{if(open.value&&!generating.value)close();});
 onBeforeUnmount(()=>sequence++);
 async function preview(){
@@ -23,17 +23,17 @@ async function preview(){
  }catch(e){if(seq===sequence&&open.value)error.value=e.message||String(e);}
  finally{if(seq===sequence)loading.value=false;}
 }
-async function show(cohort,students){
+async function show(cohort,students,issues=[]){
  if(open.value||generating.value)return;
  if(!cohort||!students.length)return;
- cid.value=cohort;ids.value=[...students];cohortName.value=state.allCohorts.find(c=>c.id===cohort)?.name||cohort;
+ cid.value=cohort;ids.value=[...students];preflightIssues.value=[...issues];cohortName.value=state.allCohorts.find(c=>c.id===cohort)?.name||cohort;
  profiles.value=[];profileId.value='';plan.value=null;error.value='';open.value=true;loading.value=true;
  const seq=++sequence;
  try{
   const data=await api('export-profiles',undefined,undefined,cohort);
   if(seq!==sequence||!open.value)return;
   profiles.value=data;profileId.value=available.value.find(p=>p.is_default)?.id||available.value[0]?.id||'';
-  await preview();
+  if(!preflightIssues.value.length)await preview();else loading.value=false;
  }catch(e){if(seq===sequence&&open.value){error.value=e.message||String(e);loading.value=false;}}
 }
 async function confirm(){
@@ -63,7 +63,10 @@ defineExpose({show,close});
   </el-select>
   <p v-if="loading" role="status" class="muted">正在检查文件名…</p>
   <el-alert v-if="error" :title="error" type="error" :closable="false"/>
-  <el-alert v-else-if="plan&&!plan.ok" title="文件名检查未通过，请切换格式或修改名单字段" type="error" :closable="false"/>
+  <el-alert v-if="preflightIssues.length" title="以下学生暂不能生成交付包" type="error" :closable="false">
+   <ul class="delivery-issues"><li v-for="issue in preflightIssues" :key="issue.student_id">{{issue.student_id}}：{{issue.reason}}</li></ul>
+  </el-alert>
+  <el-alert v-if="!error&&!preflightIssues.length&&plan&&!plan.ok" title="文件名检查未通过，请切换格式或修改名单字段" type="error" :closable="false"/>
   <PagedTable v-show="!!plan" :items="plan?.items||[]"><el-table-column prop="student_id" label="学号"/><el-table-column prop="file_name" label="实际文件名"/><el-table-column prop="reason" label="状态"/></PagedTable>
   <template #footer><el-button :disabled="generating" @click="close">取消</el-button><el-button v-if="error" :disabled="loading||generating" @click="showRetry">重新加载格式</el-button><el-button type="primary" :disabled="!allowed" :loading="generating" @click="confirm">确认生成交付包</el-button></template>
  </el-dialog>

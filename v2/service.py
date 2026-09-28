@@ -509,16 +509,49 @@ class Service:
         try: return next(p for p in profiles if p['id']==profile_id)
         except StopIteration: raise ValueError('导出格式不存在')
 
+    @staticmethod
+    def _delivery_status_reason(status):
+        return {
+            'missing': '未采集照片',
+            'pending': '照片待处理，尚未审核通过',
+            'review': '照片待人工审核',
+            'review_rejected': '照片已退回，请重新处理并审核',
+            'machine_rejected': '照片处理未通过，请重新处理',
+            'failed': '照片处理失败，请重新处理',
+        }.get(status, '当前状态为'+str(status)+'，无法交付')
+
+    def _delivery_result(self, data, sid, cohort, reserved):
+        student = data['students'].get(sid)
+        if not student or student.get('cohort', cohort) != cohort:
+            raise ValueError(sid+' 不属于当前届次')
+        if Store.processing(data, sid):
+            raise ValueError(sid+' 在未完成处理任务中')
+        if sid in reserved:
+            raise ValueError(sid+' 已在待实际交付包中')
+        status = Store.status(student)
+        if status == 'delivered_updated':
+            raise ValueError(sid+' 照片已变更，请先启动替换流程重新处理并审核')
+        approved_id = student.get('approved')
+        if approved_id and not any(item.get('id') == approved_id for item in student.get('results', [])):
+            raise ValueError(sid+' 没有可交付成片，审核成片引用不存在')
+        if status not in {'approved', 'delivered'}:
+            raise ValueError(sid+' '+self._delivery_status_reason(status))
+        result = next((item for item in student.get('results', []) if item.get('id') == student.get('approved')), None)
+        if not result or not result.get('artifact') or not result['artifact'].get('file'):
+            raise ValueError(sid+' 没有可交付成片')
+        try:
+            self.store.file(result['artifact']['file'])
+        except ValueError:
+            raise ValueError(sid+' 没有可交付成片，成片文件不存在')
+        return student, result
+
     def export_preview(self, ids, profile_id=None, cohort=None):
         d=self.store.snapshot(); profile=self.export_profile(profile_id,d)
         if profile.get('status')!='active': raise ValueError('该导出格式已停用，请先恢复使用')
         active=cohort or d.get('active_cohort'); students=[]
+        reserved = {x['student_id'] for batch in d['deliveries'].values() if batch['status'] == 'prepared' for x in batch['items']}
         for sid in dict.fromkeys(ids):
-            s=d['students'].get(sid)
-            if not s or s.get('cohort',active)!=active: raise ValueError(sid+' 不属于当前届次')
-            if Store.status(s)!='approved': raise ValueError(sid+' 未审核通过')
-            r=next((x for x in s['results'] if x['id']==s['approved']),None)
-            if not r or not r.get('artifact'): raise ValueError(sid+' 没有可交付成片')
+            s,r=self._delivery_result(d,sid,active,reserved)
             students.append({'student_id':sid,'name':s.get('name'),'ext':Path(r['artifact']['file']).suffix})
         result=preview_names(profile,students)
         result.update(profile_id=profile['id'],profile_snapshot={'profile_id':profile['id'],'name':profile.get('name'),'template':profile.get('template'),'revision':profile.get('revision'),'rules':profile.get('rules')})
@@ -532,14 +565,7 @@ class Service:
             entries = []
             reserved = {x['student_id'] for batch in d['deliveries'].values() if batch['status'] == 'prepared' for x in batch['items']}
             for sid in dict.fromkeys(ids):
-                s = d['students'].get(sid)
-                if not s or s.get('cohort',d.get('active_cohort')) != d.get('active_cohort'):
-                    raise ValueError(sid+' 不属于当前届次')
-                if Store.processing(d,sid):
-                    raise ValueError(sid+' 在未完成处理任务中')
-                if Store.status(s) != 'approved' or sid in reserved:
-                    raise ValueError(sid+' 未审核通过或已在待交付包中')
-                r = next(r for r in s['results'] if r['id'] == s['approved'])
+                s, r = self._delivery_result(d,sid,d.get('active_cohort'),reserved)
                 artifact = r['artifact']
                 if hashlib.sha256(self.store.file(artifact['file']).read_bytes()).hexdigest() != artifact['id']:
                     raise ValueError('成片完整性校验失败：'+sid)
