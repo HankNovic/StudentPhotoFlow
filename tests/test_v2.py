@@ -284,7 +284,7 @@ class V2Test(unittest.TestCase):
             self.assertEqual(result.status_code,200,result.text)
             self.assertEqual((result.json()['id_column'],result.json()['image_column']),expected)
         with patch.object(self.service,'start_import',return_value={'ok':True}) as start:
-            result=self.client.post(route,data={'id_column':'A','image_column':'B','inspect_only':'false'},files={'file':('sample.xlsx',workbook(['姓名','学号','照片']))})
+            result=self.client.post(route,data={'id_column':'A','image_column':'B','name_column':'C','inspect_only':'false'},files={'file':('sample.xlsx',workbook(['姓名','学号','照片']))})
             self.assertEqual(result.status_code,200,result.text)
             self.assertEqual(start.call_args.args[3:5],(0,1))
 

@@ -29,7 +29,7 @@ async function test(){if(testing.value)return;testing.value=true;testResult.valu
     </el-form-item>
    </div>
    <template v-if="keys.includes('hivision_url')">
-    <div class="toolbar"><el-button v-if="!localSettings" @click="add">添加当前地址到历史</el-button><el-button @click="test" :loading="testing" :disabled="testing">测试当前 API（不上传照片）</el-button><ActionHelp v-if="localSettings" label="测试当前 API" text="仅检测当前地址的服务接口，不上传照片，不保存全局处理配置。"/></div>
+    <div class="toolbar"><el-button v-if="!localSettings" @click="add">添加当前地址到历史</el-button><span class="action-pair"><el-button @click="test" :loading="testing" :disabled="testing">测试当前 API（不上传照片）</el-button><ActionHelp v-if="localSettings" label="测试当前 API" text="仅检测当前地址的服务接口，不上传照片，不保存全局处理配置。"/></span></div>
     <p class="muted">{{localSettings?'输入新地址后按回车确认，仅用于本次；地址历史请在处理配置页管理。':'输入新地址后按回车确认。展开可选择历史，× 仅删除历史记录。'}}</p>
     <p class="muted">请求并发数：同一应用内，每个 Hivision 服务地址共享的同时请求数量，1 为串行，需根据 Hivision 服务性能调整。仅在处理配置保存后生效（含运行中任务的后续调度）；降低上限不取消已发出的请求。本次参数调整不能覆盖全局上限。</p>
     <pre v-if="testResult" data-testid="engine-test-result">{{testResult}}</pre>

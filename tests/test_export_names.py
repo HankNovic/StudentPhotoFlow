@@ -68,7 +68,7 @@ class ExportNameTests(unittest.TestCase):
         self.assertEqual(report.summary['name_empty_rows'], [2])
         self.assertEqual(inspect_selection(path, 'Sheet1', 1, 0, 1).rows[0].name, None)
 
-    def test_excel_api_reports_optional_name_column(self):
+    def test_excel_check_requires_detected_column_and_nonempty_names(self):
         root = Path(tempfile.mkdtemp())
         raw = workbook(['学号', '照片', '姓名'], ['00123', '', '张三'])
         client = TestClient(create_app(root, 'test-name-token'), headers={'Authorization': 'Bearer test-name-token'})
@@ -76,6 +76,14 @@ class ExportNameTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()['name_column'], 'C')
         self.assertEqual(response.json()['summary']['name_empty'], 0)
+        missing_column = client.post('/api/v1/imports/xlsx', files={'file': ('old.xlsx', workbook(['学号', '照片'], ['00123', '']))})
+        self.assertEqual(missing_column.status_code, 200, missing_column.text)
+        self.assertFalse(missing_column.json()['can_import'])
+        self.assertEqual(missing_column.json()['name_column'], '')
+        empty_name = client.post('/api/v1/imports/xlsx', files={'file': ('empty.xlsx', workbook(['学号', '照片', '姓名'], ['00123', '', '']))})
+        self.assertEqual(empty_name.status_code, 200, empty_name.text)
+        self.assertFalse(empty_name.json()['can_import'])
+        self.assertEqual(empty_name.json()['summary']['name_empty_rows'], [2])
 
     def test_excel_import_persists_name_and_empty_does_not_overwrite(self):
         root = Path(tempfile.mkdtemp())
@@ -194,12 +202,18 @@ class NameContractTests(unittest.TestCase):
                     self.assertEqual(image.format,'JPEG');image.verify()
         return r.content
 
-    def test_actual_excel_old_format_update_and_manual_roster_preserves(self):
+    def test_actual_excel_requires_name_and_manual_roster_preserves(self):
+        before=self.store.snapshot()
+        for headers,row,fields,message in [
+            (['学号','照片'],['00123',self.uri],{},'姓名列'),
+            (['学号','照片','姓名'],['00123',self.uri,''],{'name_column':'C'},'姓名不能为空')]:
+            response=self.excel(headers,[row],**fields)
+            self.assertEqual(response.status_code,409,response.text)
+            self.assertIn(message,response.json()['message'])
+            self.assertEqual(self.store.snapshot(),before)
         for headers,row,fields,expected in [
-            (['学号','照片'],['00123',self.uri],{},None),
             (['学号','照片','姓名'],['00123',self.uri,' 张三 '],{'name_column':'C'},'张三'),
-            (['学号','照片','姓名'],['00123',self.uri,'李四'],{'name_column':'C'},'李四'),
-            (['学号','照片','姓名'],['00123',self.uri,''],{'name_column':'C'},'李四')]:
+            (['学号','照片','姓名'],['00123',self.uri,'李四'],{'name_column':'C'},'李四')]:
             job=self.accepted(self.excel(headers,[row],**fields))
             self.assertFalse(self.store.snapshot()['jobs'][job['id']]['errors'])
             self.assertEqual(Store(self.root).snapshot()['students']['00123']['name'],expected)

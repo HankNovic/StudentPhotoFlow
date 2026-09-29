@@ -151,7 +151,7 @@ onMounted(()=>{timer=setInterval(()=>{if(props.id&&!busy.value)load().catch(()=>
 <template>
  <el-dialog :model-value="!!id" @update:model-value="close" :title="'学生 '+id+' · 流程与审核'" width="min(1120px,96vw)" destroy-on-close>
   <el-alert v-if="loadError" :title="loadError" type="error" :closable="false"/>
-  <div v-if="loadError" class="toolbar"><el-button :loading="busy==='reload'" :disabled="!!busy" @click="retryLoad">刷新详情</el-button><ActionHelp label="刷新详情" text="重新读取当前学生记录；不会重新提交处理或审核。"/></div>
+  <div v-if="loadError" class="toolbar"><span class="action-pair"><el-button :loading="busy==='reload'" :disabled="!!busy" @click="retryLoad">刷新详情</el-button><ActionHelp label="刷新详情" text="重新读取当前学生记录；不会重新提交处理或审核。"/></span></div>
   <el-skeleton v-if="!detail&&busy" :rows="4" animated/>
   <template v-if="detail">
    <p>固定届次：{{cohortName}} · 学号：{{id}} <span v-if="detail.name">· 姓名：{{detail.name}}</span></p>
@@ -169,7 +169,7 @@ onMounted(()=>{timer=setInterval(()=>{if(props.id&&!busy.value)load().catch(()=>
     </div>
     <template v-if="stage.process">
      <p class="muted">引擎 {{config.background_mode}} · 背景 {{config.background_color}} · 输出 {{config.background_mode==='hivision'?config.hivision_width:config.crop_enabled?config.crop_width:source?.width}} × {{config.background_mode==='hivision'?config.hivision_height:config.crop_enabled?config.crop_height:source?.height}}。参数修改后请重新检查计划。</p>
-     <el-collapse v-model="settings"><el-collapse-item name="settings"><template #title><span>仅本次调整处理参数</span><ActionHelp label="仅本次调整处理参数" text="只对当前学生本次处理生效，不修改全局配置；修改后需要重新检查计划，不会立即处理。"/></template><fieldset :disabled="disabled" class="config-fieldset"><ConfigFields v-model="config" local-settings/></fieldset></el-collapse-item></el-collapse>
+     <el-collapse v-model="settings"><el-collapse-item name="settings"><template #title><span class="action-pair"><span>仅本次调整处理参数</span><ActionHelp label="仅本次调整处理参数" text="只对当前学生本次处理生效，不修改全局配置；修改后需要重新检查计划，不会立即处理。"/></span></template><fieldset :disabled="disabled" class="config-fieldset"><ConfigFields v-model="config" local-settings/></fieldset></el-collapse-item></el-collapse>
      <div class="toolbar">
       <span class="action-pair"><el-button @click="replan" :loading="busy==='plan'" :disabled="disabled">检查处理计划</el-button><ActionHelp label="检查处理计划" text="只检查原图、参数及处理规则；不会创建任务、调用处理服务或生成正式成片。"/></span>
       <span class="action-pair"><el-button type="primary" @click="start" :loading="busy==='start'" :disabled="disabled||!readyPlan">开始生成正式成片</el-button><ActionHelp label="开始生成正式成片" :text="'按检查后的配置生成正式结果，完成后仍需人工审核。'+(readyPlan?'关闭窗口不会停止已创建的任务。':planReason)"/></span>
@@ -187,7 +187,7 @@ onMounted(()=>{timer=setInterval(()=>{if(props.id&&!busy.value)load().catch(()=>
    </section>
    <section v-if="stage.deliver||batches.length" class="review-section" aria-label="照片交付">
     <h3>照片交付</h3>
-    <div v-if="stage.deliver" class="toolbar"><el-button :loading="busy==='deliver'" :disabled="disabled" @click="deliver">生成单人交付包</el-button><ActionHelp label="生成交付包" text="打包已审核通过的正式成片；生成、下载均不等于交付，实际交给学生后还需确认。"/></div>
+    <div v-if="stage.deliver" class="toolbar"><span class="action-pair"><el-button :loading="busy==='deliver'" :disabled="disabled" @click="deliver">生成单人交付包</el-button><ActionHelp label="生成交付包" text="打包已审核通过的正式成片；生成、下载均不等于交付，实际交给学生后还需确认。"/></span></div>
     <el-card v-for="b in batches" :key="b.id" shadow="never"><p>交付记录 {{b.id.slice(0,8)}} · {{({prepared:'待确认实际交付',delivered:'已实际交付',cancelled:'已取消'})[b.status]||b.status}} · {{b.items.length}} 人</p><p class="muted">{{b.format_snapshot?'格式：'+b.format_snapshot.name+' v'+b.format_snapshot.revision:'历史学号命名格式'}}</p>
      <div class="toolbar"><span v-if="!b.historical&&b.status!=='cancelled'" class="action-pair"><el-button :loading="busy==='download-'+b.id" :disabled="!!busy" @click="downloadBatch(b)">下载交付包</el-button><ActionHelp label="下载交付包" text="下载已有交付文件，不会自动把学生标记为已交付；多人批次下载的是整个原交付包。"/></span>
      <span v-if="b.status==='prepared'&&b.items.length===1&&!stage.lockReason" class="action-pair"><el-button :loading="busy==='confirm'" :disabled="disabled" @click="confirm(b)">确认已交付</el-button><ActionHelp label="确认已交付" text="确认照片已实际交给学生，保存交付事实。尚未发送时请不要确认。"/></span></div>
@@ -204,11 +204,11 @@ onMounted(()=>{timer=setInterval(()=>{if(props.id&&!busy.value)load().catch(()=>
     <div v-for="j in jobs.slice(0,3)" :key="j.id" class="task-summary"><p>{{j.kind==='import'?'原图接收':j.kind==='delivery'?'交付打包':'照片处理'}} · {{j.id.slice(0,8)}} · {{taskLabels[j.status]||j.status}} · 整批已结束项目 {{j.completed.length}} / {{j.plan.items.length}}</p><p v-if="j.message">{{j.message}}</p><pre v-if="Object.keys(j.errors||{}).length">整批失败记录：{{j.errors}}</pre><p v-if="j.uncertain?.[id]">当前学生需核对：{{j.uncertain[id]}}</p></div>
    </el-collapse-item></el-collapse>
    <el-collapse><el-collapse-item title="版本与操作记录"><pre data-testid="version-history">{{JSON.stringify({history:detail.history,versions:detail.results,delivered:detail.delivered},null,2)}}</pre></el-collapse-item></el-collapse>
-   <nav class="toolbar review-navigation" aria-label="学生导航"><el-button @click="move(-1)" :disabled="!!busy||position<=0||cohort!==state.cohort">上一张</el-button><el-button @click="move(1)" :disabled="!!busy||position<0||position>=navigation.length-1||cohort!==state.cohort">下一张</el-button><ActionHelp label="学生导航" text="按打开时的筛选顺序切换学生，不会保存或跳过审核；已有审核决定即时保存。"/><span class="muted">仅切换学生，不写入跳过状态。{{busy?'正在提交操作，请稍候。':''}}</span></nav>
+   <nav class="toolbar review-navigation" aria-label="学生导航"><el-button @click="move(-1)" :disabled="!!busy||position<=0||cohort!==state.cohort">上一张</el-button><span class="action-pair"><el-button @click="move(1)" :disabled="!!busy||position<0||position>=navigation.length-1||cohort!==state.cohort">下一张</el-button><ActionHelp label="学生导航" text="按打开时的筛选顺序切换学生，不会保存或跳过审核；已有审核决定即时保存。"/></span><span class="muted">仅切换学生，不写入跳过状态。{{busy?'正在提交操作，请稍候。':''}}</span></nav>
   </template>
  </el-dialog>
  <DeliveryPreview ref="deliveryPreview" @busy="deliveryBusy=$event" @generated="deliveryCreated"/>
 </template>
 <style scoped>
-.review-section{border-top:1px solid #e9e9e7;margin-top:16px;padding-top:14px}.action-pair{display:inline-flex;align-items:center;gap:6px}.config-fieldset{border:0;margin:0;padding:0;min-width:0}.config-fieldset:disabled{pointer-events:none;opacity:.65}.review-navigation{border-top:1px solid #e9e9e7;padding-top:12px}.task-summary{border-bottom:1px solid #e9e9e7;padding:6px 0}.comparison{margin:14px 0}
+.review-section{border-top:1px solid #e9e9e7;margin-top:16px;padding-top:14px}.config-fieldset{border:0;margin:0;padding:0;min-width:0}.config-fieldset:disabled{pointer-events:none;opacity:.65}.review-navigation{border-top:1px solid #e9e9e7;padding-top:12px}.task-summary{border-bottom:1px solid #e9e9e7;padding:6px 0}.comparison{margin:14px 0}
 </style>

@@ -499,7 +499,7 @@ def create_app(root, token=None, requests=None):
             if cohort.strip(): store.set_cohort(cohort.strip())
             return service.start_zip(path,rows)
 
-    @app.post('/api/v1/imports/xlsx', tags=['导入与迁移'], summary='检查 Excel 或创建原图接收任务', description='multipart/form-data：file 为 .xlsx（最大 50MB）；sheet 留空取首张；header_row 表头行从 1 开始；id_column 学号列默认 A；image_column 图片列默认 B；name_column 可选姓名列，空值不覆盖已保存姓名。inspect_only=true 默认按表头识别列，detect_columns=false 检查用户所选列，未识别的列默认 A/B，返回 summary、headers、sheet、id_column、image_column；false 严格使用所选列并创建后台导入任务。照片链接须仍有效。')
+    @app.post('/api/v1/imports/xlsx', tags=['导入与迁移'], summary='检查 Excel 或创建原图接收任务', description='multipart/form-data：file 为 .xlsx（最大 50MB）；sheet 留空取首张；header_row 表头行从 1 开始；id_column 学号列默认 A；image_column 图片列默认 B；name_column 为必填姓名列。inspect_only=true 默认按表头识别列，detect_columns=false 检查用户所选列，返回 summary、headers、sheet、id_column、image_column、name_column；false 严格使用所选列并创建后台导入任务。照片链接须仍有效。')
     def import_xlsx(file: UploadFile = File(...), sheet: str = Form(''), header_row: int = Form(1), id_column: str = Form('A'), image_column: str = Form('B'), name_column: str = Form(''), cohort: str = Form(''), inspect_only: bool = Form(True), detect_columns: bool = Form(True)):
         from xlsx_photo_core import WorkbookReader, inspect_selection, column_index, column_label, suggest_columns, _fetch_source
         raw = file.file.read(50*1024*1024+1)
@@ -538,7 +538,11 @@ def create_app(root, token=None, requests=None):
                 return dict(summary=report.summary,headers=report.headers,sheet=name,
                             id_column=column_label(id_col),image_column=column_label(image_col),name_column=column_label(name_col) if name_col is not None else '',cohort=detected_cohort,
                             name_header=headers[name_col] if name_col is not None else '',
-                            can_import=not (report.summary['duplicate_count'] or report.summary['empty_ids'] or report.summary['name_conflicts']))
+                            can_import=name_col is not None and not (report.summary['duplicate_count'] or report.summary['empty_ids'] or report.summary['name_empty'] or report.summary['name_conflicts']))
+            if name_col is None:
+                raise ValueError('未选择姓名列，请先选择姓名列并重新检查表格')
+            if report.summary['name_empty']:
+                raise ValueError('姓名不能为空，请修正第 '+ '、'.join(map(str,report.summary['name_empty_rows']))+' 行')
             if report.summary.get('name_conflicts'):
                 details='；'.join(x['student_id']+'（第'+ '、'.join(map(str,x['rows']))+'行）：'+', '.join(x['names']) for x in report.summary['name_conflicts'])
                 raise ValueError('同一批次同一学号存在不同姓名，请修正：'+details)
