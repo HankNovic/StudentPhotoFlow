@@ -10,7 +10,7 @@ services:
     ports:
       - "${SPF_PORT:-8769}:8769"
     volumes:
-      - ${SPF_DATA_DIR:-./data-rc4}:/data
+      - ${SPF_DATA_DIR:-./data}:/data
     init: true
     stop_grace_period: 150s
     restart: unless-stopped

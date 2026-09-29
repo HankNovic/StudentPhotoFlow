@@ -43,6 +43,8 @@ curl --fail http://127.0.0.1:8769/healthz
 
 ## 全新部署
 
+全新安装统一使用 `./data`；已发布的 v2.4.1 附件保持原样，以下命令通过新 `.env` 显式设置目录，覆盖旧附件的默认值。已有部署保留原 `.env` 的 `SPF_DATA_DIR`，无需迁移或重命名；如果旧部署未设置该变量，更换 Compose 前先补填原实际挂载路径。不要对已有部署执行以下新装步骤。
+
 下载本Release的部署ZIP，解压到新部署目录。原始文件名compose.yaml、.env.example及中文说明保留在ZIP中。单独下载时GitHub可能将.env.example规范化为default.env.example。
 
 ```sh
@@ -50,11 +52,13 @@ mkdir -p ~/studentphotoflow
 cd ~/studentphotoflow
 # 将部署ZIP解压到本目录后
 cp .env.example .env
+# 仅全新安装：显式设置目录，兼容保留旧默认值的 v2.4.1 附件
+sed -i 's|^SPF_DATA_DIR=.*|SPF_DATA_DIR=./data|' .env
 chmod 600 .env
 # 生成随机口令，编辑.env，勿使用示例占位值
 openssl rand -hex 32
 nano .env
-mkdir -p data-rc4
+mkdir -p data
 docker compose --env-file .env -p studentphotoflow pull
 docker compose --env-file .env -p studentphotoflow up -d
 curl --fail http://127.0.0.1:8769/healthz

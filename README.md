@@ -19,10 +19,12 @@ curl -fL --output StudentPhotoFlow-2.4.1-deploy.zip \
   https://github.com/HankNovic/StudentPhotoFlow/releases/download/v2.4.1/StudentPhotoFlow-2.4.1-deploy.zip
 unzip StudentPhotoFlow-2.4.1-deploy.zip
 cp .env.example .env
+# 仅全新安装：显式设置目录，兼容保留旧默认值的 v2.4.1 附件
+sed -i 's|^SPF_DATA_DIR=.*|SPF_DATA_DIR=./data|' .env
 chmod 600 .env
 ```
 
-部署包包含 `compose.yaml`、`.env.example` 和 `DOCKER部署.md`。也可在 [最新正式 Release](https://github.com/HankNovic/StudentPhotoFlow/releases/latest) 查看版本、镜像 digest 和附件；部署建议固定版本，不随意混用不同版本的文件。
+部署包包含 `compose.yaml`、`.env.example` 和 `DOCKER部署.md`。已发布的 v2.4.1 附件保持原样；上面的命令只修改全新安装的 `.env`，其 `SPF_DATA_DIR=./data` 会覆盖附件中 Compose 的旧默认目录。也可在 [最新正式 Release](https://github.com/HankNovic/StudentPhotoFlow/releases/latest) 查看版本、镜像 digest 和附件；部署建议固定版本，不随意混用不同版本的文件。
 
 ### 2. 配置访问口令和数据目录
 
@@ -42,10 +44,10 @@ nano .env
 | `SPF_API_TOKEN` | 必须自行设置随机口令 | 网页登录和外部 API 认证 |
 | `SPF_IMAGE` | `ghcr.io/hanknovic/studentphotoflow:2.4.1` | 固定应用镜像版本 |
 | `SPF_PORT` | `8769` | 宿主机访问端口；容器内部仍使用 8769 |
-| `SPF_DATA_DIR` | `./data-rc4` | 宿主机持久化目录，挂载到容器 `/data` |
+| `SPF_DATA_DIR` | `./data` | 宿主机持久化目录，挂载到容器 `/data` |
 | `SPF_LOG_LEVEL` | `info` | 服务日志级别 |
 
-`data-rc4` 是沿用至今的目录默认名，不代表正在运行旧版本。容器工作区固定为 `/data/workspace`，其中保留名单、照片、配置、任务、审核、交付及回收站数据。全新部署可以自行指定数据目录；已有部署不要随版本更名或清空目录。
+全新安装统一使用 `./data`，容器工作区仍为 `/data/workspace`，其中保留名单、照片、配置、任务、审核、交付及回收站数据。已有部署继续使用各自原 `.env` 的 `SPF_DATA_DIR`，无需迁移或重命名现有目录，也不要执行上面的新装配置命令。若旧部署未显式设置该变量，更换 Compose 文件前应先在原 `.env` 中填入原实际挂载路径，避免默认值变化后挂载到空目录。
 
 ### 3. 启动并访问
 
@@ -53,7 +55,7 @@ nano .env
 
 ```sh
 # 如修改了 SPF_DATA_DIR，请创建对应目录
-mkdir -p data-rc4
+mkdir -p data
 docker compose --env-file .env -p studentphotoflow pull
 docker compose --env-file .env -p studentphotoflow up -d
 docker compose --env-file .env -p studentphotoflow ps
