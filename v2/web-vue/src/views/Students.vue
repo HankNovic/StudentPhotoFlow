@@ -8,16 +8,22 @@ import RecycleDialog from '../components/RecycleDialog.vue';
 import StudentDetail from '../components/StudentDetail.vue';
 import DeliveryPreview from '../components/DeliveryPreview.vue';
 import PagedTable from '../components/PagedTable.vue';
+import ActionHelp from '../components/ActionHelp.vue';
 const emit=defineEmits(['navigate']);
 const recycle=ref();
 async function single(){if(!state.cohort)throw Error('请先选择届次');const cid=state.cohort;const {value}=await ElMessageBox.prompt('在 '+state.cohortName+' 中精确查找已有学号，不会新建学生','单人补录',{inputPlaceholder:'完整学号'});const sid=value.trim();await api('students/'+encodeURIComponent(sid),undefined,undefined,cid);if(cid!==state.cohort)throw Error('届次已切换，请重新确认学生');detailId.value=sid;}
 const q=ref(''),status=ref(''),selected=ref([]),detailId=ref(''),batchDecision=ref(''),reason=ref('');
 const planOpen=ref(false),planData=ref(null),planIds=ref([]),busy=ref(false),deliveryPreview=ref();
+const page=ref(1),pageSize=ref(20),pageSizes=[20,50,100];
 const filtered=computed(()=>state.students.filter(s=>(!status.value||s.status===status.value)&&s.id.includes(q.value.trim())));
 const visibleIds=computed(()=>filtered.value.map(s=>s.id));
+const pagedStudents=computed(()=>filtered.value.slice((page.value-1)*pageSize.value,page.value*pageSize.value));
+const pageStart=computed(()=>filtered.value.length?(page.value-1)*pageSize.value+1:0);
+const pageEnd=computed(()=>Math.min(page.value*pageSize.value,filtered.value.length));
 const all=computed(()=>filtered.value.length>0&&filtered.value.every(s=>selected.value.includes(s.id)));
-watch([q,status,()=>state.cohort],()=>{selected.value=[];planOpen.value=false;});
+watch([q,status,()=>state.cohort],()=>{selected.value=[];planOpen.value=false;page.value=1;});
 watch(()=>state.students,()=>{selected.value=selected.value.filter(id=>visibleIds.value.includes(id));});
+watch([()=>filtered.value.length,pageSize],()=>{page.value=Math.max(1,Math.min(page.value,Math.max(1,Math.ceil(filtered.value.length/pageSize.value))));});
 watch(()=>JSON.stringify(state.config),()=>{planData.value=null;});
 function toggle(id,value){selected.value=value?[...new Set([...selected.value,id])]:selected.value.filter(x=>x!==id);}
 function toggleAll(value){selected.value=value?[...visibleIds.value]:[];}
@@ -64,14 +70,14 @@ async function deliveryCreated(batch){
   <div class="toolbar">
    <el-input v-model="q" placeholder="搜索学号" aria-label="搜索学号" clearable class="search"/>
    <el-select v-model="status" :empty-values="[null,undefined]" aria-label="状态筛选" class="filter"><el-option label="全部状态" value=""/><el-option v-for="(label,key) in labels" :key="key" :label="label" :value="key"/></el-select>
-   <el-checkbox :model-value="all" @update:model-value="toggleAll">全选筛选结果</el-checkbox><span data-testid="selection-count">已选 {{selected.length}} 人</span>
+   <span class="action-pair"><el-checkbox :model-value="all" @update:model-value="toggleAll">全选筛选结果</el-checkbox><ActionHelp label="全选筛选结果" text="选择当前搜索和状态筛选后全部学生，包含未显示在当前页的学生。"/></span><span data-testid="selection-count">已选 {{selected.length}} 人</span>
   </div>
   <div class="toolbar">
    <el-button @click="batch('approved')">批量审核通过</el-button><el-button @click="batch('rejected')">批量退回</el-button>
    <el-button type="primary" @click="openPlan">预览处理计划</el-button><el-button @click="deliver">预览并生成照片交付包</el-button>
    <el-button @click="download('选中学号.json',{student_ids:selected})">导出选中名单</el-button>
   </div>
-  <el-table :data="filtered" row-key="id" empty-text="当前届次暂无学生，请前往数据接入" data-testid="student-table">
+  <el-table :data="pagedStudents" row-key="id" empty-text="当前届次暂无学生，请前往数据接入" data-testid="student-table">
    <el-table-column width="56"><template #default="{row}"><el-checkbox :model-value="selected.includes(row.id)" @update:model-value="toggle(row.id,$event)" :aria-label="'选择学生 '+row.id"/></template></el-table-column>
    <el-table-column prop="id" label="学号" min-width="140"/>
    <el-table-column prop="name" label="姓名" min-width="120"/>
@@ -79,6 +85,7 @@ async function deliveryCreated(batch){
    <el-table-column label="状态" min-width="150"><template #default="{row}"><el-tag>{{labels[row.status]||row.status}}</el-tag></template></el-table-column>
    <el-table-column label="操作" min-width="180"><template #default="{row}"><el-button link type="primary" @click="detailId=row.id">查看流程 / 审核</el-button><el-button v-if="row.status==='missing'" link :disabled="state.archived" @click="detailId=row.id">补交照片</el-button><el-button link type="danger" :disabled="state.archived" @click="recycle.show(state.cohort,[row.id])">移入回收站</el-button></template></el-table-column>
   </el-table>
+  <div v-if="filtered.length" class="student-pagination"><span class="muted">共 {{filtered.length}} 条，当前显示第 {{pageStart}}–{{pageEnd}} 条</span><el-pagination v-model:current-page="page" v-model:page-size="pageSize" :page-sizes="pageSizes" layout="sizes,prev,pager,next" :total="filtered.length"/></div>
  </el-card>
  <RecycleDialog ref="recycle"/>
  <StudentDetail v-model:id="detailId" :visible-ids="visibleIds"/>

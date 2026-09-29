@@ -39,7 +39,7 @@ onUnmounted(()=>{clearInterval(versionTimer);window.removeEventListener('beforeu
    <div class="sidebar-bottom"><p class="sidebar-label">当前届次</p><el-select :model-value="state.cohort" @update:model-value="switchCohort" aria-label="当前届次" :disabled="!state.ready"><el-option v-if="state.archived" :value="state.cohort" :label="state.cohortName+'（归档只读）'"/><el-option v-for="c in state.cohorts" :key="c.id" :value="c.id" :label="c.name"/></el-select>
    <p class="workspace">{{state.health.workspace}}</p><p class="sidebar-label">版本 {{state.health.version||'—'}}</p>
    <el-button @click="update" :loading="checking" :disabled="!state.ready">检查更新</el-button>
-   <el-button @click="navigate('settings')">届次及回收站管理</el-button><el-button @click="logout">退出登录</el-button></div>
+   <el-button @click="logout">退出登录</el-button></div>
   </aside>
   <main><header><div><p class="eyebrow">STUDENT PHOTO WORKSPACE</p><h1>{{pages[page]}}</h1><p class="muted" v-if="state.cohort">所属届次：{{state.cohortName}}</p></div><el-button @click="refresh" :disabled="!state.ready">刷新</el-button></header>
    <el-alert v-if="failure" :title="failure" type="error" :closable="false"/>
